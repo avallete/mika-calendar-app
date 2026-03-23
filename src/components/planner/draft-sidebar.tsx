@@ -34,6 +34,7 @@ function DraggableDraftCard({
       type: "draft",
       projectId: project.id,
       durationHalfDays: project.estimatedDurationHalfDays,
+      title: project.title,
     },
   });
 

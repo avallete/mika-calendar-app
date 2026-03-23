@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useMemo, useState } from "react";
-import { ArrowRight, PenSquare, Plus, Rows3 } from "lucide-react";
+import { ArrowRight, PenSquare, Plus, Rows3, Trash2 } from "lucide-react";
 
 import { usePlanner } from "@/components/planner/planner-provider";
 import { Badge } from "@/components/ui/badge";
@@ -33,7 +33,7 @@ const emptyForm: ProjectEditorState = {
 };
 
 export function DraftsBoard() {
-  const { state, upsertProject } = usePlanner();
+  const { state, upsertProject, deleteProject } = usePlanner();
   const drafts = useMemo(
     () => state.projects.filter((project) => project.status === "draft"),
     [state.projects]
@@ -122,6 +122,16 @@ export function DraftsBoard() {
           selectedProjectId={selectedProjectId}
           selectedProject={selectedProject}
           onSave={(values) => upsertProject(values, selectedProjectId ?? undefined)}
+          onDelete={() => {
+            if (!selectedProjectId) {
+              return;
+            }
+
+            if (window.confirm("Delete this draft permanently?")) {
+              deleteProject(selectedProjectId);
+              setSelectedProjectId(null);
+            }
+          }}
           allProjects={state.projects}
           dependencies={state.dependencies}
         />
@@ -156,12 +166,14 @@ function DraftEditorPanel({
   allProjects,
   dependencies,
   onSave,
+  onDelete,
 }: {
   selectedProjectId: string | null;
   selectedProject: (typeof allProjects)[number] | null;
   allProjects: ReturnType<typeof usePlanner>["state"]["projects"];
   dependencies: ReturnType<typeof usePlanner>["state"]["dependencies"];
   onSave: (values: ProjectEditorState) => void;
+  onDelete: () => void;
 }) {
   const [form, setForm] = useState<ProjectEditorState>(() => {
     if (!selectedProject) {
@@ -323,9 +335,17 @@ function DraftEditorPanel({
           </ScrollArea>
         </div>
 
-        <Button className="w-full" onClick={() => onSave(form)}>
-          Save draft
-        </Button>
+        <div className="flex flex-col gap-2 sm:flex-row">
+          {selectedProject ? (
+            <Button variant="destructive" className="sm:flex-1" onClick={onDelete}>
+              <Trash2 className="size-4" />
+              Delete draft
+            </Button>
+          ) : null}
+          <Button className="sm:flex-1" onClick={() => onSave(form)}>
+            Save draft
+          </Button>
+        </div>
       </CardContent>
     </Card>
   );

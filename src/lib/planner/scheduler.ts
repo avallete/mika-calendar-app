@@ -12,6 +12,7 @@ import {
   type PlannerState,
   type Project,
   type ProjectDependency,
+  type ProjectDeleteMode,
   type ProjectPlacement,
   type ProjectMetrics,
   type SlotKey,
@@ -245,6 +246,96 @@ export function buildPlannerMetrics(state: PlannerState): ProjectMetrics {
     blockedCount: state.projects.filter((project) => blockedProjectIds.has(project.id)).length,
     closureCount: state.closures.length,
   };
+}
+
+function collectTransitiveSuccessors(
+  dependencies: ProjectDependency[],
+  seedIds: Iterable<string>
+) {
+  const adjacency = new Map<string, string[]>();
+  for (const dependency of dependencies) {
+    const successors = adjacency.get(dependency.predecessorProjectId) ?? [];
+    successors.push(dependency.successorProjectId);
+    adjacency.set(dependency.predecessorProjectId, successors);
+  }
+
+  const affected = new Set<string>();
+  const queue = [...seedIds];
+
+  while (queue.length) {
+    const current = queue.shift()!;
+    if (affected.has(current)) {
+      continue;
+    }
+
+    affected.add(current);
+    for (const next of adjacency.get(current) ?? []) {
+      queue.push(next);
+    }
+  }
+
+  return affected;
+}
+
+export function deleteProjectFromState(
+  state: PlannerState,
+  projectId: string,
+  mode: ProjectDeleteMode = "preserve-dates"
+) {
+  const projectToDelete = state.projects.find((project) => project.id === projectId);
+  if (!projectToDelete) {
+    return state;
+  }
+
+  const nextDependencies = state.dependencies.filter(
+    (dependency) =>
+      dependency.predecessorProjectId !== projectId &&
+      dependency.successorProjectId !== projectId
+  );
+  const nextProjects = state.projects
+    .filter((project) => project.id !== projectId)
+    .map((project) => ({ ...project }));
+  const baseState = {
+    ...state,
+    projects: nextProjects,
+    dependencies: nextDependencies,
+  };
+
+  if (!isScheduledProject(projectToDelete) || mode === "preserve-dates") {
+    return rescheduleProjects(baseState);
+  }
+
+  const laterSameTeamIds = state.projects
+    .filter(isScheduledProject)
+    .filter(
+      (project) =>
+        project.scheduledTeam === projectToDelete.scheduledTeam &&
+        project.sequenceOrder > projectToDelete.sequenceOrder
+    )
+    .map((project) => project.id);
+  const deletedProjectSuccessors = state.dependencies
+    .filter((dependency) => dependency.predecessorProjectId === projectId)
+    .map((dependency) => dependency.successorProjectId);
+  const affectedIds = collectTransitiveSuccessors(state.dependencies, [
+    ...laterSameTeamIds,
+    ...deletedProjectSuccessors,
+  ]);
+
+  const compactedProjects = nextProjects.map((project) => {
+    if (!isScheduledProject(project) || !affectedIds.has(project.id)) {
+      return project;
+    }
+
+    return {
+      ...project,
+      scheduledStartSlot: projectToDelete.scheduledStartSlot,
+    };
+  });
+
+  return rescheduleProjects({
+    ...baseState,
+    projects: compactedProjects,
+  });
 }
 
 export function buildTimelineWindow(projects: Project[], closures: ClosurePeriod[]) {

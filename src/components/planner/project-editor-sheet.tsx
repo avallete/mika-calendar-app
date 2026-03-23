@@ -1,7 +1,7 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { ArrowRightLeft, CalendarDays, PauseCircle } from "lucide-react";
+import { ArrowRightLeft, CalendarDays, PauseCircle, Trash2 } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -14,7 +14,13 @@ import {
   SheetHeader,
   SheetTitle,
 } from "@/components/ui/sheet";
-import type { Project, ProjectDependency, ProjectPlacement, TeamId } from "@/lib/planner/types";
+import type {
+  Project,
+  ProjectDependency,
+  ProjectDeleteMode,
+  ProjectPlacement,
+  TeamId,
+} from "@/lib/planner/types";
 import { isScheduledProject } from "@/lib/planner/types";
 import { cn } from "@/lib/utils";
 
@@ -31,6 +37,7 @@ export function ProjectEditorSheet({
   placementOverride,
   onSave,
   onUnschedule,
+  onDelete,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -39,6 +46,7 @@ export function ProjectEditorSheet({
   placementOverride?: ProjectPlacement | null;
   onSave: (projectId: string, placement: ProjectPlacement) => void;
   onUnschedule?: (projectId: string) => void;
+  onDelete?: (projectId: string, mode: ProjectDeleteMode) => void;
 }) {
   const incomingDependencies = useMemo(
     () =>
@@ -103,7 +111,7 @@ export function ProjectEditorSheet({
         <SheetFooter className="border-t border-border/60">
           {isScheduledProject(project) && onUnschedule ? (
             <Button
-              variant="destructive"
+              variant="outline"
               onClick={() => {
                 onUnschedule(project.id);
                 onOpenChange(false);
@@ -112,6 +120,42 @@ export function ProjectEditorSheet({
               <PauseCircle className="size-4" />
               Return to draft queue
             </Button>
+          ) : null}
+          {isScheduledProject(project) && onDelete ? (
+            <>
+              <Button
+                variant="destructive"
+                onClick={() => {
+                  if (
+                    window.confirm(
+                      "Delete this planned project and keep the remaining schedule dates as they are?"
+                    )
+                  ) {
+                    onDelete(project.id, "preserve-dates");
+                    onOpenChange(false);
+                  }
+                }}
+              >
+                <Trash2 className="size-4" />
+                Delete and keep dates
+              </Button>
+              <Button
+                variant="destructive"
+                onClick={() => {
+                  if (
+                    window.confirm(
+                      "Delete this planned project and compact later dates where dependencies allow?"
+                    )
+                  ) {
+                    onDelete(project.id, "compact-schedule");
+                    onOpenChange(false);
+                  }
+                }}
+              >
+                <Trash2 className="size-4" />
+                Delete and compact
+              </Button>
+            </>
           ) : null}
         </SheetFooter>
       </SheetContent>

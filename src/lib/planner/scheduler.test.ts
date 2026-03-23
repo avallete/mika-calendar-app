@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import { makeSlotKey } from "@/lib/planner/calendar";
 import {
+  deleteProjectFromState,
   rescheduleProjects,
   updateProjectPlacement,
   wouldCreateDependencyCycle,
@@ -130,5 +131,56 @@ describe("scheduler", () => {
   test("rejects circular dependencies", () => {
     const result = wouldCreateDependencyCycle(baseState().dependencies, "b-1", "a-1");
     expect(result).toBe(true);
+  });
+
+  test("deleting a draft removes its dependency edges", () => {
+    const nextState = deleteProjectFromState(
+      {
+        ...baseState(),
+        projects: [
+          ...baseState().projects,
+          {
+            id: "draft-1",
+            title: "Draft",
+            status: "draft",
+            plannedTeam: "team-a",
+            estimatedDurationHalfDays: 2,
+          },
+        ],
+        dependencies: [
+          ...baseState().dependencies,
+          {
+            id: "dep-draft",
+            predecessorProjectId: "a-2",
+            successorProjectId: "draft-1",
+            lagHalfDays: 0,
+          },
+        ],
+      },
+      "draft-1"
+    );
+
+    expect(nextState.projects.find((project) => project.id === "draft-1")).toBeUndefined();
+    expect(nextState.dependencies.find((dependency) => dependency.id === "dep-draft")).toBeUndefined();
+  });
+
+  test("deleting a scheduled project with preserve dates keeps later work on current dates", () => {
+    const nextState = deleteProjectFromState(baseState(), "a-1", "preserve-dates");
+
+    const teamA = nextState.projects.find((project) => project.id === "a-2");
+    const teamB = nextState.projects.find((project) => project.id === "b-1");
+
+    expect(teamA?.scheduledStartSlot).toBe(makeSlotKey("2026-03-25", "AM"));
+    expect(teamB?.scheduledStartSlot).toBe(makeSlotKey("2026-03-25", "AM"));
+  });
+
+  test("deleting a scheduled project with compact schedule pulls later work earlier", () => {
+    const nextState = deleteProjectFromState(baseState(), "a-1", "compact-schedule");
+
+    const teamA = nextState.projects.find((project) => project.id === "a-2");
+    const teamB = nextState.projects.find((project) => project.id === "b-1");
+
+    expect(teamA?.scheduledStartSlot).toBe(makeSlotKey("2026-03-23", "AM"));
+    expect(teamB?.scheduledStartSlot).toBe(makeSlotKey("2026-03-23", "AM"));
   });
 });

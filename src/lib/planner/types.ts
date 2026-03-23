@@ -21,6 +21,7 @@ export type TeamId = (typeof teamOptions)[number]["id"];
 export type ZoomLevel = (typeof zoomLevels)[number];
 export type ClosureType = (typeof closureTypeOptions)[number]["id"];
 export type ProjectStatus = "draft" | "scheduled";
+export type ProjectDeleteMode = "preserve-dates" | "compact-schedule";
 export type SlotPart = "AM" | "PM";
 export type SlotKey = `${string}-${SlotPart}`;
 
@@ -63,6 +64,44 @@ export type ProjectPlacement = {
   teamId: TeamId;
   startSlot: SlotKey;
   durationHalfDays: number;
+};
+
+export type CalendarBucket = {
+  bucketId: string;
+  teamId: TeamId;
+  startSlot: SlotKey;
+  granularity: "slot" | "day";
+};
+
+export type DragProjectMeta =
+  | {
+      type: "draft";
+      projectId: string;
+      durationHalfDays: number;
+      title: string;
+    }
+  | {
+      type: "scheduled";
+      projectId: string;
+      teamId: TeamId;
+      startSlot: SlotKey;
+      durationHalfDays: number;
+      title: string;
+    };
+
+export type QuickPlacementState = {
+  projectId: string;
+  title: string;
+  triggerId: string;
+  placement: ProjectPlacement;
+};
+
+export type YearMonthSection = {
+  id: string;
+  label: string;
+  startDate: string;
+  endDate: string;
+  dayCount: number;
 };
 
 export type ProjectEditorState = {

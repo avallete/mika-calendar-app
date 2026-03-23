@@ -5,6 +5,7 @@ import { createContext, useContext, useMemo, useReducer } from "react";
 import { initialPlannerState } from "@/lib/planner/sample-data";
 import {
   buildPlannerMetrics,
+  deleteProjectFromState,
   rescheduleProjects,
   updateProjectPlacement,
   wouldCreateDependencyCycle,
@@ -12,6 +13,7 @@ import {
 import type {
   ClosureFormState,
   PlannerState,
+  ProjectDeleteMode,
   ProjectEditorState,
   ProjectPlacement,
 } from "@/lib/planner/types";
@@ -31,6 +33,11 @@ type PlannerAction =
   | {
       type: "UNSCHEDULE_PROJECT";
       projectId: string;
+    }
+  | {
+      type: "DELETE_PROJECT";
+      projectId: string;
+      mode?: ProjectDeleteMode;
     }
   | {
       type: "ADD_CLOSURE";
@@ -124,6 +131,8 @@ function plannerReducer(state: PlannerState, action: PlannerAction): PlannerStat
         projects: nextProjects,
       });
     }
+    case "DELETE_PROJECT":
+      return deleteProjectFromState(state, action.projectId, action.mode);
     case "ADD_CLOSURE":
       return rescheduleProjects({
         ...state,
@@ -157,6 +166,7 @@ type PlannerContextValue = {
   setDependencies: (projectId: string, dependencyIds: string[]) => void;
   placeProject: (projectId: string, placement: ProjectPlacement) => void;
   unscheduleProject: (projectId: string) => void;
+  deleteProject: (projectId: string, mode?: ProjectDeleteMode) => void;
   addClosure: (values: ClosureFormState) => void;
   removeClosure: (closureId: string) => void;
   resetDemoData: () => void;
@@ -185,6 +195,9 @@ export function PlannerProvider({ children }: { children: React.ReactNode }) {
       },
       unscheduleProject(projectId) {
         dispatch({ type: "UNSCHEDULE_PROJECT", projectId });
+      },
+      deleteProject(projectId, mode) {
+        dispatch({ type: "DELETE_PROJECT", projectId, mode });
       },
       addClosure(values) {
         dispatch({ type: "ADD_CLOSURE", values });
