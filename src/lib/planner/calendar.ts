@@ -63,6 +63,29 @@ export function previousCalendarSlot(slotKey: SlotKey): SlotKey {
   return makeSlotKey(format(addDays(parseISO(date), -1), "yyyy-MM-dd"), "PM");
 }
 
+export function shiftWorkingSlot(
+  slotKey: SlotKey,
+  offsetHalfDays: number,
+  closures: ClosurePeriod[]
+) {
+  if (offsetHalfDays === 0) {
+    return slotKey;
+  }
+
+  let cursor = slotKey;
+  let remaining = Math.abs(offsetHalfDays);
+  const step = offsetHalfDays > 0 ? nextCalendarSlot : previousCalendarSlot;
+
+  while (remaining > 0) {
+    cursor = step(cursor);
+    if (!isNonWorkingDate(parseSlotKey(cursor).date, closures)) {
+      remaining -= 1;
+    }
+  }
+
+  return cursor;
+}
+
 export function isDateInsideClosure(date: string, closure: ClosurePeriod) {
   const value = parseISO(date);
   return !isBefore(value, parseISO(closure.startDate)) && !isAfter(value, parseISO(closure.endDate));
@@ -142,17 +165,8 @@ export function addWorkingLag(
   lagHalfDays: number,
   closures: ClosurePeriod[]
 ) {
-  let cursor = normalizeToWorkingSlot(startSlot, closures);
-  let remaining = lagHalfDays;
-
-  while (remaining > 0) {
-    cursor = nextCalendarSlot(cursor);
-    if (!isNonWorkingDate(parseSlotKey(cursor).date, closures)) {
-      remaining -= 1;
-    }
-  }
-
-  return normalizeToWorkingSlot(cursor, closures);
+  const normalizedStart = normalizeToWorkingSlot(startSlot, closures);
+  return normalizeToWorkingSlot(shiftWorkingSlot(normalizedStart, lagHalfDays, closures), closures);
 }
 
 export function countWorkingHalfDays(
@@ -172,6 +186,42 @@ export function countWorkingHalfDays(
   }
 
   return count;
+}
+
+export function countWorkingSlotDistance(
+  startSlot: SlotKey,
+  endSlot: SlotKey,
+  closures: ClosurePeriod[]
+) {
+  if (startSlot === endSlot) {
+    return 0;
+  }
+
+  if (compareSlotKeys(startSlot, endSlot) < 0) {
+    let cursor = startSlot;
+    let count = 0;
+
+    while (compareSlotKeys(cursor, endSlot) < 0) {
+      cursor = nextCalendarSlot(cursor);
+      if (!isNonWorkingDate(parseSlotKey(cursor).date, closures)) {
+        count += 1;
+      }
+    }
+
+    return count;
+  }
+
+  let cursor = startSlot;
+  let count = 0;
+
+  while (compareSlotKeys(cursor, endSlot) > 0) {
+    cursor = previousCalendarSlot(cursor);
+    if (!isNonWorkingDate(parseSlotKey(cursor).date, closures)) {
+      count += 1;
+    }
+  }
+
+  return -count;
 }
 
 export function slotIndexFromDate(startDate: string, slotKey: SlotKey) {

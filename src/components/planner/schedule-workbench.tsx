@@ -12,7 +12,7 @@ import {
   type DragEndEvent,
   type DragStartEvent,
 } from "@dnd-kit/core";
-import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { CalendarPlus2, Sparkles, X } from "lucide-react";
 
 import { ClosureSheet } from "@/components/planner/closure-sheet";
@@ -39,25 +39,35 @@ import {
   SidebarTrigger,
 } from "@/components/ui/sidebar";
 import {
+  advanceWorkingDuration,
   compareSlotKeys,
   countWorkingHalfDays,
+  countWorkingSlotDistance,
   makeSlotKey,
   nextCalendarSlot,
+  normalizeToWorkingSlot,
   parseSlotKey,
   previousWorkingDate,
+  shiftWorkingSlot,
 } from "@/lib/planner/calendar";
 import {
+  detectDependencyConflicts,
   getEarlierShiftPrompt,
+  getTouchingProjectChain,
   setSchedulerTraceEnabled,
 } from "@/lib/planner/scheduler";
 import type {
   CalendarBucket,
   ClosurePeriod,
+  DependencyConflictPromptState,
   DragProjectMeta,
   EarlierShiftPromptState,
+  Project,
+  ProjectPlacementRequest,
   ProjectPlacement,
   QuickPlacementState,
   SlotKey,
+  TeamId,
 } from "@/lib/planner/types";
 import { isScheduledProject } from "@/lib/planner/types";
 
@@ -87,6 +97,199 @@ function getTracePreferenceSnapshot() {
   return window.localStorage.getItem(TRACE_STORAGE_KEY) === "true";
 }
 
+function stringifyTracePayload(payload: unknown) {
+  try {
+    return JSON.stringify(payload, null, 2);
+  } catch (error) {
+    return JSON.stringify({
+      serializationError: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+function tracePlannerUi(enabled: boolean, label: string, payload: unknown) {
+  if (!enabled || typeof console === "undefined") {
+    return;
+  }
+
+  console.log(`[planner ui trace] ${label} ${stringifyTracePayload(payload)}`);
+}
+
+function normalizePlacementRequest(
+  request: ProjectPlacementRequest,
+  closures: ClosurePeriod[]
+): ProjectPlacementRequest {
+  return {
+    ...request,
+    placement: {
+      ...request.placement,
+      startSlot: normalizeToWorkingSlot(request.placement.startSlot, closures),
+      durationHalfDays: Math.max(1, request.placement.durationHalfDays),
+    },
+  };
+}
+
+function shiftPlacementRequests(
+  placementRequests: ProjectPlacementRequest[],
+  offsetHalfDays: number,
+  closures: ClosurePeriod[]
+) {
+  if (offsetHalfDays === 0) {
+    return placementRequests;
+  }
+
+  return placementRequests.map((request) => ({
+    ...request,
+    placement: {
+      ...request.placement,
+      startSlot: shiftWorkingSlot(request.placement.startSlot, offsetHalfDays, closures),
+    },
+  }));
+}
+
+function summarizePlacementBlock(
+  placementRequests: ProjectPlacementRequest[],
+  closures: ClosurePeriod[]
+) {
+  const orderedRequests = [...placementRequests].sort((left, right) =>
+    compareSlotKeys(left.placement.startSlot, right.placement.startSlot)
+  );
+  const startSlot = orderedRequests[0]?.placement.startSlot;
+  const readySlot = orderedRequests.reduce<SlotKey | null>((latest, request) => {
+    const computed = advanceWorkingDuration(
+      request.placement.startSlot,
+      request.placement.durationHalfDays,
+      closures
+    );
+
+    if (!latest || compareSlotKeys(computed.readySlot, latest) > 0) {
+      return computed.readySlot;
+    }
+
+    return latest;
+  }, null);
+
+  if (!startSlot || !readySlot) {
+    return null;
+  }
+
+  return {
+    startSlot,
+    readySlot,
+    spanHalfDays: countWorkingSlotDistance(startSlot, readySlot, closures),
+  };
+}
+
+function snapMovePlacementRequests(
+  stateProjects: Project[],
+  placementRequests: ProjectPlacementRequest[],
+  selectedProjectIds: string[],
+  teamId: TeamId,
+  closures: ClosurePeriod[]
+) {
+  const block = summarizePlacementBlock(placementRequests, closures);
+  if (!block) {
+    return {
+      placementRequests,
+      snapTarget: null as null | {
+        kind: "after" | "before";
+        projectId: string;
+        distanceHalfDays: number;
+        targetStartSlot: SlotKey;
+      },
+    };
+  }
+
+  const selectedProjectIdSet = new Set(selectedProjectIds);
+  const snapCandidates = stateProjects
+    .filter(isScheduledProject)
+    .filter(
+      (project) =>
+        project.scheduledTeam === teamId && !selectedProjectIdSet.has(project.id)
+    )
+    .flatMap((project) => {
+      const readySlot = advanceWorkingDuration(
+        project.scheduledStartSlot,
+        project.scheduledDurationHalfDays,
+        closures
+      ).readySlot;
+
+      return [
+        {
+          kind: "after" as const,
+          projectId: project.id,
+          targetStartSlot: readySlot,
+          distanceHalfDays: Math.abs(
+            countWorkingSlotDistance(block.startSlot, readySlot, closures)
+          ),
+        },
+        {
+          kind: "before" as const,
+          projectId: project.id,
+          targetStartSlot: shiftWorkingSlot(
+            project.scheduledStartSlot,
+            -block.spanHalfDays,
+            closures
+          ),
+          distanceHalfDays: Math.abs(
+            countWorkingSlotDistance(
+              block.startSlot,
+              shiftWorkingSlot(project.scheduledStartSlot, -block.spanHalfDays, closures),
+              closures
+            )
+          ),
+        },
+      ];
+    })
+    .filter((candidate) => candidate.distanceHalfDays <= 2)
+    .sort((left, right) => {
+      if (left.distanceHalfDays !== right.distanceHalfDays) {
+        return left.distanceHalfDays - right.distanceHalfDays;
+      }
+
+      return compareSlotKeys(left.targetStartSlot, right.targetStartSlot);
+    });
+
+  const snapTarget = snapCandidates[0] ?? null;
+  if (!snapTarget) {
+    return {
+      placementRequests,
+      snapTarget: null,
+    };
+  }
+
+  return {
+    placementRequests: shiftPlacementRequests(
+      placementRequests,
+      countWorkingSlotDistance(block.startSlot, snapTarget.targetStartSlot, closures),
+      closures
+    ),
+    snapTarget,
+  };
+}
+
+function arePlacementRequestsNoop(
+  projects: Project[],
+  placementRequests: ProjectPlacementRequest[],
+  closures: ClosurePeriod[]
+) {
+  const projectsById = new Map(projects.map((project) => [project.id, project] as const));
+
+  return placementRequests.every((request) => {
+    const current = projectsById.get(request.projectId);
+    if (!current || !isScheduledProject(current)) {
+      return false;
+    }
+
+    const normalized = normalizePlacementRequest(request, closures);
+    return (
+      current.scheduledTeam === normalized.placement.teamId &&
+      current.scheduledStartSlot === normalized.placement.startSlot &&
+      current.scheduledDurationHalfDays === normalized.placement.durationHalfDays
+    );
+  });
+}
+
 function getDragLabel(activeDrag: DragProjectMeta | null) {
   if (!activeDrag) {
     return null;
@@ -102,6 +305,10 @@ function getDragLabel(activeDrag: DragProjectMeta | null) {
 
   if (activeDrag.intent === "resize-end") {
     return `Resize end: ${activeDrag.title}`;
+  }
+
+  if (activeDrag.selectionProjectIds && activeDrag.selectionProjectIds.length > 1) {
+    return `${activeDrag.title} + ${activeDrag.selectionProjectIds.length - 1} more`;
   }
 
   return activeDrag.title;
@@ -167,22 +374,89 @@ function buildScheduledPlacement(
   };
 }
 
+function buildMovePlacementRequests(
+  active: Extract<DragProjectMeta, { type: "scheduled" }>,
+  bucket: CalendarBucket,
+  projects: Project[],
+  closures: ClosurePeriod[]
+) {
+  const selectionProjectIds =
+    active.selectionProjectIds && active.selectionProjectIds.length
+      ? active.selectionProjectIds
+      : [active.projectId];
+
+  if (selectionProjectIds.length > 1 && bucket.teamId !== active.teamId) {
+    return null;
+  }
+
+  const rawRequests = selectionProjectIds
+    .map((projectId) => {
+      const project = projects.find((candidate) => candidate.id === projectId);
+      if (!project || !isScheduledProject(project)) {
+        return null;
+      }
+
+      const relativeOffset = countWorkingSlotDistance(
+        active.startSlot,
+        project.scheduledStartSlot,
+        closures
+      );
+
+      return {
+        projectId,
+        placement: {
+          teamId: bucket.teamId,
+          startSlot: shiftWorkingSlot(bucket.startSlot, relativeOffset, closures),
+          durationHalfDays: project.scheduledDurationHalfDays,
+        },
+      } satisfies ProjectPlacementRequest;
+    })
+    .filter(Boolean) as ProjectPlacementRequest[];
+
+  const normalizedRequests = rawRequests.map((request) =>
+    normalizePlacementRequest(request, closures)
+  );
+  const snapped =
+    bucket.teamId === active.teamId
+      ? snapMovePlacementRequests(
+          projects,
+          normalizedRequests,
+          selectionProjectIds,
+          bucket.teamId,
+          closures
+        )
+      : { placementRequests: normalizedRequests, snapTarget: null };
+
+  return {
+    projectIds: selectionProjectIds,
+    rawRequests,
+    normalizedRequests,
+    snappedRequests: snapped.placementRequests,
+    snapTarget: snapped.snapTarget,
+  };
+}
+
 export function ScheduleWorkbench() {
   const {
     state,
     metrics,
     placeProject,
+    placeProjects,
     addClosure,
     removeClosure,
     unscheduleProject,
     deleteProject,
   } = usePlanner();
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
+  const [selectedProjectIds, setSelectedProjectIds] = useState<string[]>([]);
   const [pendingPlacement, setPendingPlacement] = useState<QuickPlacementState | null>(null);
   const [pendingEarlierShift, setPendingEarlierShift] =
     useState<EarlierShiftPromptState | null>(null);
+  const [pendingDependencyConflict, setPendingDependencyConflict] =
+    useState<DependencyConflictPromptState | null>(null);
   const [closureSheetOpen, setClosureSheetOpen] = useState(false);
   const [activeDrag, setActiveDrag] = useState<DragProjectMeta | null>(null);
+  const handledDragIdRef = useRef<string | null>(null);
   const traceEnabled = useSyncExternalStore(
     subscribeToTracePreference,
     getTracePreferenceSnapshot,
@@ -215,16 +489,68 @@ export function ScheduleWorkbench() {
     window.dispatchEvent(new Event(TRACE_STORAGE_EVENT));
   };
 
+  const setTouchingSelection = (projectId: string) => {
+    const chainProjectIds = getTouchingProjectChain(state, projectId);
+    setSelectedProjectIds(chainProjectIds);
+    setSelectedProjectId(null);
+    setPendingPlacement(null);
+
+    tracePlannerUi(traceEnabled, "selection.chain", {
+      projectId,
+      selectedProjectIds: chainProjectIds,
+    });
+  };
+
+  const commitPlacementRequests = (
+    placementRequests: ProjectPlacementRequest[],
+    options?: Parameters<typeof placeProjects>[1]
+  ) => {
+    if (placementRequests.length === 1) {
+      placeProject(
+        placementRequests[0].projectId,
+        placementRequests[0].placement,
+        options
+      );
+      return;
+    }
+
+    placeProjects(placementRequests, options);
+  };
+
   const handleDragStart = (event: DragStartEvent) => {
     const data = event.active.data.current as DragProjectMeta | undefined;
+    handledDragIdRef.current = null;
+
+    if (
+      data?.type === "scheduled" &&
+      data.intent === "move" &&
+      selectedProjectIds.includes(data.projectId)
+    ) {
+      setActiveDrag({
+        ...data,
+        selectionProjectIds: selectedProjectIds,
+      });
+      return;
+    }
+
     setActiveDrag(data ?? null);
   };
 
   const handleDragEnd = (event: DragEndEvent) => {
     const active = event.active.data.current as DragProjectMeta | undefined;
     const bucket = event.over?.data.current as CalendarBucket | undefined;
+    const dragId = String(event.active.id);
 
     setActiveDrag(null);
+
+    if (handledDragIdRef.current === dragId) {
+      tracePlannerUi(traceEnabled, "dragEnd.ignoredDuplicate", {
+        dragId,
+      });
+      return;
+    }
+
+    handledDragIdRef.current = dragId;
 
     if (!active || !bucket) {
       return;
@@ -244,16 +570,143 @@ export function ScheduleWorkbench() {
       return;
     }
 
-    const nextPlacement = buildScheduledPlacement(active, bucket, state.closures);
+    const activeSelectionProjectIds =
+      active.intent === "move" && selectedProjectIds.includes(active.projectId)
+        ? selectedProjectIds
+        : [active.projectId];
+    const activeWithSelection =
+      active.intent === "move"
+        ? {
+            ...active,
+            selectionProjectIds: activeSelectionProjectIds,
+          }
+        : active;
+
+    if (active.intent === "move") {
+      const movePlan = buildMovePlacementRequests(
+        activeWithSelection,
+        bucket,
+        state.projects,
+        state.closures
+      );
+
+      if (!movePlan || !movePlan.snappedRequests.length) {
+        return;
+      }
+
+      if (arePlacementRequestsNoop(state.projects, movePlan.snappedRequests, state.closures)) {
+        tracePlannerUi(traceEnabled, "dragEnd.ignoredNoop", {
+          dragId,
+          projectIds: movePlan.projectIds,
+          normalizedPlacements: movePlan.normalizedRequests,
+          snappedPlacements: movePlan.snappedRequests,
+        });
+        return;
+      }
+
+      const conflicts = detectDependencyConflicts(state, movePlan.snappedRequests);
+      const traceMetadata = {
+        selectedProjectIds: movePlan.projectIds,
+        rawPlacements: movePlan.rawRequests,
+        normalizedPlacements: movePlan.normalizedRequests,
+        snappedPlacements: movePlan.snappedRequests,
+        snapTarget: movePlan.snapTarget,
+        conflictingDependencies: conflicts,
+      };
+
+      if (conflicts.length) {
+        tracePlannerUi(traceEnabled, "dependencyConflict.prompt", traceMetadata);
+        setPendingDependencyConflict({
+          projectIds: movePlan.projectIds,
+          placements: movePlan.snappedRequests,
+          primaryProjectId: active.projectId,
+          primaryTitle: active.title,
+          conflicts,
+          source: `drag-${active.intent}`,
+          traceMetadata,
+        });
+        return;
+      }
+
+      const earliestShiftPrompt =
+        movePlan.projectIds.length === 1
+          ? getEarlierShiftPrompt(
+              state,
+              active.projectId,
+              movePlan.snappedRequests[0].placement,
+              "move"
+            )
+          : null;
+
+      if (earliestShiftPrompt) {
+        setPendingEarlierShift(earliestShiftPrompt);
+        return;
+      }
+
+      commitPlacementRequests(movePlan.snappedRequests, {
+        source: "drag-move",
+        dependencyResolution: "preserve-dependencies",
+        traceMetadata,
+      });
+      setPendingPlacement(null);
+      return;
+    }
+
+    const nextPlacement = buildScheduledPlacement(activeWithSelection, bucket, state.closures);
     if (!nextPlacement) {
       return;
     }
 
-    if (active.intent === "move" || active.intent === "resize-start") {
+    const normalizedPlacementRequest = normalizePlacementRequest(
+      {
+        projectId: active.projectId,
+        placement: nextPlacement,
+      },
+      state.closures
+    );
+
+    if (arePlacementRequestsNoop(state.projects, [normalizedPlacementRequest], state.closures)) {
+      tracePlannerUi(traceEnabled, "dragEnd.ignoredNoop", {
+        dragId,
+        projectIds: [active.projectId],
+        normalizedPlacements: [normalizedPlacementRequest],
+      });
+      return;
+    }
+
+    const conflicts = detectDependencyConflicts(state, [normalizedPlacementRequest]);
+    const traceMetadata = {
+      selectedProjectIds: [active.projectId],
+      rawPlacements: [
+        {
+          projectId: active.projectId,
+          placement: nextPlacement,
+        },
+      ],
+      normalizedPlacements: [normalizedPlacementRequest],
+      snappedPlacements: [normalizedPlacementRequest],
+      conflictingDependencies: conflicts,
+    };
+
+    if (conflicts.length) {
+      tracePlannerUi(traceEnabled, "dependencyConflict.prompt", traceMetadata);
+      setPendingDependencyConflict({
+        projectIds: [active.projectId],
+        placements: [normalizedPlacementRequest],
+        primaryProjectId: active.projectId,
+        primaryTitle: active.title,
+        conflicts,
+        source: `drag-${active.intent}`,
+        traceMetadata,
+      });
+      return;
+    }
+
+    if (active.intent === "resize-start") {
       const prompt = getEarlierShiftPrompt(
         state,
         active.projectId,
-        nextPlacement,
+        normalizedPlacementRequest.placement,
         active.intent
       );
 
@@ -263,8 +716,10 @@ export function ScheduleWorkbench() {
       }
     }
 
-    placeProject(active.projectId, nextPlacement, {
+    placeProject(active.projectId, normalizedPlacementRequest.placement, {
       source: `drag-${active.intent}`,
+      dependencyResolution: "preserve-dependencies",
+      traceMetadata,
     });
     setPendingPlacement(null);
   };
@@ -277,7 +732,10 @@ export function ScheduleWorkbench() {
         collisionDetection={pointerWithin}
         onDragStart={handleDragStart}
         onDragEnd={handleDragEnd}
-        onDragCancel={() => setActiveDrag(null)}
+        onDragCancel={() => {
+          handledDragIdRef.current = null;
+          setActiveDrag(null);
+        }}
       >
         <DraftSidebar drafts={drafts} dependencies={state.dependencies} />
 
@@ -364,6 +822,7 @@ export function ScheduleWorkbench() {
               dependencies={state.dependencies}
               closures={state.closures}
               pendingPlacement={pendingPlacement}
+              selectedProjectIds={selectedProjectIds}
               traceEnabled={traceEnabled}
               onTraceEnabledChange={updateTraceEnabled}
               onPendingPlacementChange={setPendingPlacement}
@@ -373,7 +832,23 @@ export function ScheduleWorkbench() {
                 });
                 setPendingPlacement(null);
               }}
-              onSelectProject={(projectId) => {
+              onProjectPointerDown={(projectId, shiftKey) => {
+                if (shiftKey) {
+                  setTouchingSelection(projectId);
+                  return;
+                }
+
+                if (!selectedProjectIds.includes(projectId)) {
+                  setSelectedProjectIds([]);
+                }
+              }}
+              onSelectProject={(projectId, shiftKey) => {
+                if (shiftKey) {
+                  setTouchingSelection(projectId);
+                  return;
+                }
+
+                setSelectedProjectIds([]);
                 setSelectedProjectId(projectId);
                 setPendingPlacement(null);
               }}
@@ -385,6 +860,7 @@ export function ScheduleWorkbench() {
             onOpenChange={(open) => {
               if (!open) {
                 setSelectedProjectId(null);
+                setSelectedProjectIds([]);
                 setPendingPlacement(null);
               }
             }}
@@ -421,6 +897,90 @@ export function ScheduleWorkbench() {
           ) : null}
         </DragOverlay>
       </DndContext>
+
+      <Dialog
+        open={Boolean(pendingDependencyConflict)}
+        onOpenChange={(open) => {
+          if (!open) {
+            setPendingDependencyConflict(null);
+          }
+        }}
+      >
+        <DialogContent showCloseButton={false} className="max-w-lg">
+          <DialogHeader>
+            <DialogTitle>Dependency conflict detected</DialogTitle>
+            <DialogDescription>
+              {pendingDependencyConflict
+                ? `${pendingDependencyConflict.primaryTitle} is being moved into a position that conflicts with current dependency links. You can keep those links and let the schedule stay dependency-safe, or break only the conflicting links and keep the dragged placement exactly.`
+                : ""}
+            </DialogDescription>
+          </DialogHeader>
+
+          {pendingDependencyConflict ? (
+            <div className="space-y-2 rounded-2xl border border-border/60 bg-muted/35 p-3">
+              {pendingDependencyConflict.conflicts.map((conflict) => (
+                <div key={conflict.id} className="text-sm text-muted-foreground">
+                  <span className="font-medium text-foreground">
+                    {conflict.predecessorTitle}
+                  </span>
+                  {" -> "}
+                  <span className="font-medium text-foreground">
+                    {conflict.successorTitle}
+                  </span>
+                </div>
+              ))}
+            </div>
+          ) : null}
+
+          <DialogFooter className="sm:justify-between">
+            <Button
+              variant="outline"
+              onClick={() => {
+                if (!pendingDependencyConflict) {
+                  return;
+                }
+
+                commitPlacementRequests(pendingDependencyConflict.placements, {
+                  source: `${pendingDependencyConflict.source}-keep-dependencies`,
+                  dependencyResolution: "preserve-dependencies",
+                  traceMetadata: {
+                    ...pendingDependencyConflict.traceMetadata,
+                    promptDecision: "preserve-dependencies",
+                  },
+                });
+                setPendingDependencyConflict(null);
+              }}
+            >
+              Keep dependencies
+            </Button>
+            <Button
+              onClick={() => {
+                if (!pendingDependencyConflict) {
+                  return;
+                }
+
+                commitPlacementRequests(pendingDependencyConflict.placements, {
+                  source: `${pendingDependencyConflict.source}-break-dependencies`,
+                  dependencyResolution: "break-conflicting-links",
+                  removeDependencyIds: pendingDependencyConflict.conflicts.map(
+                    (conflict) => conflict.id
+                  ),
+                  traceMetadata: {
+                    ...pendingDependencyConflict.traceMetadata,
+                    promptDecision: "break-conflicting-links",
+                    brokenDependencyIds: pendingDependencyConflict.conflicts.map(
+                      (conflict) => conflict.id
+                    ),
+                  },
+                });
+                setPendingDependencyConflict(null);
+              }}
+            >
+              Break conflicting links
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <Dialog
         open={Boolean(pendingEarlierShift)}

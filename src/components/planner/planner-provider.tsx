@@ -8,6 +8,7 @@ import {
   deleteProjectFromState,
   rescheduleProjects,
   updateProjectPlacement,
+  updateProjectPlacements,
   wouldCreateDependencyCycle,
 } from "@/lib/planner/scheduler";
 import type {
@@ -16,6 +17,7 @@ import type {
   ProjectDeleteMode,
   ProjectEditorState,
   ProjectPlacement,
+  ProjectPlacementRequest,
   ProjectPlacementOptions,
 } from "@/lib/planner/types";
 
@@ -30,6 +32,11 @@ type PlannerAction =
       type: "PLACE_PROJECT";
       projectId: string;
       placement: ProjectPlacement;
+      options?: ProjectPlacementOptions;
+    }
+  | {
+      type: "PLACE_PROJECTS";
+      placements: ProjectPlacementRequest[];
       options?: ProjectPlacementOptions;
     }
   | {
@@ -114,6 +121,8 @@ function plannerReducer(state: PlannerState, action: PlannerAction): PlannerStat
     }
     case "PLACE_PROJECT":
       return updateProjectPlacement(state, action.projectId, action.placement, action.options);
+    case "PLACE_PROJECTS":
+      return updateProjectPlacements(state, action.placements, action.options);
     case "UNSCHEDULE_PROJECT": {
       const nextProjects = state.projects.map((project) =>
         project.id === action.projectId
@@ -171,6 +180,10 @@ type PlannerContextValue = {
     placement: ProjectPlacement,
     options?: ProjectPlacementOptions
   ) => void;
+  placeProjects: (
+    placements: ProjectPlacementRequest[],
+    options?: ProjectPlacementOptions
+  ) => void;
   unscheduleProject: (projectId: string) => void;
   deleteProject: (projectId: string, mode?: ProjectDeleteMode) => void;
   addClosure: (values: ClosureFormState) => void;
@@ -198,6 +211,9 @@ export function PlannerProvider({ children }: { children: React.ReactNode }) {
       },
       placeProject(projectId, placement, options) {
         dispatch({ type: "PLACE_PROJECT", projectId, placement, options });
+      },
+      placeProjects(placements, options) {
+        dispatch({ type: "PLACE_PROJECTS", placements, options });
       },
       unscheduleProject(projectId) {
         dispatch({ type: "UNSCHEDULE_PROJECT", projectId });

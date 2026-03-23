@@ -2,11 +2,14 @@ import { describe, expect, test } from "bun:test";
 
 import { makeSlotKey } from "@/lib/planner/calendar";
 import {
+  detectDependencyConflicts,
   deleteProjectFromState,
   getEarlierShiftPrompt,
+  getTouchingProjectChain,
   rescheduleProjects,
   setSchedulerTraceEnabled,
   updateProjectPlacement,
+  updateProjectPlacements,
   wouldCreateDependencyCycle,
 } from "@/lib/planner/scheduler";
 import type { PlannerState } from "@/lib/planner/types";
@@ -319,5 +322,222 @@ describe("scheduler", () => {
     expect(calls.some((entry) => entry.includes("updateProjectPlacement"))).toBe(true);
     expect(calls.some((entry) => entry.includes("queues.before"))).toBe(true);
     expect(calls.some((entry) => entry === "end")).toBe(true);
+  });
+
+  test("detects dependency conflicts when a successor is dragged before its predecessor", () => {
+    const state: PlannerState = {
+      projects: [
+        {
+          id: "build",
+          title: "Build",
+          status: "scheduled",
+          plannedTeam: "team-b",
+          estimatedDurationHalfDays: 4,
+          scheduledTeam: "team-b",
+          scheduledStartSlot: makeSlotKey("2026-03-30", "AM"),
+          scheduledDurationHalfDays: 4,
+          sequenceOrder: 0,
+        },
+        {
+          id: "handover",
+          title: "Handover",
+          status: "scheduled",
+          plannedTeam: "team-b",
+          estimatedDurationHalfDays: 2,
+          scheduledTeam: "team-b",
+          scheduledStartSlot: makeSlotKey("2026-04-01", "AM"),
+          scheduledDurationHalfDays: 2,
+          sequenceOrder: 1,
+        },
+      ],
+      dependencies: [
+        {
+          id: "dep-build-handover",
+          predecessorProjectId: "build",
+          successorProjectId: "handover",
+          lagHalfDays: 0,
+        },
+      ],
+      closures: [],
+    };
+
+    const conflicts = detectDependencyConflicts(state, [
+      {
+        projectId: "handover",
+        placement: {
+          teamId: "team-b",
+          startSlot: makeSlotKey("2026-03-27", "AM"),
+          durationHalfDays: 2,
+        },
+      },
+    ]);
+
+    expect(conflicts.map((conflict) => conflict.id)).toEqual(["dep-build-handover"]);
+  });
+
+  test("breaking conflicting links keeps the dragged placement exact", () => {
+    const state: PlannerState = {
+      projects: [
+        {
+          id: "build",
+          title: "Build",
+          status: "scheduled",
+          plannedTeam: "team-b",
+          estimatedDurationHalfDays: 4,
+          scheduledTeam: "team-b",
+          scheduledStartSlot: makeSlotKey("2026-03-30", "AM"),
+          scheduledDurationHalfDays: 4,
+          sequenceOrder: 0,
+        },
+        {
+          id: "handover",
+          title: "Handover",
+          status: "scheduled",
+          plannedTeam: "team-b",
+          estimatedDurationHalfDays: 2,
+          scheduledTeam: "team-b",
+          scheduledStartSlot: makeSlotKey("2026-04-01", "AM"),
+          scheduledDurationHalfDays: 2,
+          sequenceOrder: 1,
+        },
+      ],
+      dependencies: [
+        {
+          id: "dep-build-handover",
+          predecessorProjectId: "build",
+          successorProjectId: "handover",
+          lagHalfDays: 0,
+        },
+      ],
+      closures: [],
+    };
+
+    const nextState = updateProjectPlacements(
+      state,
+      [
+        {
+          projectId: "handover",
+          placement: {
+            teamId: "team-b",
+            startSlot: makeSlotKey("2026-03-27", "AM"),
+            durationHalfDays: 2,
+          },
+        },
+      ],
+      {
+        dependencyResolution: "break-conflicting-links",
+        removeDependencyIds: ["dep-build-handover"],
+      }
+    );
+
+    expect(nextState.dependencies).toHaveLength(0);
+    expect(
+      nextState.projects.find((project) => project.id === "handover" && project.status === "scheduled")
+        ?.scheduledStartSlot
+    ).toBe(makeSlotKey("2026-03-27", "AM"));
+  });
+
+  test("preserving dependencies keeps a successor behind its predecessor without runaway drift", () => {
+    const state: PlannerState = {
+      projects: [
+        {
+          id: "build",
+          title: "Build",
+          status: "scheduled",
+          plannedTeam: "team-b",
+          estimatedDurationHalfDays: 4,
+          scheduledTeam: "team-b",
+          scheduledStartSlot: makeSlotKey("2026-03-30", "AM"),
+          scheduledDurationHalfDays: 4,
+          sequenceOrder: 0,
+        },
+        {
+          id: "handover",
+          title: "Handover",
+          status: "scheduled",
+          plannedTeam: "team-b",
+          estimatedDurationHalfDays: 2,
+          scheduledTeam: "team-b",
+          scheduledStartSlot: makeSlotKey("2026-04-01", "AM"),
+          scheduledDurationHalfDays: 2,
+          sequenceOrder: 1,
+        },
+      ],
+      dependencies: [
+        {
+          id: "dep-build-handover",
+          predecessorProjectId: "build",
+          successorProjectId: "handover",
+          lagHalfDays: 0,
+        },
+      ],
+      closures: [],
+    };
+
+    const nextState = updateProjectPlacements(state, [
+      {
+        projectId: "handover",
+        placement: {
+          teamId: "team-b",
+          startSlot: makeSlotKey("2026-03-27", "AM"),
+          durationHalfDays: 2,
+        },
+      },
+    ]);
+
+    const build = nextState.projects.find(
+      (project) => project.id === "build" && project.status === "scheduled"
+    );
+    const handover = nextState.projects.find(
+      (project) => project.id === "handover" && project.status === "scheduled"
+    );
+
+    expect(build?.scheduledStartSlot).toBe(makeSlotKey("2026-03-30", "AM"));
+    expect(handover?.scheduledStartSlot).toBe(makeSlotKey("2026-04-01", "AM"));
+  });
+
+  test("finds touching chains across a weekend gap with no working-time break", () => {
+    const state: PlannerState = {
+      projects: [
+        {
+          id: "a-1",
+          title: "Friday block",
+          status: "scheduled",
+          plannedTeam: "team-a",
+          estimatedDurationHalfDays: 2,
+          scheduledTeam: "team-a",
+          scheduledStartSlot: makeSlotKey("2026-03-27", "AM"),
+          scheduledDurationHalfDays: 2,
+          sequenceOrder: 0,
+        },
+        {
+          id: "a-2",
+          title: "Monday block",
+          status: "scheduled",
+          plannedTeam: "team-a",
+          estimatedDurationHalfDays: 2,
+          scheduledTeam: "team-a",
+          scheduledStartSlot: makeSlotKey("2026-03-30", "AM"),
+          scheduledDurationHalfDays: 2,
+          sequenceOrder: 1,
+        },
+        {
+          id: "a-3",
+          title: "Later block",
+          status: "scheduled",
+          plannedTeam: "team-a",
+          estimatedDurationHalfDays: 2,
+          scheduledTeam: "team-a",
+          scheduledStartSlot: makeSlotKey("2026-04-01", "AM"),
+          scheduledDurationHalfDays: 2,
+          sequenceOrder: 2,
+        },
+      ],
+      dependencies: [],
+      closures: [],
+    };
+
+    expect(getTouchingProjectChain(state, "a-1")).toEqual(["a-1", "a-2"]);
+    expect(getTouchingProjectChain(state, "a-2")).toEqual(["a-1", "a-2"]);
   });
 });

@@ -124,7 +124,9 @@ function ScheduledProjectCard({
   left,
   width,
   dependencyCount,
+  selected,
   onSelect,
+  onPointerDown,
 }: {
   project: Project & {
     scheduledTeam: TeamId;
@@ -135,7 +137,9 @@ function ScheduledProjectCard({
   left: string;
   width: string;
   dependencyCount: number;
-  onSelect: (projectId: string) => void;
+  selected: boolean;
+  onSelect: (projectId: string, shiftKey: boolean) => void;
+  onPointerDown: (projectId: string, shiftKey: boolean) => void;
 }) {
   const sharedData = {
     type: "scheduled" as const,
@@ -196,6 +200,7 @@ function ScheduledProjectCard({
         project.scheduledTeam === "team-a"
           ? "bg-[linear-gradient(150deg,rgba(41,123,138,0.18),rgba(255,255,255,0.96))]"
           : "bg-[linear-gradient(150deg,rgba(203,129,53,0.18),rgba(255,255,255,0.96))]",
+        selected && "border-primary/60 ring-2 ring-primary/35",
         isDragging && "opacity-40 shadow-lg"
       )}
       style={{
@@ -207,7 +212,8 @@ function ScheduledProjectCard({
       <button
         type="button"
         className="flex h-full w-full flex-col justify-between rounded-2xl px-5 py-3 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-        onClick={() => onSelect(project.id)}
+        onPointerDownCapture={(event) => onPointerDown(project.id, event.shiftKey)}
+        onClick={(event) => onSelect(project.id, event.shiftKey)}
         {...moveAttributes}
         {...moveListeners}
       >
@@ -232,6 +238,11 @@ function ScheduledProjectCard({
             <MoveHorizontal className="size-3" />
             Move
           </Badge>
+          {selected ? (
+            <Badge variant="outline" className="rounded-full bg-background/70">
+              Selected
+            </Badge>
+          ) : null}
         </div>
       </button>
 
@@ -416,7 +427,9 @@ function YearMonthRow({
   projects,
   dependencies,
   pendingPlacement,
+  selectedProjectIds,
   onSelectProject,
+  onProjectPointerDown,
 }: {
   teamId: TeamId;
   section: YearMonthSection;
@@ -428,7 +441,9 @@ function YearMonthRow({
   })[];
   dependencies: ProjectDependency[];
   pendingPlacement: QuickPlacementState | null;
-  onSelectProject: (projectId: string) => void;
+  selectedProjectIds: string[];
+  onSelectProject: (projectId: string, shiftKey: boolean) => void;
+  onProjectPointerDown: (projectId: string, shiftKey: boolean) => void;
 }) {
   const days = eachDayOfInterval({
     start: parseISO(section.startDate),
@@ -514,7 +529,9 @@ function YearMonthRow({
                 left={`${(bounds.startOffset / section.dayCount) * 100}%`}
                 width={`${(Math.max(bounds.endOffset - bounds.startOffset, 0.9) / section.dayCount) * 100}%`}
                 dependencyCount={dependencyCount}
+                selected={selectedProjectIds.includes(project.id)}
                 onSelect={onSelectProject}
+                onPointerDown={onProjectPointerDown}
               />
             );
           })}
@@ -529,13 +546,17 @@ function YearView({
   dependencies,
   closures,
   pendingPlacement,
+  selectedProjectIds,
   onSelectProject,
+  onProjectPointerDown,
 }: {
   projects: Project[];
   dependencies: ProjectDependency[];
   closures: ClosurePeriod[];
   pendingPlacement: QuickPlacementState | null;
-  onSelectProject: (projectId: string) => void;
+  selectedProjectIds: string[];
+  onSelectProject: (projectId: string, shiftKey: boolean) => void;
+  onProjectPointerDown: (projectId: string, shiftKey: boolean) => void;
 }) {
   const sections = useMemo(
     () => buildYearSections(getAnchorYear(projects, closures)),
@@ -574,7 +595,9 @@ function YearView({
                 projects={scheduledProjects.filter((project) => project.scheduledTeam === team.id)}
                 dependencies={dependencies}
                 pendingPlacement={pendingPlacement}
+                selectedProjectIds={selectedProjectIds}
                 onSelectProject={onSelectProject}
+                onProjectPointerDown={onProjectPointerDown}
               />
             ))}
           </div>
@@ -589,21 +612,25 @@ export function TimelineCanvas({
   dependencies,
   closures,
   pendingPlacement,
+  selectedProjectIds,
   traceEnabled,
   onTraceEnabledChange,
   onPendingPlacementChange,
   onQuickPlacementCommit,
   onSelectProject,
+  onProjectPointerDown,
 }: {
   projects: Project[];
   dependencies: ProjectDependency[];
   closures: ClosurePeriod[];
   pendingPlacement: QuickPlacementState | null;
+  selectedProjectIds: string[];
   traceEnabled: boolean;
   onTraceEnabledChange: (enabled: boolean) => void;
   onPendingPlacementChange: (placement: QuickPlacementState | null) => void;
   onQuickPlacementCommit: (projectId: string, placement: ProjectPlacement) => void;
-  onSelectProject: (projectId: string) => void;
+  onSelectProject: (projectId: string, shiftKey: boolean) => void;
+  onProjectPointerDown: (projectId: string, shiftKey: boolean) => void;
 }) {
   return (
     <Popover
@@ -625,6 +652,9 @@ export function TimelineCanvas({
               <h2 className="mt-1 font-heading text-2xl font-semibold text-foreground">
                 Year view with direct move and resize controls
               </h2>
+              <p className="mt-2 text-sm text-muted-foreground">
+                Hold Shift on a touching chain to move the full block together.
+              </p>
             </div>
 
             <div className="flex flex-wrap items-center gap-2">
@@ -646,7 +676,9 @@ export function TimelineCanvas({
             dependencies={dependencies}
             closures={closures}
             pendingPlacement={pendingPlacement}
+            selectedProjectIds={selectedProjectIds}
             onSelectProject={onSelectProject}
+            onProjectPointerDown={onProjectPointerDown}
           />
         </CardContent>
       </Card>

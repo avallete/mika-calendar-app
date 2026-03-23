@@ -19,6 +19,9 @@ export type ClosureType = (typeof closureTypeOptions)[number]["id"];
 export type ProjectStatus = "draft" | "scheduled";
 export type ProjectDeleteMode = "preserve-dates" | "compact-schedule";
 export type ProjectPlacementStrategy = "preserve" | "compact-same-team";
+export type DependencyResolutionMode =
+  | "preserve-dependencies"
+  | "break-conflicting-links";
 export type SlotPart = "AM" | "PM";
 export type SlotKey = `${string}-${SlotPart}`;
 export type ScheduledDragIntent = "move" | "resize-start" | "resize-end";
@@ -64,9 +67,26 @@ export type ProjectPlacement = {
   durationHalfDays: number;
 };
 
+export type ProjectPlacementRequest = {
+  projectId: string;
+  placement: ProjectPlacement;
+};
+
+export type DependencyConflict = {
+  id: string;
+  predecessorProjectId: string;
+  predecessorTitle: string;
+  successorProjectId: string;
+  successorTitle: string;
+  lagHalfDays: number;
+};
+
 export type ProjectPlacementOptions = {
   strategy?: ProjectPlacementStrategy;
   source?: string;
+  dependencyResolution?: DependencyResolutionMode;
+  removeDependencyIds?: string[];
+  traceMetadata?: Record<string, unknown>;
 };
 
 export type CalendarBucket = {
@@ -92,6 +112,7 @@ export type DragProjectMeta =
       durationHalfDays: number;
       calendarEndSlot: SlotKey;
       title: string;
+      selectionProjectIds?: string[];
     };
 
 export type QuickPlacementState = {
@@ -107,6 +128,16 @@ export type EarlierShiftPromptState = {
   interaction: Extract<ScheduledDragIntent, "move" | "resize-start">;
   previousStartSlot: SlotKey;
   placement: ProjectPlacement;
+};
+
+export type DependencyConflictPromptState = {
+  projectIds: string[];
+  placements: ProjectPlacementRequest[];
+  primaryProjectId: string;
+  primaryTitle: string;
+  conflicts: DependencyConflict[];
+  source: string;
+  traceMetadata?: Record<string, unknown>;
 };
 
 export type YearMonthSection = {
