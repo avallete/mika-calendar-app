@@ -1,36 +1,44 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# AppCalendar Mika
 
-## Getting Started
+Single-user scheduling cockpit for Team A / Team B planning, built with Bun, Next.js, shadcn/ui, drag-and-drop scheduling, and a PostgreSQL + Drizzle schema.
 
-First, run the development server:
+## Stack
+
+- Bun runtime and package manager
+- Next.js App Router + React 19 + TypeScript
+- shadcn/ui + Tailwind CSS
+- `@dnd-kit/*` for drag and drop
+- `@tanstack/react-virtual` for the timeline viewport
+- PostgreSQL schema via Drizzle ORM + Drizzle Kit
+
+## Scripts
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+bun run dev
+bun run build
+bun run lint
+bun test
+bun run db:generate
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+## Environment
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+Copy `.env.example` to `.env.local` and set a PostgreSQL connection string:
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+```bash
+DATABASE_URL=postgres://planner:planner@localhost:5432/app_calendar_mika
+```
 
-## Learn More
+The current UI runs against seeded demo data in memory so the app can boot without a live database, but the Drizzle schema and initial migration are already included.
 
-To learn more about Next.js, take a look at the following resources:
+## Main Routes
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+- `/` scheduler workbench with draft sidebar, team lanes, drag/drop, zoom levels, and closure management
+- `/drafts` list-based draft input view with dependency editing
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+## Scheduling Rules
 
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+- Half-day planning granularity (`AM` / `PM`)
+- Weekends and company closures pause progress
+- Same-team edits preserve order and push later work forward
+- Cross-team tasks move only when their explicit blocker changes
