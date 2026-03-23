@@ -77,15 +77,29 @@ export function isNonWorkingDate(date: string, closures: ClosurePeriod[]) {
   return closures.some((closure) => isDateInsideClosure(date, closure));
 }
 
-export function normalizeToWorkingSlot(slotKey: SlotKey, closures: ClosurePeriod[]) {
-  let cursor = slotKey;
+export function nextWorkingDate(date: string, closures: ClosurePeriod[]) {
+  let cursor = date;
 
-  while (isNonWorkingDate(parseSlotKey(cursor).date, closures)) {
-    const nextDate = format(addDays(parseISO(parseSlotKey(cursor).date), 1), "yyyy-MM-dd");
-    cursor = makeSlotKey(nextDate, "AM");
+  while (isNonWorkingDate(cursor, closures)) {
+    cursor = format(addDays(parseISO(cursor), 1), "yyyy-MM-dd");
   }
 
   return cursor;
+}
+
+export function previousWorkingDate(date: string, closures: ClosurePeriod[]) {
+  let cursor = date;
+
+  while (isNonWorkingDate(cursor, closures)) {
+    cursor = format(addDays(parseISO(cursor), -1), "yyyy-MM-dd");
+  }
+
+  return cursor;
+}
+
+export function normalizeToWorkingSlot(slotKey: SlotKey, closures: ClosurePeriod[]) {
+  const { date } = parseSlotKey(slotKey);
+  return makeSlotKey(nextWorkingDate(date, closures), "AM");
 }
 
 export function advanceWorkingDuration(
@@ -95,19 +109,31 @@ export function advanceWorkingDuration(
 ) {
   let cursor = normalizeToWorkingSlot(requestedStart, closures);
   let remaining = Math.max(1, durationHalfDays);
+  const skippedDates = new Set<string>();
 
   while (remaining > 0) {
-    if (!isNonWorkingDate(parseSlotKey(cursor).date, closures)) {
+    const { date } = parseSlotKey(cursor);
+
+    if (!isNonWorkingDate(date, closures)) {
       remaining -= 1;
+    } else {
+      skippedDates.add(date);
     }
 
     cursor = nextCalendarSlot(cursor);
   }
 
+  const normalizedReadySlot = normalizeToWorkingSlot(cursor, closures);
+  const readyDate = parseSlotKey(normalizedReadySlot).date;
+  if (readyDate !== parseSlotKey(cursor).date) {
+    skippedDates.add(parseSlotKey(cursor).date);
+  }
+
   return {
     startSlot: normalizeToWorkingSlot(requestedStart, closures),
     calendarEndSlot: cursor,
-    readySlot: normalizeToWorkingSlot(cursor, closures),
+    readySlot: normalizedReadySlot,
+    skippedDates: [...skippedDates].sort(),
   };
 }
 
@@ -127,6 +153,25 @@ export function addWorkingLag(
   }
 
   return normalizeToWorkingSlot(cursor, closures);
+}
+
+export function countWorkingHalfDays(
+  startSlot: SlotKey,
+  endSlotExclusive: SlotKey,
+  closures: ClosurePeriod[]
+) {
+  let cursor = normalizeToWorkingSlot(startSlot, closures);
+  let count = 0;
+
+  while (compareSlotKeys(cursor, endSlotExclusive) < 0) {
+    if (!isNonWorkingDate(parseSlotKey(cursor).date, closures)) {
+      count += 1;
+    }
+
+    cursor = nextCalendarSlot(cursor);
+  }
+
+  return count;
 }
 
 export function slotIndexFromDate(startDate: string, slotKey: SlotKey) {
@@ -152,21 +197,7 @@ export function formatSlotLabel(slotKey: SlotKey, zoom: ZoomLevel) {
   const { date, part } = parseSlotKey(slotKey);
   const parsedDate = parseISO(date);
 
-  if (zoom === "half-day") {
-    return `${format(parsedDate, "dd MMM")} ${part}`;
-  }
-
-  if (zoom === "day") {
-    return format(parsedDate, "EEE dd");
-  }
-
-  if (zoom === "week") {
-    return format(parsedDate, "dd MMM");
-  }
-
-  if (zoom === "month") {
-    return format(parsedDate, "MMM");
-  }
-
+  void part;
+  void zoom;
   return format(parsedDate, "yyyy");
 }

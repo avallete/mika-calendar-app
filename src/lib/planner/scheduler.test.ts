@@ -3,7 +3,9 @@ import { describe, expect, test } from "bun:test";
 import { makeSlotKey } from "@/lib/planner/calendar";
 import {
   deleteProjectFromState,
+  getEarlierShiftPrompt,
   rescheduleProjects,
+  setSchedulerTraceEnabled,
   updateProjectPlacement,
   wouldCreateDependencyCycle,
 } from "@/lib/planner/scheduler";
@@ -182,5 +184,140 @@ describe("scheduler", () => {
 
     expect(teamA?.scheduledStartSlot).toBe(makeSlotKey("2026-03-23", "AM"));
     expect(teamB?.scheduledStartSlot).toBe(makeSlotKey("2026-03-23", "AM"));
+  });
+
+  test("normalizes weekend moves to the next working start slot", () => {
+    const nextState = updateProjectPlacement(baseState(), "a-2", {
+      teamId: "team-a",
+      startSlot: makeSlotKey("2026-03-28", "AM"),
+      durationHalfDays: 2,
+    });
+
+    const movedProject = nextState.projects.find((project) => project.id === "a-2");
+    expect(movedProject?.scheduledStartSlot).toBe(makeSlotKey("2026-03-30", "AM"));
+  });
+
+  test("suggests an earlier-shift prompt only when the earlier gap is empty", () => {
+    const prompt = getEarlierShiftPrompt(
+      {
+        ...baseState(),
+        projects: baseState().projects.map((project) =>
+          project.id === "a-2"
+            ? {
+                ...project,
+                scheduledStartSlot: makeSlotKey("2026-03-30", "AM"),
+              }
+            : project
+        ),
+      },
+      "a-2",
+      {
+        teamId: "team-a",
+        startSlot: makeSlotKey("2026-03-26", "AM"),
+        durationHalfDays: 2,
+      },
+      "move"
+    );
+
+    const blockedPrompt = getEarlierShiftPrompt(
+      baseState(),
+      "a-2",
+      {
+        teamId: "team-a",
+        startSlot: makeSlotKey("2026-03-24", "AM"),
+        durationHalfDays: 2,
+      },
+      "move"
+    );
+
+    expect(prompt?.placement.startSlot).toBe(makeSlotKey("2026-03-26", "AM"));
+    expect(blockedPrompt).toBeNull();
+  });
+
+  test("compacts later same-team work when an earlier move requests queue compaction", () => {
+    const state = baseState();
+    const movedProject = state.projects.find((project) => project.id === "a-2");
+    if (!movedProject) {
+      throw new Error("Expected Team A follow-up in base state.");
+    }
+
+    const nextState = updateProjectPlacement(
+      {
+        ...state,
+        projects: [
+          ...state.projects.filter((project) => project.id !== "a-2"),
+          {
+            id: "a-3",
+            title: "Team A final",
+            status: "scheduled" as const,
+            plannedTeam: "team-a" as const,
+            estimatedDurationHalfDays: 2,
+            scheduledTeam: "team-a" as const,
+            scheduledStartSlot: makeSlotKey("2026-04-03", "AM"),
+            scheduledDurationHalfDays: 2,
+            sequenceOrder: 2,
+          },
+          {
+            ...movedProject,
+            scheduledStartSlot: makeSlotKey("2026-03-31", "AM"),
+          },
+        ],
+      },
+      "a-2",
+      {
+        teamId: "team-a",
+        startSlot: makeSlotKey("2026-03-26", "AM"),
+        durationHalfDays: 2,
+      },
+      {
+        strategy: "compact-same-team",
+        source: "test",
+      }
+    );
+
+    const followingProject = nextState.projects.find((project) => project.id === "a-3");
+    expect(followingProject?.scheduledStartSlot).toBe(makeSlotKey("2026-03-27", "AM"));
+  });
+
+  test("emits trace logs when scheduler tracing is enabled", () => {
+    const originalGroupCollapsed = console.groupCollapsed;
+    const originalLog = console.log;
+    const originalGroupEnd = console.groupEnd;
+    const calls: string[] = [];
+
+    console.groupCollapsed = ((...args: unknown[]) => {
+      calls.push(`group:${String(args[0])}`);
+    }) as typeof console.groupCollapsed;
+    console.log = ((...args: unknown[]) => {
+      calls.push(`log:${String(args[0])}`);
+    }) as typeof console.log;
+    console.groupEnd = (() => {
+      calls.push("end");
+    }) as typeof console.groupEnd;
+
+    try {
+      setSchedulerTraceEnabled(true);
+      updateProjectPlacement(
+        baseState(),
+        "a-2",
+        {
+          teamId: "team-a",
+          startSlot: makeSlotKey("2026-03-27", "AM"),
+          durationHalfDays: 2,
+        },
+        {
+          source: "trace-test",
+        }
+      );
+    } finally {
+      setSchedulerTraceEnabled(false);
+      console.groupCollapsed = originalGroupCollapsed;
+      console.log = originalLog;
+      console.groupEnd = originalGroupEnd;
+    }
+
+    expect(calls.some((entry) => entry.includes("updateProjectPlacement"))).toBe(true);
+    expect(calls.some((entry) => entry.includes("queues.before"))).toBe(true);
+    expect(calls.some((entry) => entry === "end")).toBe(true);
   });
 });

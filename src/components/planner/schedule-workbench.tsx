@@ -1,5 +1,6 @@
 "use client";
 
+import { addDays, format, parseISO } from "date-fns";
 import {
   DndContext,
   DragOverlay,
@@ -11,7 +12,7 @@ import {
   type DragEndEvent,
   type DragStartEvent,
 } from "@dnd-kit/core";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import { CalendarPlus2, Sparkles, X } from "lucide-react";
 
 import { ClosureSheet } from "@/components/planner/closure-sheet";
@@ -23,19 +24,148 @@ import { TimelineCanvas } from "@/components/planner/timeline-canvas";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Separator } from "@/components/ui/separator";
 import {
   SidebarInset,
   SidebarProvider,
   SidebarTrigger,
 } from "@/components/ui/sidebar";
+import {
+  compareSlotKeys,
+  countWorkingHalfDays,
+  makeSlotKey,
+  nextCalendarSlot,
+  parseSlotKey,
+  previousWorkingDate,
+} from "@/lib/planner/calendar";
+import {
+  getEarlierShiftPrompt,
+  setSchedulerTraceEnabled,
+} from "@/lib/planner/scheduler";
 import type {
   CalendarBucket,
+  ClosurePeriod,
   DragProjectMeta,
+  EarlierShiftPromptState,
+  ProjectPlacement,
   QuickPlacementState,
-  ZoomLevel,
+  SlotKey,
 } from "@/lib/planner/types";
 import { isScheduledProject } from "@/lib/planner/types";
+
+const TRACE_STORAGE_KEY = "planner-trace-enabled";
+const TRACE_STORAGE_EVENT = "planner-trace-storage";
+
+function subscribeToTracePreference(callback: () => void) {
+  if (typeof window === "undefined") {
+    return () => {};
+  }
+
+  const handleChange = () => callback();
+  window.addEventListener("storage", handleChange);
+  window.addEventListener(TRACE_STORAGE_EVENT, handleChange);
+
+  return () => {
+    window.removeEventListener("storage", handleChange);
+    window.removeEventListener(TRACE_STORAGE_EVENT, handleChange);
+  };
+}
+
+function getTracePreferenceSnapshot() {
+  if (typeof window === "undefined") {
+    return false;
+  }
+
+  return window.localStorage.getItem(TRACE_STORAGE_KEY) === "true";
+}
+
+function getDragLabel(activeDrag: DragProjectMeta | null) {
+  if (!activeDrag) {
+    return null;
+  }
+
+  if (activeDrag.type === "draft") {
+    return activeDrag.title;
+  }
+
+  if (activeDrag.intent === "resize-start") {
+    return `Resize start: ${activeDrag.title}`;
+  }
+
+  if (activeDrag.intent === "resize-end") {
+    return `Resize end: ${activeDrag.title}`;
+  }
+
+  return activeDrag.title;
+}
+
+function getLatestAllowedResizeStartSlot(
+  calendarEndSlot: SlotKey,
+  closures: ClosurePeriod[]
+) {
+  const { date, part } = parseSlotKey(calendarEndSlot);
+  const inclusiveEndDate =
+    part === "AM"
+      ? format(addDays(parseISO(date), -1), "yyyy-MM-dd")
+      : previousWorkingDate(date, closures);
+
+  return makeSlotKey(previousWorkingDate(inclusiveEndDate, closures), "AM");
+}
+
+function buildScheduledPlacement(
+  active: Extract<DragProjectMeta, { type: "scheduled" }>,
+  bucket: CalendarBucket,
+  closures: ClosurePeriod[]
+): ProjectPlacement | null {
+  if (active.intent === "move") {
+    return {
+      teamId: bucket.teamId,
+      startSlot: bucket.startSlot,
+      durationHalfDays: active.durationHalfDays,
+    };
+  }
+
+  if (bucket.teamId !== active.teamId) {
+    return null;
+  }
+
+  if (active.intent === "resize-start") {
+    const latestAllowedStart = getLatestAllowedResizeStartSlot(active.calendarEndSlot, closures);
+    const startSlot =
+      compareSlotKeys(bucket.startSlot, latestAllowedStart) > 0
+        ? latestAllowedStart
+        : bucket.startSlot;
+
+    return {
+      teamId: active.teamId,
+      startSlot,
+      durationHalfDays: Math.max(
+        2,
+        countWorkingHalfDays(startSlot, active.calendarEndSlot, closures)
+      ),
+    };
+  }
+
+  const targetDate = previousWorkingDate(bucket.startSlot.slice(0, 10), closures);
+  const endSlotExclusive = nextCalendarSlot(makeSlotKey(targetDate, "PM"));
+
+  return {
+    teamId: active.teamId,
+    startSlot: active.startSlot,
+    durationHalfDays: Math.max(
+      2,
+      countWorkingHalfDays(active.startSlot, endSlotExclusive, closures)
+    ),
+  };
+}
 
 export function ScheduleWorkbench() {
   const {
@@ -47,11 +177,17 @@ export function ScheduleWorkbench() {
     unscheduleProject,
     deleteProject,
   } = usePlanner();
-  const [zoom, setZoom] = useState<ZoomLevel>("week");
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
   const [pendingPlacement, setPendingPlacement] = useState<QuickPlacementState | null>(null);
+  const [pendingEarlierShift, setPendingEarlierShift] =
+    useState<EarlierShiftPromptState | null>(null);
   const [closureSheetOpen, setClosureSheetOpen] = useState(false);
   const [activeDrag, setActiveDrag] = useState<DragProjectMeta | null>(null);
+  const traceEnabled = useSyncExternalStore(
+    subscribeToTracePreference,
+    getTracePreferenceSnapshot,
+    () => false
+  );
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
     useSensor(KeyboardSensor)
@@ -65,6 +201,19 @@ export function ScheduleWorkbench() {
     () => state.projects.find((project) => project.id === selectedProjectId) ?? null,
     [selectedProjectId, state.projects]
   );
+
+  useEffect(() => {
+    setSchedulerTraceEnabled(traceEnabled);
+  }, [traceEnabled]);
+
+  const updateTraceEnabled = (enabled: boolean) => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    window.localStorage.setItem(TRACE_STORAGE_KEY, String(enabled));
+    window.dispatchEvent(new Event(TRACE_STORAGE_EVENT));
+  };
 
   const handleDragStart = (event: DragStartEvent) => {
     const data = event.active.data.current as DragProjectMeta | undefined;
@@ -95,12 +244,29 @@ export function ScheduleWorkbench() {
       return;
     }
 
-    setPendingPlacement(null);
-    placeProject(active.projectId, {
-      teamId: bucket.teamId,
-      startSlot: bucket.startSlot,
-      durationHalfDays: active.durationHalfDays,
+    const nextPlacement = buildScheduledPlacement(active, bucket, state.closures);
+    if (!nextPlacement) {
+      return;
+    }
+
+    if (active.intent === "move" || active.intent === "resize-start") {
+      const prompt = getEarlierShiftPrompt(
+        state,
+        active.projectId,
+        nextPlacement,
+        active.intent
+      );
+
+      if (prompt) {
+        setPendingEarlierShift(prompt);
+        return;
+      }
+    }
+
+    placeProject(active.projectId, nextPlacement, {
+      source: `drag-${active.intent}`,
     });
+    setPendingPlacement(null);
   };
 
   return (
@@ -126,11 +292,12 @@ export function ScheduleWorkbench() {
                   </p>
                 </div>
                 <h2 className="font-heading text-3xl font-semibold text-foreground">
-                  Team A and Team B stay in sync without manual replanning
+                  One stacked year view for the full delivery plan
                 </h2>
                 <p className="max-w-3xl text-sm leading-6 text-muted-foreground">
-                  Drag draft projects from the left sidebar, adjust placement inline, and
-                  let closures plus dependencies push the rest of the plan automatically.
+                  Drag drafts into the year planner, resize live projects directly on the
+                  timeline, and use the trace toggle when weekend or dependency behavior
+                  needs debugging.
                 </p>
               </div>
 
@@ -138,11 +305,11 @@ export function ScheduleWorkbench() {
                 <CardContent className="space-y-3 p-4">
                   <div className="flex items-center gap-2 text-sm font-medium text-foreground">
                     <Sparkles className="size-4 text-[var(--team-b)]" />
-                    Push-forward scheduling rules are live
+                    Year planner controls are live
                   </div>
                   <p className="text-sm leading-6 text-muted-foreground">
-                    Same-team order is preserved. Cross-team projects only move when their
-                    incoming blockers actually change.
+                    Body drag moves, edge drag resizes, and same-team earlier shifts can
+                    optionally compact the queue behind the moved project.
                   </p>
                 </CardContent>
               </Card>
@@ -196,15 +363,14 @@ export function ScheduleWorkbench() {
               projects={state.projects}
               dependencies={state.dependencies}
               closures={state.closures}
-              zoom={zoom}
               pendingPlacement={pendingPlacement}
-              onZoomChange={(nextZoom) => {
-                setPendingPlacement(null);
-                setZoom(nextZoom);
-              }}
+              traceEnabled={traceEnabled}
+              onTraceEnabledChange={updateTraceEnabled}
               onPendingPlacementChange={setPendingPlacement}
               onQuickPlacementCommit={(projectId, placement) => {
-                placeProject(projectId, placement);
+                placeProject(projectId, placement, {
+                  source: "draft-drop",
+                });
                 setPendingPlacement(null);
               }}
               onSelectProject={(projectId) => {
@@ -225,7 +391,9 @@ export function ScheduleWorkbench() {
             project={selectedProject}
             dependencies={state.dependencies}
             onSave={(projectId, placement) => {
-              placeProject(projectId, placement);
+              placeProject(projectId, placement, {
+                source: "sheet-edit",
+              });
             }}
             onUnschedule={(projectId) => {
               const project = state.projects.find((value) => value.id === projectId);
@@ -248,11 +416,66 @@ export function ScheduleWorkbench() {
         <DragOverlay>
           {activeDrag ? (
             <div className="rounded-2xl border border-border bg-background/95 px-4 py-3 text-sm font-medium shadow-2xl backdrop-blur">
-              {activeDrag.title}
+              {getDragLabel(activeDrag)}
             </div>
           ) : null}
         </DragOverlay>
       </DndContext>
+
+      <Dialog
+        open={Boolean(pendingEarlierShift)}
+        onOpenChange={(open) => {
+          if (!open) {
+            setPendingEarlierShift(null);
+          }
+        }}
+      >
+        <DialogContent showCloseButton={false} className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>Move later work earlier as well?</DialogTitle>
+            <DialogDescription>
+              {pendingEarlierShift
+                ? `${pendingEarlierShift.title} is moving earlier on ${
+                    pendingEarlierShift.placement.teamId === "team-a" ? "Team A" : "Team B"
+                  }. The gap between ${pendingEarlierShift.previousStartSlot.slice(0, 10)} and the new start is empty, so the rest of that team queue can be compacted if you want.`
+                : ""}
+            </DialogDescription>
+          </DialogHeader>
+
+          <DialogFooter className="sm:justify-between">
+            <Button
+              variant="outline"
+              onClick={() => {
+                if (!pendingEarlierShift) {
+                  return;
+                }
+
+                placeProject(pendingEarlierShift.projectId, pendingEarlierShift.placement, {
+                  source: `prompt-${pendingEarlierShift.interaction}`,
+                });
+                setPendingEarlierShift(null);
+              }}
+            >
+              Keep only this project earlier
+            </Button>
+            <Button
+              onClick={() => {
+                if (!pendingEarlierShift) {
+                  return;
+                }
+
+                placeProject(pendingEarlierShift.projectId, pendingEarlierShift.placement, {
+                  strategy: "compact-same-team",
+                  source: `prompt-compact-${pendingEarlierShift.interaction}`,
+                });
+                setPendingEarlierShift(null);
+              }}
+            >
+              Pull same-team queue earlier
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </SidebarProvider>
   );
 }

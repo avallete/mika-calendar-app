@@ -4,10 +4,6 @@ export const teamOptions = [
 ] as const;
 
 export const zoomLevels = [
-  "half-day",
-  "day",
-  "week",
-  "month",
   "year",
 ] as const;
 
@@ -22,8 +18,10 @@ export type ZoomLevel = (typeof zoomLevels)[number];
 export type ClosureType = (typeof closureTypeOptions)[number]["id"];
 export type ProjectStatus = "draft" | "scheduled";
 export type ProjectDeleteMode = "preserve-dates" | "compact-schedule";
+export type ProjectPlacementStrategy = "preserve" | "compact-same-team";
 export type SlotPart = "AM" | "PM";
 export type SlotKey = `${string}-${SlotPart}`;
+export type ScheduledDragIntent = "move" | "resize-start" | "resize-end";
 
 export type Project = {
   id: string;
@@ -66,6 +64,11 @@ export type ProjectPlacement = {
   durationHalfDays: number;
 };
 
+export type ProjectPlacementOptions = {
+  strategy?: ProjectPlacementStrategy;
+  source?: string;
+};
+
 export type CalendarBucket = {
   bucketId: string;
   teamId: TeamId;
@@ -82,10 +85,12 @@ export type DragProjectMeta =
     }
   | {
       type: "scheduled";
+      intent: ScheduledDragIntent;
       projectId: string;
       teamId: TeamId;
       startSlot: SlotKey;
       durationHalfDays: number;
+      calendarEndSlot: SlotKey;
       title: string;
     };
 
@@ -93,6 +98,14 @@ export type QuickPlacementState = {
   projectId: string;
   title: string;
   triggerId: string;
+  placement: ProjectPlacement;
+};
+
+export type EarlierShiftPromptState = {
+  projectId: string;
+  title: string;
+  interaction: Extract<ScheduledDragIntent, "move" | "resize-start">;
+  previousStartSlot: SlotKey;
   placement: ProjectPlacement;
 };
 

@@ -16,6 +16,7 @@ import type {
   ProjectDeleteMode,
   ProjectEditorState,
   ProjectPlacement,
+  ProjectPlacementOptions,
 } from "@/lib/planner/types";
 
 type PlannerAction =
@@ -29,6 +30,7 @@ type PlannerAction =
       type: "PLACE_PROJECT";
       projectId: string;
       placement: ProjectPlacement;
+      options?: ProjectPlacementOptions;
     }
   | {
       type: "UNSCHEDULE_PROJECT";
@@ -111,7 +113,7 @@ function plannerReducer(state: PlannerState, action: PlannerAction): PlannerStat
       });
     }
     case "PLACE_PROJECT":
-      return updateProjectPlacement(state, action.projectId, action.placement);
+      return updateProjectPlacement(state, action.projectId, action.placement, action.options);
     case "UNSCHEDULE_PROJECT": {
       const nextProjects = state.projects.map((project) =>
         project.id === action.projectId
@@ -164,7 +166,11 @@ type PlannerContextValue = {
   metrics: ReturnType<typeof buildPlannerMetrics>;
   upsertProject: (values: ProjectEditorState, projectId?: string) => void;
   setDependencies: (projectId: string, dependencyIds: string[]) => void;
-  placeProject: (projectId: string, placement: ProjectPlacement) => void;
+  placeProject: (
+    projectId: string,
+    placement: ProjectPlacement,
+    options?: ProjectPlacementOptions
+  ) => void;
   unscheduleProject: (projectId: string) => void;
   deleteProject: (projectId: string, mode?: ProjectDeleteMode) => void;
   addClosure: (values: ClosureFormState) => void;
@@ -190,8 +196,8 @@ export function PlannerProvider({ children }: { children: React.ReactNode }) {
       setDependencies(projectId, dependencyIds) {
         dispatch({ type: "SET_DEPENDENCIES", projectId, dependencyIds });
       },
-      placeProject(projectId, placement) {
-        dispatch({ type: "PLACE_PROJECT", projectId, placement });
+      placeProject(projectId, placement, options) {
+        dispatch({ type: "PLACE_PROJECT", projectId, placement, options });
       },
       unscheduleProject(projectId) {
         dispatch({ type: "UNSCHEDULE_PROJECT", projectId });
