@@ -108,3 +108,7 @@ export function buildCalendarDayState(date: string, closures: ClosurePeriod[]): 
     tone: markers[0]?.tone ?? "working",
   };
 }
+
+export function shouldShowDayTooltip(dayState: CalendarDayState) {
+  return dayState.markers.length > 0;
+}

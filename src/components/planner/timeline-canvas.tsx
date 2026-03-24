@@ -6,6 +6,7 @@ import { addDays, endOfMonth, eachDayOfInterval, format, getDate, getMonth, pars
 import { fr as localeFr } from "date-fns/locale";
 import {
   ArrowRightLeft,
+  CalendarDays,
   CalendarClock,
   GripVertical,
   MoveHorizontal,
@@ -37,6 +38,7 @@ import {
   buildCalendarDayState,
   getClosureImpactLabelFr,
   getClosureTypeLabelFr,
+  shouldShowDayTooltip,
 } from "@/lib/planner/day-markers";
 import { fr } from "@/lib/i18n/fr";
 import {
@@ -295,9 +297,9 @@ function ScheduledProjectCard({
     <div
       ref={setMoveNodeRef}
       className={cn(
-        "absolute top-3 h-[92px] rounded-2xl border border-black/10 shadow-[0_18px_36px_-24px_rgba(0,0,0,0.42)] transition-all duration-200",
+        "absolute top-3 z-10 h-[92px] rounded-2xl border border-black/10 shadow-[0_18px_36px_-24px_rgba(0,0,0,0.42)] transition-all duration-200",
         selected && "border-primary/60 ring-2 ring-primary/35",
-        isDragging && "opacity-40 shadow-lg",
+        isDragging && "pointer-events-none opacity-0 shadow-none",
         dimmed && !isDragging && "opacity-25 saturate-50"
       )}
       style={{
@@ -391,7 +393,7 @@ function PreviewProjectCard({
   return (
     <div
       className={cn(
-        "pointer-events-none absolute top-4 h-[84px] rounded-2xl border border-dashed shadow-[0_18px_40px_-30px_rgba(23,37,84,0.5)] backdrop-blur-sm transition-all duration-200",
+        "pointer-events-none absolute top-4 z-20 h-[84px] rounded-2xl border border-dashed shadow-[0_18px_40px_-30px_rgba(23,37,84,0.5)] backdrop-blur-sm transition-all duration-200",
         primary
           ? "border-primary/65 bg-white/88 ring-2 ring-primary/20"
           : "border-foreground/20 bg-white/55 opacity-80"
@@ -468,6 +470,7 @@ function SlotBucketCell({
   slotIndex,
   slotCount,
   dayState,
+  dragActive,
   active,
   previewActive,
   focused,
@@ -478,6 +481,7 @@ function SlotBucketCell({
   slotIndex: number;
   slotCount: number;
   dayState: CalendarDayState;
+  dragActive: boolean;
   active: boolean;
   previewActive: boolean;
   focused: boolean;
@@ -489,38 +493,42 @@ function SlotBucketCell({
   });
   const part = parseSlotKey(bucket.startSlot).part;
   const tone = toneClasses(dayState.tone);
+  const showTooltip = !dragActive && shouldShowDayTooltip(dayState);
+  const cellTrigger = (
+    <PopoverTrigger
+      id={bucket.bucketId}
+      render={
+        <button
+          ref={setNodeRef}
+          type="button"
+          aria-label={`Placer un projet le ${date} ${part}`}
+          data-focus-anchor={focusAnchor ? date : undefined}
+          className={cn(
+            "absolute inset-y-0 border-r transition-all duration-200 last:border-r-0 hover:z-10 hover:-translate-y-0.5 hover:shadow-[0_12px_24px_-18px_rgba(15,23,42,0.4)]",
+            tone.cell,
+            part === "AM" ? "border-r-white/55" : "border-r-border/35",
+            isOver && "bg-primary/16 shadow-[inset_0_0_0_1px_rgba(37,99,235,0.2)]",
+            previewActive && "bg-primary/10 ring-1 ring-inset ring-primary/35",
+            active && "ring-2 ring-inset ring-primary/60",
+            focused &&
+              "z-20 animate-[pulse_1.5s_ease-in-out_2] ring-2 ring-inset ring-[oklch(0.65_0.18_30)] shadow-[0_0_0_1px_rgba(255,120,80,0.25)]"
+          )}
+          style={{
+            left: `${(slotIndex / slotCount) * 100}%`,
+            width: `${100 / slotCount}%`,
+          }}
+        />
+      }
+    />
+  );
+
+  if (!showTooltip) {
+    return cellTrigger;
+  }
 
   return (
     <Tooltip>
-      <TooltipTrigger
-        render={
-          <PopoverTrigger
-            id={bucket.bucketId}
-            render={
-              <button
-                ref={setNodeRef}
-                type="button"
-                aria-label={`Placer un projet le ${date} ${part}`}
-                data-focus-anchor={focusAnchor ? date : undefined}
-                className={cn(
-                  "absolute inset-y-0 border-r transition-all duration-200 last:border-r-0 hover:z-10 hover:-translate-y-0.5 hover:shadow-[0_12px_24px_-18px_rgba(15,23,42,0.4)]",
-                  tone.cell,
-                  part === "AM" ? "border-r-white/55" : "border-r-border/35",
-                  isOver && "bg-primary/16 shadow-[inset_0_0_0_1px_rgba(37,99,235,0.2)]",
-                  previewActive && "bg-primary/10 ring-1 ring-inset ring-primary/35",
-                  active && "ring-2 ring-inset ring-primary/60",
-                  focused &&
-                    "z-20 animate-[pulse_1.5s_ease-in-out_2] ring-2 ring-inset ring-[oklch(0.65_0.18_30)] shadow-[0_0_0_1px_rgba(255,120,80,0.25)]"
-                )}
-                style={{
-                  left: `${(slotIndex / slotCount) * 100}%`,
-                  width: `${100 / slotCount}%`,
-                }}
-              />
-            }
-          />
-        }
-      />
+      <TooltipTrigger render={cellTrigger} />
       <TooltipContent className="w-80 max-w-[22rem] rounded-2xl bg-foreground p-3 text-background">
         <DayTooltipContent dayState={dayState} />
       </TooltipContent>
@@ -634,26 +642,38 @@ function QuickPlacementForm({
 function DayHeaderCell({
   date,
   dayState,
+  todayDate,
   focused,
 }: {
   date: string;
   dayState: CalendarDayState;
+  todayDate: string;
   focused: boolean;
 }) {
   const tone = toneClasses(dayState.tone);
+  const isToday = date === todayDate;
 
   return (
     <div
       className={cn(
         "rounded-xl border p-2 transition-all duration-200",
         tone.header,
+        isToday &&
+          "border-primary/60 bg-[linear-gradient(160deg,rgba(236,253,245,0.98),rgba(220,252,231,0.92))] shadow-[0_12px_24px_-20px_rgba(5,150,105,0.65)]",
         focused && "ring-2 ring-[oklch(0.65_0.18_30)] shadow-[0_10px_24px_-20px_rgba(234,88,12,0.8)]"
       )}
     >
-      <div className="flex items-center justify-between">
-        <p className="text-sm font-semibold text-foreground">
-          {format(parseISO(date), "dd", { locale: localeFr })}
-        </p>
+      <div className="flex items-start justify-between gap-2">
+        <div className="space-y-1">
+          <p className="text-sm font-semibold text-foreground">
+            {format(parseISO(date), "dd", { locale: localeFr })}
+          </p>
+          {isToday ? (
+            <Badge className="rounded-full border-0 bg-primary/12 px-2 py-0.5 text-[10px] text-primary shadow-none">
+              {fr.schedule.containsToday}
+            </Badge>
+          ) : null}
+        </div>
         {dayState.markers[0] ? (
           <Badge variant="outline" className="rounded-full bg-background/80 text-[10px]">
             {dayState.markers[0].shortLabelFr}
@@ -682,6 +702,8 @@ function YearMonthRow({
   dependencies,
   pendingPlacement,
   hoveredBucketId,
+  dragActive,
+  todayDate,
   focusedRange,
   selectedProjectIds,
   teams,
@@ -707,6 +729,8 @@ function YearMonthRow({
   dependencies: ProjectDependency[];
   pendingPlacement: QuickPlacementState | null;
   hoveredBucketId: string | null;
+  dragActive: boolean;
+  todayDate: string;
   focusedRange: CalendarFocusEvent;
   selectedProjectIds: string[];
   teams: Team[];
@@ -749,6 +773,7 @@ function YearMonthRow({
               key={`${teamId}-header-${date}`}
               date={date}
               dayState={dayStates[date]}
+              todayDate={todayDate}
               focused={isDateWithinFocus(date, focusedRange)}
             />
           ))}
@@ -773,6 +798,7 @@ function YearMonthRow({
                   slotIndex={dayIndex * 2 + partIndex}
                   slotCount={slotCount}
                   dayState={dayStates[date]}
+                  dragActive={dragActive}
                   active={pendingPlacement?.triggerId === bucketId}
                   previewActive={hoveredBucketId === bucketId}
                   focused={isDateWithinFocus(date, focusedRange)}
@@ -946,6 +972,8 @@ function ExpandedMonthSection({
   closures,
   pendingPlacement,
   hoveredBucketId,
+  dragActive,
+  todayDate,
   focusedRange,
   selectedProjectIds,
   teams,
@@ -961,6 +989,8 @@ function ExpandedMonthSection({
   closures: ClosurePeriod[];
   pendingPlacement: QuickPlacementState | null;
   hoveredBucketId: string | null;
+  dragActive: boolean;
+  todayDate: string;
   focusedRange: CalendarFocusEvent;
   selectedProjectIds: string[];
   teams: Team[];
@@ -1004,6 +1034,8 @@ function ExpandedMonthSection({
             dependencies={dependencies}
             pendingPlacement={pendingPlacement}
             hoveredBucketId={hoveredBucketId}
+            dragActive={dragActive}
+            todayDate={todayDate}
             focusedRange={focusedRange}
             selectedProjectIds={selectedProjectIds}
             teams={teams}
@@ -1081,6 +1113,8 @@ function MonthModeView({
   closures,
   pendingPlacement,
   hoveredBucketId,
+  dragActive,
+  todayDate,
   focusedRange,
   selectedProjectIds,
   teams,
@@ -1098,6 +1132,8 @@ function MonthModeView({
   closures: ClosurePeriod[];
   pendingPlacement: QuickPlacementState | null;
   hoveredBucketId: string | null;
+  dragActive: boolean;
+  todayDate: string;
   focusedRange: CalendarFocusEvent;
   selectedProjectIds: string[];
   teams: Team[];
@@ -1138,6 +1174,8 @@ function MonthModeView({
                     closures={closures}
                     pendingPlacement={pendingPlacement}
                     hoveredBucketId={hoveredBucketId}
+                    dragActive={dragActive}
+                    todayDate={todayDate}
                     focusedRange={focusedRange}
                     selectedProjectIds={selectedProjectIds}
                     teams={teams}
@@ -1176,6 +1214,8 @@ function YearModeView({
   closures,
   pendingPlacement,
   hoveredBucketId,
+  dragActive,
+  todayDate,
   focusedRange,
   selectedProjectIds,
   teams,
@@ -1192,6 +1232,8 @@ function YearModeView({
   closures: ClosurePeriod[];
   pendingPlacement: QuickPlacementState | null;
   hoveredBucketId: string | null;
+  dragActive: boolean;
+  todayDate: string;
   focusedRange: CalendarFocusEvent;
   selectedProjectIds: string[];
   teams: Team[];
@@ -1230,6 +1272,8 @@ function YearModeView({
                   closures={closures}
                   pendingPlacement={pendingPlacement}
                   hoveredBucketId={hoveredBucketId}
+                  dragActive={dragActive}
+                  todayDate={todayDate}
                   focusedRange={focusedRange}
                   selectedProjectIds={selectedProjectIds}
                   teams={teams}
@@ -1265,6 +1309,7 @@ export function TimelineCanvas({
   traceEnabled,
   teams,
   focusEvent,
+  dragActive = false,
   onActiveDateChange,
   onTraceEnabledChange,
   onPendingPlacementChange,
@@ -1285,6 +1330,7 @@ export function TimelineCanvas({
   traceEnabled: boolean;
   teams: Team[];
   focusEvent: CalendarFocusEvent;
+  dragActive?: boolean;
   onActiveDateChange?: (date: string) => void;
   onTraceEnabledChange: (enabled: boolean) => void;
   onPendingPlacementChange: (placement: QuickPlacementState | null) => void;
@@ -1292,7 +1338,6 @@ export function TimelineCanvas({
   onSelectProject: (projectId: string, shiftKey: boolean) => void;
   onProjectPointerDown: (projectId: string, shiftKey: boolean) => void;
 }) {
-  const visibleProjects = previewProjects ?? projects;
   const initialScrollDoneRef = useRef(false);
   const pendingFocusDateRef = useRef<string | null>(null);
   const [isNavigating, startNavigationTransition] = useTransition();
@@ -1301,25 +1346,25 @@ export function TimelineCanvas({
   const [viewMode, setViewMode] = useState<TimelineViewMode>("month");
   const [activeDate, setActiveDate] = useState(todayDate);
   const sections = useMemo(
-    () => buildTimelineSections(visibleProjects, customClosures, timelineNow),
-    [customClosures, timelineNow, visibleProjects]
+    () => buildTimelineSections(projects, customClosures, timelineNow),
+    [customClosures, projects, timelineNow]
   );
   const { years } = useMemo(
-    () => buildTimelineYearRange(visibleProjects, customClosures, timelineNow),
-    [customClosures, timelineNow, visibleProjects]
+    () => buildTimelineYearRange(projects, customClosures, timelineNow),
+    [customClosures, projects, timelineNow]
   );
   const summaries = useMemo(
     () =>
       buildTimelineYearSummaries({
         sections,
-        projects: visibleProjects,
+        projects,
         closures,
         activeDate,
         todayDate,
         focusDate: focusEvent?.startDate ?? null,
         viewMode,
       }),
-    [activeDate, closures, focusEvent, sections, todayDate, viewMode, visibleProjects]
+    [activeDate, closures, focusEvent, projects, sections, todayDate, viewMode]
   );
   const activeYear = parseISO(activeDate).getFullYear();
 
@@ -1430,6 +1475,12 @@ export function TimelineCanvas({
     });
   };
 
+  const jumpToToday = () => {
+    startNavigationTransition(() => {
+      setActiveDate(todayDate);
+    });
+  };
+
   return (
     <Popover
       open={Boolean(pendingPlacement)}
@@ -1486,6 +1537,10 @@ export function TimelineCanvas({
               <Button size="sm" variant="outline" onClick={() => navigate(1)} disabled={isNavigating}>
                 {fr.schedule.nextPeriod}
               </Button>
+              <Button size="sm" variant="outline" onClick={jumpToToday} disabled={isNavigating}>
+                <CalendarDays className="size-4" />
+                {fr.schedule.containsToday}
+              </Button>
               <YearJumpStrip years={years} activeYear={activeYear} onJumpToYear={jumpToYear} />
               {focusEvent ? (
                 <Badge variant="secondary" className="rounded-full px-3 py-1.5 text-xs">
@@ -1513,6 +1568,8 @@ export function TimelineCanvas({
               closures={closures}
               pendingPlacement={pendingPlacement}
               hoveredBucketId={hoveredBucketId}
+              dragActive={dragActive}
+              todayDate={todayDate}
               focusedRange={focusEvent}
               selectedProjectIds={selectedProjectIds}
               teams={teams}
@@ -1540,6 +1597,8 @@ export function TimelineCanvas({
               closures={closures}
               pendingPlacement={pendingPlacement}
               hoveredBucketId={hoveredBucketId}
+              dragActive={dragActive}
+              todayDate={todayDate}
               focusedRange={focusEvent}
               selectedProjectIds={selectedProjectIds}
               teams={teams}

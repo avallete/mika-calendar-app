@@ -1,5 +1,7 @@
 "use client";
 
+import { differenceInCalendarDays, format, parseISO } from "date-fns";
+import { fr as localeFr } from "date-fns/locale";
 import Link from "next/link";
 import {
   DndContext,
@@ -13,7 +15,7 @@ import {
   type DragEndEvent,
   type DragStartEvent,
 } from "@dnd-kit/core";
-import { useDeferredValue, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { ChevronDown, ChevronUp, Settings2, Sparkles } from "lucide-react";
 
 import { DraftSidebar } from "@/components/planner/draft-sidebar";
@@ -40,22 +42,20 @@ import {
   SidebarTrigger,
 } from "@/components/ui/sidebar";
 import {
-  advanceWorkingDuration,
-  compareSlotKeys,
-  countWorkingHalfDays,
-  countWorkingSlotDistance,
-  isNonWorkingDate,
-  makeSlotKey,
-  nextCalendarSlot,
   normalizeToWorkingSlot,
   parseSlotKey,
-  shiftWorkingSlot,
 } from "@/lib/planner/calendar";
 import {
   getClosureImpactLabelFr,
   getClosureTone,
   getClosureTypeLabelFr,
 } from "@/lib/planner/day-markers";
+import {
+  arePlacementRequestsNoop,
+  buildMovePlacementRequests,
+  buildScheduledPlacement,
+  normalizePlacementRequest,
+} from "@/lib/planner/drag-placements";
 import {
   buildFranceHolidayStripSummary,
   getNextCustomClosureOccurrence,
@@ -80,10 +80,8 @@ import type {
   EarlierShiftPromptState,
   Project,
   ProjectPlacementRequest,
-  ProjectPlacement,
   QuickPlacementState,
   SlotKey,
-  TeamId,
 } from "@/lib/planner/types";
 import { isScheduledProject } from "@/lib/planner/types";
 import { cn } from "@/lib/utils";
@@ -130,181 +128,6 @@ function tracePlannerUi(enabled: boolean, label: string, payload: unknown) {
   }
 
   console.log(`[planner ui trace] ${label} ${stringifyTracePayload(payload)}`);
-}
-
-function normalizePlacementRequest(
-  request: ProjectPlacementRequest,
-  closures: ClosurePeriod[]
-): ProjectPlacementRequest {
-  return {
-    ...request,
-    placement: {
-      ...request.placement,
-      startSlot: normalizeToWorkingSlot(request.placement.startSlot, closures),
-      durationHalfDays: Math.max(1, request.placement.durationHalfDays),
-    },
-  };
-}
-
-function shiftPlacementRequests(
-  placementRequests: ProjectPlacementRequest[],
-  offsetHalfDays: number,
-  closures: ClosurePeriod[]
-) {
-  if (offsetHalfDays === 0) {
-    return placementRequests;
-  }
-
-  return placementRequests.map((request) => ({
-    ...request,
-    placement: {
-      ...request.placement,
-      startSlot: shiftWorkingSlot(request.placement.startSlot, offsetHalfDays, closures),
-    },
-  }));
-}
-
-function summarizePlacementBlock(
-  placementRequests: ProjectPlacementRequest[],
-  closures: ClosurePeriod[]
-) {
-  const orderedRequests = [...placementRequests].sort((left, right) =>
-    compareSlotKeys(left.placement.startSlot, right.placement.startSlot)
-  );
-  const startSlot = orderedRequests[0]?.placement.startSlot;
-  const readySlot = orderedRequests.reduce<SlotKey | null>((latest, request) => {
-    const computed = advanceWorkingDuration(
-      request.placement.startSlot,
-      request.placement.durationHalfDays,
-      closures
-    );
-
-    if (!latest || compareSlotKeys(computed.readySlot, latest) > 0) {
-      return computed.readySlot;
-    }
-
-    return latest;
-  }, null);
-
-  if (!startSlot || !readySlot) {
-    return null;
-  }
-
-  return {
-    startSlot,
-    readySlot,
-    spanHalfDays: countWorkingSlotDistance(startSlot, readySlot, closures),
-  };
-}
-
-function snapMovePlacementRequests(
-  stateProjects: Project[],
-  placementRequests: ProjectPlacementRequest[],
-  selectedProjectIds: string[],
-  teamId: TeamId,
-  closures: ClosurePeriod[]
-) {
-  const block = summarizePlacementBlock(placementRequests, closures);
-  if (!block) {
-    return {
-      placementRequests,
-      snapTarget: null as null | {
-        kind: "after" | "before";
-        projectId: string;
-        distanceHalfDays: number;
-        targetStartSlot: SlotKey;
-      },
-    };
-  }
-
-  const selectedProjectIdSet = new Set(selectedProjectIds);
-  const snapCandidates = stateProjects
-    .filter(isScheduledProject)
-    .filter(
-      (project) =>
-        project.scheduledTeam === teamId && !selectedProjectIdSet.has(project.id)
-    )
-    .flatMap((project) => {
-      const readySlot = advanceWorkingDuration(
-        project.scheduledStartSlot,
-        project.scheduledDurationHalfDays,
-        closures
-      ).readySlot;
-
-      return [
-        {
-          kind: "after" as const,
-          projectId: project.id,
-          targetStartSlot: readySlot,
-          distanceHalfDays: Math.abs(
-            countWorkingSlotDistance(block.startSlot, readySlot, closures)
-          ),
-        },
-        {
-          kind: "before" as const,
-          projectId: project.id,
-          targetStartSlot: shiftWorkingSlot(
-            project.scheduledStartSlot,
-            -block.spanHalfDays,
-            closures
-          ),
-          distanceHalfDays: Math.abs(
-            countWorkingSlotDistance(
-              block.startSlot,
-              shiftWorkingSlot(project.scheduledStartSlot, -block.spanHalfDays, closures),
-              closures
-            )
-          ),
-        },
-      ];
-    })
-    .filter((candidate) => candidate.distanceHalfDays <= 2)
-    .sort((left, right) => {
-      if (left.distanceHalfDays !== right.distanceHalfDays) {
-        return left.distanceHalfDays - right.distanceHalfDays;
-      }
-
-      return compareSlotKeys(left.targetStartSlot, right.targetStartSlot);
-    });
-
-  const snapTarget = snapCandidates[0] ?? null;
-  if (!snapTarget) {
-    return {
-      placementRequests,
-      snapTarget: null,
-    };
-  }
-
-  return {
-    placementRequests: shiftPlacementRequests(
-      placementRequests,
-      countWorkingSlotDistance(block.startSlot, snapTarget.targetStartSlot, closures),
-      closures
-    ),
-    snapTarget,
-  };
-}
-
-function arePlacementRequestsNoop(
-  projects: Project[],
-  placementRequests: ProjectPlacementRequest[],
-  closures: ClosurePeriod[]
-) {
-  const projectsById = new Map(projects.map((project) => [project.id, project] as const));
-
-  return placementRequests.every((request) => {
-    const current = projectsById.get(request.projectId);
-    if (!current || !isScheduledProject(current)) {
-      return false;
-    }
-
-    const normalized = normalizePlacementRequest(request, closures);
-    return (
-      current.scheduledTeam === normalized.placement.teamId &&
-      current.scheduledStartSlot === normalized.placement.startSlot &&
-      current.scheduledDurationHalfDays === normalized.placement.durationHalfDays
-    );
-  });
 }
 
 function getDragLabel(activeDrag: DragProjectMeta | null) {
@@ -354,130 +177,73 @@ function renderClosureSourceLabel(closure: ClosurePeriod) {
   return closure.impact === "advisory" ? fr.schedule.sourceAdvisory : fr.schedule.sourceCustom;
 }
 
+function getClosureChipSpanClasses(closure: ClosurePeriod) {
+  const spanDays =
+    differenceInCalendarDays(parseISO(closure.endDate), parseISO(closure.startDate)) + 1;
+
+  if (spanDays >= 7) {
+    return "md:col-span-2 xl:col-span-4";
+  }
+
+  if (spanDays >= 4) {
+    return "md:col-span-2 xl:col-span-3";
+  }
+
+  if (spanDays >= 2) {
+    return "xl:col-span-2";
+  }
+
+  return "";
+}
+
+function formatPlannerDate(date: string) {
+  return format(parseISO(date), "EEE d MMM", { locale: localeFr });
+}
+
+function formatPlannerSlot(slotKey: SlotKey) {
+  const { date, part } = parseSlotKey(slotKey);
+  return `${formatPlannerDate(date)} ${part}`;
+}
+
+function buildDependencyConflictDescription(
+  state: ReturnType<typeof usePlanner>["state"],
+  prompt: DependencyConflictPromptState | null
+) {
+  if (!prompt) {
+    return "";
+  }
+
+  const teamLabel =
+    prompt.placements.length === 1
+      ? state.teams.find((team) => team.id === prompt.placements[0].placement.teamId)?.nameFr
+      : null;
+
+  return `${prompt.primaryTitle} touche ${prompt.conflicts.length} dependance${
+    prompt.conflicts.length > 1 ? "s" : ""
+  }${teamLabel ? ` sur ${teamLabel}` : ""}. Choisissez entre recalculer avec les liens ou garder ce placement exact.`;
+}
+
+function buildEarlierShiftDescription(
+  state: ReturnType<typeof usePlanner>["state"],
+  prompt: EarlierShiftPromptState | null
+) {
+  if (!prompt) {
+    return "";
+  }
+
+  const teamName =
+    state.teams.find((team) => team.id === prompt.placement.teamId)?.nameFr ?? "l'equipe";
+
+  return `${prompt.title} peut avancer sur ${teamName}. Position actuelle : ${formatPlannerSlot(
+    prompt.previousStartSlot
+  )}. Nouvelle position : ${formatPlannerSlot(prompt.placement.startSlot)}.`;
+}
+
 function asDisplayClosure(closure: CustomClosure): ClosurePeriod {
   return {
     ...closure,
     source: "custom",
     editable: true,
-  };
-}
-
-function getLatestAllowedResizeStartSlot(
-  calendarEndSlot: SlotKey,
-  closures: ClosurePeriod[]
-) {
-  return shiftWorkingSlot(calendarEndSlot, -1, closures);
-}
-
-function buildScheduledPlacement(
-  active: Extract<DragProjectMeta, { type: "scheduled" }>,
-  bucket: CalendarBucket,
-  closures: ClosurePeriod[]
-): ProjectPlacement | null {
-  if (active.intent === "move") {
-    return {
-      teamId: bucket.teamId,
-      startSlot: bucket.startSlot,
-      durationHalfDays: active.durationHalfDays,
-    };
-  }
-
-  if (bucket.teamId !== active.teamId) {
-    return null;
-  }
-
-  if (active.intent === "resize-start") {
-    const latestAllowedStart = getLatestAllowedResizeStartSlot(active.calendarEndSlot, closures);
-    const requestedStart = normalizeToWorkingSlot(bucket.startSlot, closures);
-    const startSlot =
-      compareSlotKeys(requestedStart, latestAllowedStart) > 0
-        ? latestAllowedStart
-        : requestedStart;
-
-    return {
-      teamId: active.teamId,
-      startSlot,
-      durationHalfDays: Math.max(
-        1,
-        countWorkingHalfDays(startSlot, active.calendarEndSlot, closures)
-      ),
-    };
-  }
-
-  const { date } = parseSlotKey(bucket.startSlot);
-  const endSlotExclusive = isNonWorkingDate(date, closures)
-    ? nextCalendarSlot(shiftWorkingSlot(makeSlotKey(date, "AM"), -1, closures))
-    : nextCalendarSlot(bucket.startSlot);
-
-  return {
-    teamId: active.teamId,
-    startSlot: active.startSlot,
-    durationHalfDays: Math.max(
-      1,
-      countWorkingHalfDays(active.startSlot, endSlotExclusive, closures)
-    ),
-  };
-}
-
-function buildMovePlacementRequests(
-  active: Extract<DragProjectMeta, { type: "scheduled" }>,
-  bucket: CalendarBucket,
-  projects: Project[],
-  closures: ClosurePeriod[]
-) {
-  const selectionProjectIds =
-    active.selectionProjectIds && active.selectionProjectIds.length
-      ? active.selectionProjectIds
-      : [active.projectId];
-
-  if (selectionProjectIds.length > 1 && bucket.teamId !== active.teamId) {
-    return null;
-  }
-
-  const rawRequests = selectionProjectIds
-    .map((projectId) => {
-      const project = projects.find((candidate) => candidate.id === projectId);
-      if (!project || !isScheduledProject(project)) {
-        return null;
-      }
-
-      const relativeOffset = countWorkingSlotDistance(
-        active.startSlot,
-        project.scheduledStartSlot,
-        closures
-      );
-
-      return {
-        projectId,
-        placement: {
-          teamId: bucket.teamId,
-          startSlot: shiftWorkingSlot(bucket.startSlot, relativeOffset, closures),
-          durationHalfDays: project.scheduledDurationHalfDays,
-        },
-      } satisfies ProjectPlacementRequest;
-    })
-    .filter(Boolean) as ProjectPlacementRequest[];
-
-  const normalizedRequests = rawRequests.map((request) =>
-    normalizePlacementRequest(request, closures)
-  );
-  const snapped =
-    bucket.teamId === active.teamId
-      ? snapMovePlacementRequests(
-          projects,
-          normalizedRequests,
-          selectionProjectIds,
-          bucket.teamId,
-          closures
-        )
-      : { placementRequests: normalizedRequests, snapTarget: null };
-
-  return {
-    projectIds: selectionProjectIds,
-    rawRequests,
-    normalizedRequests,
-    snappedRequests: snapped.placementRequests,
-    snapTarget: snapped.snapTarget,
   };
 }
 
@@ -531,12 +297,14 @@ export function ScheduleWorkbench() {
     endDate: string;
   } | null>(null);
   const handledDragIdRef = useRef<string | null>(null);
+  const hoveredBucketIdRef = useRef<string | null>(null);
+  const dragSessionRef = useRef<{ dragId: string; startedAt: number } | null>(null);
+  const previewTraceRef = useRef<{ bucketId: string | null; startedAt: number } | null>(null);
   const traceEnabled = useSyncExternalStore(
     subscribeToTracePreference,
     getTracePreferenceSnapshot,
     () => false
   );
-  const deferredHoveredBucket = useDeferredValue(hoveredBucket);
   const todayDate = useMemo(() => getTodayDateString(), []);
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
@@ -575,14 +343,14 @@ export function ScheduleWorkbench() {
     [state.closures, state.customClosures, todayDate]
   );
   const previewState = useMemo(() => {
-    if (!activeDrag || !deferredHoveredBucket) {
+    if (!activeDrag || !hoveredBucket) {
       return null;
     }
 
     if (activeDrag.type === "draft") {
       const preview = updateProjectPlacement(state, activeDrag.projectId, {
-        teamId: deferredHoveredBucket.teamId,
-        startSlot: deferredHoveredBucket.startSlot,
+        teamId: hoveredBucket.teamId,
+        startSlot: hoveredBucket.startSlot,
         durationHalfDays: activeDrag.durationHalfDays,
       });
 
@@ -590,6 +358,16 @@ export function ScheduleWorkbench() {
         projects: preview.projects,
         changedProjectIds: summarizePreviewChanges(state.projects, preview.projects),
         primaryProjectId: activeDrag.projectId,
+        traceSummary: {
+          dragType: activeDrag.type,
+          intent: "draft",
+          hoveredBucketId: hoveredBucket.bucketId,
+          hoveredStartSlot: hoveredBucket.startSlot,
+          normalizedStartSlot: normalizeToWorkingSlot(
+            hoveredBucket.startSlot,
+            state.closures
+          ),
+        },
       };
     }
 
@@ -608,7 +386,7 @@ export function ScheduleWorkbench() {
     if (activeDrag.intent === "move") {
       const movePlan = buildMovePlacementRequests(
         activeWithSelection,
-        deferredHoveredBucket,
+        hoveredBucket,
         state.projects,
         state.closures
       );
@@ -626,12 +404,22 @@ export function ScheduleWorkbench() {
         projects: preview.projects,
         changedProjectIds: summarizePreviewChanges(state.projects, preview.projects),
         primaryProjectId: activeDrag.projectId,
+        traceSummary: {
+          dragType: activeDrag.type,
+          intent: activeDrag.intent,
+          hoveredBucketId: hoveredBucket.bucketId,
+          hoveredStartSlot: hoveredBucket.startSlot,
+          normalizedStartSlot: normalizeToWorkingSlot(
+            hoveredBucket.startSlot,
+            state.closures
+          ),
+        },
       };
     }
 
     const nextPlacement = buildScheduledPlacement(
       activeWithSelection,
-      deferredHoveredBucket,
+      hoveredBucket,
       state.closures
     );
     if (!nextPlacement) {
@@ -647,12 +435,56 @@ export function ScheduleWorkbench() {
       projects: preview.projects,
       changedProjectIds: summarizePreviewChanges(state.projects, preview.projects),
       primaryProjectId: activeDrag.projectId,
+      traceSummary: {
+        dragType: activeDrag.type,
+        intent: activeDrag.intent,
+        hoveredBucketId: hoveredBucket.bucketId,
+        hoveredStartSlot: hoveredBucket.startSlot,
+        normalizedStartSlot: normalizeToWorkingSlot(hoveredBucket.startSlot, state.closures),
+      },
     };
-  }, [activeDrag, deferredHoveredBucket, selectedProjectIds, state]);
+  }, [activeDrag, hoveredBucket, selectedProjectIds, state]);
 
   useEffect(() => {
     setSchedulerTraceEnabled(traceEnabled);
   }, [traceEnabled]);
+
+  useEffect(() => {
+    if (!traceEnabled || !activeDrag) {
+      return;
+    }
+
+    if (!hoveredBucket) {
+      tracePlannerUi(traceEnabled, "preview.skip", {
+        reason: "no-hovered-bucket",
+        dragType: activeDrag.type,
+        intent: activeDrag.type === "draft" ? "draft" : activeDrag.intent,
+      });
+      return;
+    }
+
+    if (!previewState) {
+      tracePlannerUi(traceEnabled, "preview.skip", {
+        reason: "no-preview-state",
+        dragType: activeDrag.type,
+        intent: activeDrag.type === "draft" ? "draft" : activeDrag.intent,
+        hoveredBucketId: hoveredBucket.bucketId,
+        hoveredStartSlot: hoveredBucket.startSlot,
+      });
+      return;
+    }
+
+    tracePlannerUi(traceEnabled, "preview.compute", {
+      ...previewState.traceSummary,
+      durationMs:
+        previewTraceRef.current &&
+        previewTraceRef.current.bucketId === hoveredBucket.bucketId &&
+        typeof performance !== "undefined"
+          ? performance.now() - previewTraceRef.current.startedAt
+          : null,
+      changedProjectCount: previewState.changedProjectIds.length,
+    });
+  }, [activeDrag, hoveredBucket, previewState, traceEnabled]);
 
   useEffect(() => {
     if (!calendarFocus) {
@@ -705,15 +537,37 @@ export function ScheduleWorkbench() {
 
   const handleDragStart = (event: DragStartEvent) => {
     const data = event.active.data.current as DragProjectMeta | undefined;
+    const dragId = String(event.active.id);
     handledDragIdRef.current = null;
+    hoveredBucketIdRef.current = null;
+    dragSessionRef.current = {
+      dragId,
+      startedAt: typeof performance === "undefined" ? 0 : performance.now(),
+    };
+    previewTraceRef.current = null;
     setHoveredBucket(null);
     setHoveredBucketId(null);
+
+    const tracePayload = {
+      dragId,
+      dragType: data?.type ?? null,
+      intent: data?.type === "scheduled" ? data.intent : "draft",
+      projectId: data?.projectId ?? null,
+      selectionSize:
+        data?.type === "scheduled" &&
+        data.intent === "move" &&
+        selectedProjectIds.includes(data.projectId)
+          ? selectedProjectIds.length
+          : 1,
+      startSlot: data?.type === "scheduled" ? data.startSlot : null,
+    };
 
     if (
       data?.type === "scheduled" &&
       data.intent === "move" &&
       selectedProjectIds.includes(data.projectId)
     ) {
+      tracePlannerUi(traceEnabled, "drag.start", tracePayload);
       setActiveDrag({
         ...data,
         selectionProjectIds: selectedProjectIds,
@@ -721,27 +575,56 @@ export function ScheduleWorkbench() {
       return;
     }
 
+    tracePlannerUi(traceEnabled, "drag.start", tracePayload);
     setActiveDrag(data ?? null);
   };
 
   const handleDragOver = (event: DragOverEvent) => {
     const bucket = (event.over?.data.current as CalendarBucket | undefined) ?? null;
+    const nextBucketId = bucket?.bucketId ?? null;
+
+    if (hoveredBucketIdRef.current === nextBucketId) {
+      return;
+    }
+
+    hoveredBucketIdRef.current = nextBucketId;
+    previewTraceRef.current = {
+      bucketId: nextBucketId,
+      startedAt: typeof performance === "undefined" ? 0 : performance.now(),
+    };
     setHoveredBucket(bucket);
-    setHoveredBucketId(bucket?.bucketId ?? null);
+    setHoveredBucketId(nextBucketId);
+
+    tracePlannerUi(traceEnabled, "drag.over.bucketChanged", {
+      bucketId: nextBucketId,
+      hoveredStartSlot: bucket?.startSlot ?? null,
+      normalizedStartSlot: bucket
+        ? normalizeToWorkingSlot(bucket.startSlot, state.closures)
+        : null,
+      teamId: bucket?.teamId ?? null,
+    });
   };
 
   const handleDragEnd = (event: DragEndEvent) => {
     const active = event.active.data.current as DragProjectMeta | undefined;
     const bucket = event.over?.data.current as CalendarBucket | undefined;
     const dragId = String(event.active.id);
+    const dragDurationMs = dragSessionRef.current
+      ? (typeof performance === "undefined" ? 0 : performance.now() - dragSessionRef.current.startedAt)
+      : 0;
 
     setActiveDrag(null);
     setHoveredBucket(null);
     setHoveredBucketId(null);
+    hoveredBucketIdRef.current = null;
+    dragSessionRef.current = null;
+    previewTraceRef.current = null;
 
     if (handledDragIdRef.current === dragId) {
-      tracePlannerUi(traceEnabled, "dragEnd.ignoredDuplicate", {
+      tracePlannerUi(traceEnabled, "drag.end", {
         dragId,
+        outcome: "ignored-duplicate",
+        durationMs: dragDurationMs,
       });
       return;
     }
@@ -749,10 +632,22 @@ export function ScheduleWorkbench() {
     handledDragIdRef.current = dragId;
 
     if (!active || !bucket) {
+      tracePlannerUi(traceEnabled, "drag.end", {
+        dragId,
+        outcome: "no-target",
+        durationMs: dragDurationMs,
+      });
       return;
     }
 
     if (active.type === "draft") {
+      tracePlannerUi(traceEnabled, "drag.end", {
+        dragId,
+        outcome: "draft-pending-placement",
+        durationMs: dragDurationMs,
+        hoveredStartSlot: bucket.startSlot,
+        normalizedStartSlot: normalizeToWorkingSlot(bucket.startSlot, state.closures),
+      });
       setPendingPlacement({
         projectId: active.projectId,
         title: active.title,
@@ -787,12 +682,20 @@ export function ScheduleWorkbench() {
       );
 
       if (!movePlan || !movePlan.snappedRequests.length) {
+        tracePlannerUi(traceEnabled, "drag.end", {
+          dragId,
+          outcome: "no-move-plan",
+          durationMs: dragDurationMs,
+          hoveredStartSlot: bucket.startSlot,
+        });
         return;
       }
 
       if (arePlacementRequestsNoop(state.projects, movePlan.snappedRequests, state.closures)) {
-        tracePlannerUi(traceEnabled, "dragEnd.ignoredNoop", {
+        tracePlannerUi(traceEnabled, "drag.end", {
           dragId,
+          outcome: "noop",
+          durationMs: dragDurationMs,
           projectIds: movePlan.projectIds,
           normalizedPlacements: movePlan.normalizedRequests,
           snappedPlacements: movePlan.snappedRequests,
@@ -812,6 +715,12 @@ export function ScheduleWorkbench() {
 
       if (conflicts.length) {
         tracePlannerUi(traceEnabled, "dependencyConflict.prompt", traceMetadata);
+        tracePlannerUi(traceEnabled, "drag.end", {
+          dragId,
+          outcome: "dependency-conflict",
+          durationMs: dragDurationMs,
+          projectIds: movePlan.projectIds,
+        });
         setPendingDependencyConflict({
           projectIds: movePlan.projectIds,
           placements: movePlan.snappedRequests,
@@ -835,10 +744,23 @@ export function ScheduleWorkbench() {
           : null;
 
       if (earliestShiftPrompt) {
+        tracePlannerUi(traceEnabled, "drag.end", {
+          dragId,
+          outcome: "earlier-shift-prompt",
+          durationMs: dragDurationMs,
+          projectIds: movePlan.projectIds,
+        });
         setPendingEarlierShift(earliestShiftPrompt);
         return;
       }
 
+      tracePlannerUi(traceEnabled, "drag.end", {
+        dragId,
+        outcome: "committed",
+        durationMs: dragDurationMs,
+        projectIds: movePlan.projectIds,
+        normalizedPlacements: movePlan.normalizedRequests,
+      });
       commitPlacementRequests(movePlan.snappedRequests, {
         source: "drag-move",
         dependencyResolution: "preserve-dependencies",
@@ -862,8 +784,10 @@ export function ScheduleWorkbench() {
     );
 
     if (arePlacementRequestsNoop(state.projects, [normalizedPlacementRequest], state.closures)) {
-      tracePlannerUi(traceEnabled, "dragEnd.ignoredNoop", {
+      tracePlannerUi(traceEnabled, "drag.end", {
         dragId,
+        outcome: "noop",
+        durationMs: dragDurationMs,
         projectIds: [active.projectId],
         normalizedPlacements: [normalizedPlacementRequest],
       });
@@ -886,6 +810,12 @@ export function ScheduleWorkbench() {
 
     if (conflicts.length) {
       tracePlannerUi(traceEnabled, "dependencyConflict.prompt", traceMetadata);
+      tracePlannerUi(traceEnabled, "drag.end", {
+        dragId,
+        outcome: "dependency-conflict",
+        durationMs: dragDurationMs,
+        projectIds: [active.projectId],
+      });
       setPendingDependencyConflict({
         projectIds: [active.projectId],
         placements: [normalizedPlacementRequest],
@@ -907,11 +837,24 @@ export function ScheduleWorkbench() {
       );
 
       if (prompt) {
+        tracePlannerUi(traceEnabled, "drag.end", {
+          dragId,
+          outcome: "earlier-shift-prompt",
+          durationMs: dragDurationMs,
+          projectIds: [active.projectId],
+        });
         setPendingEarlierShift(prompt);
         return;
       }
     }
 
+    tracePlannerUi(traceEnabled, "drag.end", {
+      dragId,
+      outcome: "committed",
+      durationMs: dragDurationMs,
+      projectIds: [active.projectId],
+      normalizedPlacements: [normalizedPlacementRequest],
+    });
     placeProject(active.projectId, normalizedPlacementRequest.placement, {
       source: `drag-${active.intent}`,
       dependencyResolution: "preserve-dependencies",
@@ -931,6 +874,13 @@ export function ScheduleWorkbench() {
         onDragEnd={handleDragEnd}
         onDragCancel={() => {
           handledDragIdRef.current = null;
+          hoveredBucketIdRef.current = null;
+          dragSessionRef.current = null;
+          previewTraceRef.current = null;
+          tracePlannerUi(traceEnabled, "drag.end", {
+            dragId: null,
+            outcome: "cancelled",
+          });
           setActiveDrag(null);
           setHoveredBucket(null);
           setHoveredBucketId(null);
@@ -997,11 +947,11 @@ export function ScheduleWorkbench() {
               <Separator />
 
               <div className="space-y-3">
-                <div className="flex flex-wrap gap-3">
+                <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-6">
                   {franceHolidayStripSummary ? (
                     <div
                       className={cn(
-                        "flex min-w-[220px] flex-1 flex-col items-start gap-3 rounded-2xl border px-4 py-3",
+                        "flex flex-col items-start gap-3 rounded-2xl border px-4 py-3 md:col-span-2 xl:col-span-3",
                         getClosureChipClasses({
                           id: "france-holidays-summary",
                           title: franceHolidayStripSummary.labelFr,
@@ -1085,7 +1035,8 @@ export function ScheduleWorkbench() {
                         key={closure.id}
                         type="button"
                         className={cn(
-                          "group flex min-w-[220px] flex-1 flex-col items-start gap-2 rounded-2xl border px-4 py-3 text-left transition-all duration-200 hover:-translate-y-0.5",
+                          "group flex h-full flex-col items-start gap-2 rounded-2xl border px-4 py-3 text-left transition-all duration-200 hover:-translate-y-0.5",
+                          getClosureChipSpanClasses(displayClosure),
                           getClosureChipClasses(displayClosure),
                           isFocused && "ring-2 ring-primary/40"
                         )}
@@ -1225,6 +1176,7 @@ export function ScheduleWorkbench() {
               traceEnabled={traceEnabled}
               teams={state.teams}
               focusEvent={calendarFocus}
+              dragActive={Boolean(activeDrag)}
               onActiveDateChange={setTimelineActiveDate}
               onTraceEnabledChange={updateTraceEnabled}
               onPendingPlacementChange={setPendingPlacement}
@@ -1287,7 +1239,7 @@ export function ScheduleWorkbench() {
 
         <DragOverlay>
           {activeDrag ? (
-            <div className="rounded-2xl border border-border bg-background/95 px-4 py-3 shadow-2xl backdrop-blur">
+            <div className="z-50 rounded-2xl border border-border bg-background/95 px-4 py-3 shadow-2xl backdrop-blur">
               <p className="text-sm font-semibold text-foreground">{getDragLabel(activeDrag)}</p>
               <div className="mt-2 flex flex-wrap gap-2 text-xs text-muted-foreground">
                 <Badge variant="secondary" className="rounded-full">
@@ -1316,14 +1268,19 @@ export function ScheduleWorkbench() {
           <DialogHeader>
             <DialogTitle>{fr.schedule.dependencyConflictTitle}</DialogTitle>
             <DialogDescription>
-              {pendingDependencyConflict
-                ? `${pendingDependencyConflict.primaryTitle} entre en conflit avec les dependances actuelles. Vous pouvez conserver les liens et laisser le moteur recalculer, ou casser uniquement les liens en conflit pour garder ce placement exact.`
-                : ""}
+              {buildDependencyConflictDescription(state, pendingDependencyConflict)}
             </DialogDescription>
           </DialogHeader>
 
           {pendingDependencyConflict ? (
-            <div className="space-y-2 rounded-2xl border border-border/60 bg-muted/35 p-3">
+            <div className="space-y-3 rounded-2xl border border-border/60 bg-muted/35 p-3">
+              <div className="flex flex-wrap gap-2 text-xs text-muted-foreground">
+                {pendingDependencyConflict.placements[0] ? (
+                  <Badge variant="secondary" className="rounded-full">
+                    {formatPlannerSlot(pendingDependencyConflict.placements[0].placement.startSlot)}
+                  </Badge>
+                ) : null}
+              </div>
               {pendingDependencyConflict.conflicts.map((conflict) => (
                 <div key={conflict.id} className="text-sm text-muted-foreground">
                   <span className="font-medium text-foreground">
@@ -1400,14 +1357,22 @@ export function ScheduleWorkbench() {
           <DialogHeader>
             <DialogTitle>{fr.schedule.earlierShiftTitle}</DialogTitle>
             <DialogDescription>
-              {pendingEarlierShift
-                ? `${pendingEarlierShift.title} est avance sur ${
-                    state.teams.find((team) => team.id === pendingEarlierShift.placement.teamId)
-                      ?.nameFr ?? "l'equipe"
-                  }. L'intervalle entre ${pendingEarlierShift.previousStartSlot.slice(0, 10)} et la nouvelle date est libre, donc le reste de la file peut aussi etre compacte.`
-                : ""}
+              {buildEarlierShiftDescription(state, pendingEarlierShift)}
             </DialogDescription>
           </DialogHeader>
+
+          {pendingEarlierShift ? (
+            <div className="space-y-2 rounded-2xl border border-border/60 bg-muted/35 p-3 text-sm text-muted-foreground">
+              <div className="flex flex-wrap gap-2">
+                <Badge variant="outline" className="rounded-full">
+                  {formatPlannerSlot(pendingEarlierShift.previousStartSlot)}
+                </Badge>
+                <Badge variant="secondary" className="rounded-full">
+                  {formatPlannerSlot(pendingEarlierShift.placement.startSlot)}
+                </Badge>
+              </div>
+            </div>
+          ) : null}
 
           <DialogFooter className="sm:justify-between">
             <Button

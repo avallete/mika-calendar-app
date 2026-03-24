@@ -9,7 +9,6 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
-import { ScrollArea } from "@/components/ui/scroll-area";
 import {
   Table,
   TableBody,
@@ -123,7 +122,6 @@ export function DraftsBoard() {
       <div className="space-y-5">
         <DraftEditorPanel
           key={selectedProjectId ?? "new"}
-          selectedProjectId={selectedProjectId}
           selectedProject={selectedProject}
           onSave={(values) => upsertProject(values, selectedProjectId ?? undefined)}
           onDelete={() => {
@@ -162,12 +160,10 @@ export function DraftsBoard() {
 }
 
 function DraftEditorPanel({
-  selectedProjectId,
   selectedProject,
   onSave,
   onDelete,
 }: {
-  selectedProjectId: string | null;
   selectedProject: ReturnType<typeof usePlanner>["state"]["projects"][number] | null;
   onSave: (values: ProjectEditorState) => void;
   onDelete: () => void;
@@ -293,43 +289,6 @@ function DraftEditorPanel({
               setForm((current) => ({ ...current, notes: event.target.value }))
             }
           />
-        </div>
-
-        <div className="space-y-2">
-          <p className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">
-            {fr.draftsBoard.fields.dependencies}
-          </p>
-          <ScrollArea className="h-44 rounded-2xl border border-border/60 bg-muted/20 p-3">
-            <div className="flex flex-wrap gap-2">
-              {state.projects
-                .filter((project) => project.id !== selectedProjectId)
-                .map((project) => {
-                  const active = form.dependencyIds.includes(project.id);
-                  return (
-                    <button
-                      key={project.id}
-                      type="button"
-                      className={cn(
-                        "rounded-full border px-3 py-2 text-sm transition-colors",
-                        active
-                          ? "border-transparent bg-foreground text-background"
-                          : "border-border bg-card"
-                      )}
-                      onClick={() =>
-                        setForm((current) => ({
-                          ...current,
-                          dependencyIds: active
-                            ? current.dependencyIds.filter((id) => id !== project.id)
-                            : [...current.dependencyIds, project.id],
-                        }))
-                      }
-                    >
-                      {project.title}
-                    </button>
-                  );
-                })}
-            </div>
-          </ScrollArea>
         </div>
 
         <div className="flex flex-col gap-2 sm:flex-row">

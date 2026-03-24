@@ -3,6 +3,7 @@ import { describe, expect, test } from "bun:test";
 import {
   buildCalendarDayState,
   collectCalendarDayMarkers,
+  shouldShowDayTooltip,
 } from "@/lib/planner/day-markers";
 import type { ClosurePeriod } from "@/lib/planner/types";
 
@@ -71,11 +72,18 @@ describe("day markers", () => {
     );
   });
 
+  test("hides tooltips for ordinary working days", () => {
+    const dayState = buildCalendarDayState("2026-05-04", []);
+
+    expect(shouldShowDayTooltip(dayState)).toBe(false);
+  });
+
   test("keeps advisory details available for tooltip payloads", () => {
     const dayState = buildCalendarDayState("2026-05-01", mixedClosures);
     const advisoryMarker = dayState.markers.find((marker) => marker.id === "weather-note");
 
     expect(advisoryMarker?.details).toBe("Baches a prevoir sur les chantiers ouverts.");
     expect(advisoryMarker?.impact).toBe("advisory");
+    expect(shouldShowDayTooltip(dayState)).toBe(true);
   });
 });

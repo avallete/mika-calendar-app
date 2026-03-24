@@ -4,6 +4,7 @@ import {
   addClosureInState,
   deleteTeamInState,
   resetPlannerDemoDataInState,
+  upsertProjectInState,
   updateTeamInState,
 } from "@/lib/planner/state-mutations";
 import { initialPlannerState } from "@/lib/planner/sample-data";
@@ -81,5 +82,49 @@ describe("planner state mutations", () => {
     expect(reset.customClosures).toEqual(initialPlannerState.customClosures);
     expect(reset.closures).toEqual(initialPlannerState.closures);
     expect(reset.holidaySources).toEqual(initialPlannerState.holidaySources);
+  });
+
+  test("keeps existing dependency edges when a draft is saved with preserved dependency ids", () => {
+    const draftProject = initialPlannerState.projects.find((project) => project.status === "draft");
+    const predecessor = initialPlannerState.projects.find(
+      (project) => project.id !== draftProject?.id
+    );
+
+    expect(draftProject).toBeDefined();
+    expect(predecessor).toBeDefined();
+
+    const stateWithIncomingDependency = {
+      ...initialPlannerState,
+      dependencies: [
+        ...initialPlannerState.dependencies,
+        {
+          id: "dep-preserve",
+          predecessorProjectId: predecessor!.id,
+          successorProjectId: draftProject!.id,
+          lagHalfDays: 0,
+        },
+      ],
+    };
+
+    const nextState = upsertProjectInState(
+      stateWithIncomingDependency,
+      {
+        title: "Brouillon mis a jour",
+        plannedTeam: draftProject!.plannedTeam,
+        estimatedDurationHalfDays: draftProject!.estimatedDurationHalfDays,
+        targetDateHint: draftProject!.targetDateHint ?? "",
+        notes: draftProject!.notes ?? "",
+        dependencyIds: [predecessor!.id],
+      },
+      draftProject!.id
+    );
+
+    expect(
+      nextState.dependencies.some(
+        (dependency) =>
+          dependency.predecessorProjectId === predecessor!.id &&
+          dependency.successorProjectId === draftProject!.id
+      )
+    ).toBe(true);
   });
 });
