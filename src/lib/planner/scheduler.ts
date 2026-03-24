@@ -27,6 +27,10 @@ import {
   getSortedTeams,
   isScheduledProject,
 } from "@/lib/planner/types";
+import {
+  collectTimelineRelevantDates,
+  getTodayDateString,
+} from "@/lib/planner/timeline-range";
 
 type ScheduledComputation = ReturnType<typeof advanceWorkingDuration>;
 
@@ -971,23 +975,10 @@ export function deleteProjectFromState(
 }
 
 export function buildTimelineWindow(projects: Project[], closures: ClosurePeriod[]) {
-  const datedValues = [
-    ...projects.flatMap((project) => {
-      const values: string[] = [];
-      if (project.targetDateHint) {
-        values.push(project.targetDateHint);
-      }
-      if (isScheduledProject(project)) {
-        values.push(project.scheduledStartSlot.slice(0, 10));
-      }
-      return values;
-    }),
-    ...closures.flatMap((closure) => [closure.startDate, closure.endDate]),
-  ].filter(Boolean);
-
-  const today = "2026-03-23";
-  const anchor = datedValues.length ? datedValues.sort()[0] : today;
-  const latest = datedValues.length ? datedValues.sort().at(-1)! : today;
+  const datedValues = collectTimelineRelevantDates(projects, closures).sort();
+  const today = getTodayDateString();
+  const anchor = datedValues[0] ?? today;
+  const latest = datedValues.at(-1) ?? today;
   const startDate = format(
     addDays(startOfWeek(parseISO(anchor), { weekStartsOn: 1 }), -7),
     "yyyy-MM-dd"

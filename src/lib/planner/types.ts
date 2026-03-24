@@ -197,6 +197,7 @@ export type DependencyConflictPromptState = {
 
 export type YearMonthSection = {
   id: string;
+  year: number;
   label: string;
   startDate: string;
   endDate: string;

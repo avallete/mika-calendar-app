@@ -16,6 +16,7 @@ import {
 } from "@/components/ui/sheet";
 import { usePlanner } from "@/components/planner/planner-provider";
 import { fr } from "@/lib/i18n/fr";
+import { getTodayDateString } from "@/lib/planner/timeline-range";
 import type {
   Project,
   ProjectDependency,
@@ -161,13 +162,16 @@ function ProjectEditorForm({
 }) {
   const { state } = usePlanner();
   const teams = getSortedTeams(state.teams);
+  const fallbackStartDate = getTodayDateString();
   const initialPlacement = placementOverride
     ? placementOverride
     : {
         teamId: isScheduledProject(project) ? project.scheduledTeam : project.plannedTeam,
         startSlot: isScheduledProject(project)
           ? project.scheduledStartSlot
-          : ((project.targetDateHint ? `${project.targetDateHint}-AM` : "2026-03-25-AM") as ProjectPlacement["startSlot"]),
+          : ((project.targetDateHint
+              ? `${project.targetDateHint}-AM`
+              : `${fallbackStartDate}-AM`) as ProjectPlacement["startSlot"]),
         durationHalfDays: isScheduledProject(project)
           ? project.scheduledDurationHalfDays
           : project.estimatedDurationHalfDays,

@@ -1,5 +1,6 @@
 "use client";
 
+import { addDays, format, startOfDay } from "date-fns";
 import { useState } from "react";
 
 import { Button } from "@/components/ui/button";
@@ -23,11 +24,13 @@ export function ClosureSheet({
   onOpenChange: (open: boolean) => void;
   onSave: (values: ClosureFormState) => void;
 }) {
+  const defaultStartDate = format(startOfDay(new Date()), "yyyy-MM-dd");
+  const defaultEndDate = format(addDays(startOfDay(new Date()), 1), "yyyy-MM-dd");
   const [title, setTitle] = useState("Company closure");
   const [type, setType] = useState<ClosureFormState["type"]>("company_closure");
   const [impact, setImpact] = useState<ClosureFormState["impact"]>("blocking");
-  const [startDate, setStartDate] = useState("2026-04-20");
-  const [endDate, setEndDate] = useState("2026-04-21");
+  const [startDate, setStartDate] = useState(defaultStartDate);
+  const [endDate, setEndDate] = useState(defaultEndDate);
   const [details, setDetails] = useState("");
 
   return (

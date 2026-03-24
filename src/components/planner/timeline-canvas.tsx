@@ -2,7 +2,7 @@
 
 import { useDraggable, useDroppable } from "@dnd-kit/core";
 import { CSS } from "@dnd-kit/utilities";
-import { addDays, eachDayOfInterval, endOfMonth, format, parseISO, startOfMonth } from "date-fns";
+import { addDays, eachDayOfInterval, format, parseISO } from "date-fns";
 import { fr as localeFr } from "date-fns/locale";
 import {
   ArrowRightLeft,
@@ -12,7 +12,7 @@ import {
   Sparkles,
   StretchHorizontal,
 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -39,6 +39,11 @@ import {
   getClosureTypeLabelFr,
 } from "@/lib/planner/day-markers";
 import { fr } from "@/lib/i18n/fr";
+import {
+  buildTimelineSections,
+  buildTimelineYearRange,
+  getTodayDateString,
+} from "@/lib/planner/timeline-range";
 import type {
   CalendarBucket,
   CalendarDayMarkerTone,
@@ -64,40 +69,6 @@ type CalendarFocusEvent = {
 
 function makeBucketId(teamId: TeamId, startSlot: SlotKey) {
   return `bucket:${teamId}:${startSlot}`;
-}
-
-function getAnchorYear(projects: Project[], closures: ClosurePeriod[]) {
-  const datedValues = projects
-    .flatMap((project) => {
-      const values: string[] = [];
-      if (project.targetDateHint) {
-        values.push(project.targetDateHint);
-      }
-      if (isScheduledProject(project)) {
-        values.push(project.scheduledStartSlot.slice(0, 10));
-      }
-      return values;
-    })
-    .concat(closures.flatMap((closure) => [closure.startDate, closure.endDate]))
-    .filter(Boolean)
-    .sort();
-
-  return parseISO(datedValues[0] ?? "2026-03-23").getFullYear();
-}
-
-function buildYearSections(anchorYear: number): YearMonthSection[] {
-  return Array.from({ length: 12 }, (_, index) => {
-    const monthStart = startOfMonth(new Date(anchorYear, index, 1));
-    const monthEnd = endOfMonth(monthStart);
-
-    return {
-      id: `${anchorYear}-${String(index + 1).padStart(2, "0")}`,
-      label: format(monthStart, "MMMM yyyy", { locale: localeFr }),
-      startDate: format(monthStart, "yyyy-MM-dd"),
-      endDate: format(monthEnd, "yyyy-MM-dd"),
-      dayCount: monthEnd.getDate(),
-    };
-  });
 }
 
 function getMonthSegmentBounds(
@@ -153,6 +124,34 @@ function isDateWithinFocus(date: string, focus: CalendarFocusEvent) {
   }
 
   return date >= focus.startDate && date <= focus.endDate;
+}
+
+function scrollToTimelineDate(date: string, behavior: ScrollBehavior) {
+  const anchor = document.querySelector<HTMLElement>(`[data-focus-anchor="${date}"]`);
+  if (!anchor) {
+    return false;
+  }
+
+  anchor.scrollIntoView({
+    behavior,
+    block: "center",
+  });
+
+  return true;
+}
+
+function scrollToTimelineYear(year: number, behavior: ScrollBehavior) {
+  const anchor = document.querySelector<HTMLElement>(`[data-year-anchor="${year}"]`);
+  if (!anchor) {
+    return false;
+  }
+
+  anchor.scrollIntoView({
+    behavior,
+    block: "start",
+  });
+
+  return true;
 }
 
 function toneClasses(tone: CalendarDayMarkerTone) {
@@ -826,7 +825,35 @@ function YearMonthRow({
   );
 }
 
+function YearJumpStrip({
+  years,
+  onJumpToYear,
+}: {
+  years: number[];
+  onJumpToYear: (year: number) => void;
+}) {
+  return (
+    <div className="flex flex-wrap items-center gap-2">
+      <span className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">
+        {fr.schedule.jumpToYear}
+      </span>
+      {years.map((year) => (
+        <Button
+          key={year}
+          size="sm"
+          variant="outline"
+          className="rounded-full"
+          onClick={() => onJumpToYear(year)}
+        >
+          {year}
+        </Button>
+      ))}
+    </div>
+  );
+}
+
 function YearView({
+  years,
   sections,
   projects,
   previewProjects,
@@ -842,6 +869,7 @@ function YearView({
   onSelectProject,
   onProjectPointerDown,
 }: {
+  years: number[];
   sections: YearMonthSection[];
   projects: Project[];
   previewProjects: Project[] | null;
@@ -860,51 +888,74 @@ function YearView({
   const sortedTeams = useMemo(() => getSortedTeams(teams), [teams]);
   const scheduledProjects = projects.filter(isScheduledProject);
   const previewScheduledProjects = (previewProjects ?? []).filter(isScheduledProject);
+  const sectionsByYear = useMemo(
+    () =>
+      years.map((year) => ({
+        year,
+        sections: sections.filter((section) => section.year === year),
+      })),
+    [sections, years]
+  );
 
   return (
-    <div className="space-y-4">
-      {sections.map((section) => (
-        <section
-          key={section.id}
-          className="rounded-[28px] border border-border/70 bg-card/90 p-4 shadow-[0_24px_50px_-42px_rgba(15,23,42,0.55)]"
-        >
-          <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-            <div>
-              <p className="text-xs font-semibold uppercase tracking-[0.22em] text-muted-foreground">
-                {fr.schedule.yearOverview}
-              </p>
-              <h3 className="mt-1 font-heading text-xl font-semibold text-foreground">
-                {section.label}
-              </h3>
-            </div>
-            <Badge variant="outline" className="rounded-full px-3 py-1 text-xs">
-              {section.dayCount} {fr.schedule.daysSuffix}
-            </Badge>
+    <div className="space-y-8">
+      {sectionsByYear.map(({ year, sections: yearSections }) => (
+        <section key={year} data-year-anchor={year} className="space-y-4 scroll-mt-6">
+          <div className="sticky top-3 z-10 rounded-[24px] border border-border/70 bg-background/90 px-4 py-3 shadow-[0_18px_40px_-34px_rgba(15,23,42,0.55)] backdrop-blur-sm">
+            <p className="text-xs font-semibold uppercase tracking-[0.22em] text-muted-foreground">
+              {fr.schedule.yearOverview}
+            </p>
+            <h3 className="mt-1 font-heading text-2xl font-semibold text-foreground">
+              {year}
+            </h3>
           </div>
 
-          <div className="mt-4 space-y-4">
-            {sortedTeams.map((team, index) => (
-              <YearMonthRow
-                key={`${section.id}-${team.id}`}
-                teamId={team.id}
-                section={section}
-                closures={closures}
-                projects={scheduledProjects.filter((project) => project.scheduledTeam === team.id)}
-                previewProjects={previewScheduledProjects}
-                previewChangedProjectIds={previewChangedProjectIds}
-                previewPrimaryProjectId={previewPrimaryProjectId}
-                dependencies={dependencies}
-                pendingPlacement={pendingPlacement}
-                hoveredBucketId={hoveredBucketId}
-                focusedRange={focusedRange}
-                selectedProjectIds={selectedProjectIds}
-                teams={teams}
-                isAnchorLane={index === 0}
-                onSelectProject={onSelectProject}
-                onProjectPointerDown={onProjectPointerDown}
-              />
-            ))}
-          </div>
+          {yearSections.map((section) => (
+            <section
+              key={section.id}
+              className="rounded-[28px] border border-border/70 bg-card/90 p-4 shadow-[0_24px_50px_-42px_rgba(15,23,42,0.55)]"
+            >
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                <div>
+                  <p className="text-xs font-semibold uppercase tracking-[0.22em] text-muted-foreground">
+                    {fr.schedule.yearOverview}
+                  </p>
+                  <h4 className="mt-1 font-heading text-xl font-semibold text-foreground">
+                    {section.label}
+                  </h4>
+                </div>
+                <Badge variant="outline" className="rounded-full px-3 py-1 text-xs">
+                  {section.dayCount} {fr.schedule.daysSuffix}
+                </Badge>
+              </div>
+
+              <div className="mt-4 space-y-4">
+                {sortedTeams.map((team, index) => (
+                  <YearMonthRow
+                    key={`${section.id}-${team.id}`}
+                    teamId={team.id}
+                    section={section}
+                    closures={closures}
+                    projects={scheduledProjects.filter(
+                      (project) => project.scheduledTeam === team.id
+                    )}
+                    previewProjects={previewScheduledProjects}
+                    previewChangedProjectIds={previewChangedProjectIds}
+                    previewPrimaryProjectId={previewPrimaryProjectId}
+                    dependencies={dependencies}
+                    pendingPlacement={pendingPlacement}
+                    hoveredBucketId={hoveredBucketId}
+                    focusedRange={focusedRange}
+                    selectedProjectIds={selectedProjectIds}
+                    teams={teams}
+                    isAnchorLane={index === 0}
+                    onSelectProject={onSelectProject}
+                    onProjectPointerDown={onProjectPointerDown}
+                  />
+                ))}
+              </div>
+            </section>
+          ))}
         </section>
       ))}
     </div>
@@ -948,9 +999,16 @@ export function TimelineCanvas({
   onSelectProject: (projectId: string, shiftKey: boolean) => void;
   onProjectPointerDown: (projectId: string, shiftKey: boolean) => void;
 }) {
+  const visibleProjects = previewProjects ?? projects;
+  const initialScrollDoneRef = useRef(false);
+  const timelineNow = useMemo(() => new Date(), []);
   const sections = useMemo(
-    () => buildYearSections(getAnchorYear(previewProjects ?? projects, closures)),
-    [projects, previewProjects, closures]
+    () => buildTimelineSections(visibleProjects, closures, timelineNow),
+    [closures, timelineNow, visibleProjects]
+  );
+  const { years } = useMemo(
+    () => buildTimelineYearRange(visibleProjects, closures, timelineNow),
+    [closures, timelineNow, visibleProjects]
   );
 
   useEffect(() => {
@@ -958,14 +1016,30 @@ export function TimelineCanvas({
       return;
     }
 
-    const anchor = document.querySelector<HTMLElement>(
-      `[data-focus-anchor="${focusEvent.startDate}"]`
-    );
-    anchor?.scrollIntoView({
-      behavior: "smooth",
-      block: "center",
-    });
-  }, [focusEvent]);
+    if (scrollToTimelineDate(focusEvent.startDate, "smooth")) {
+      return;
+    }
+
+    if (years[0]) {
+      scrollToTimelineYear(years[0], "smooth");
+    }
+  }, [focusEvent, years]);
+
+  useEffect(() => {
+    if (focusEvent || initialScrollDoneRef.current) {
+      return;
+    }
+
+    initialScrollDoneRef.current = true;
+    const today = getTodayDateString();
+    if (scrollToTimelineDate(today, "auto")) {
+      return;
+    }
+
+    if (years[0]) {
+      scrollToTimelineYear(years[0], "auto");
+    }
+  }, [focusEvent, years]);
 
   return (
     <Popover
@@ -996,6 +1070,7 @@ export function TimelineCanvas({
               <Badge variant="outline" className="rounded-full px-3 py-1.5 text-xs">
                 {fr.schedule.yearOnly}
               </Badge>
+              <YearJumpStrip years={years} onJumpToYear={(year) => scrollToTimelineYear(year, "smooth")} />
               {focusEvent ? (
                 <Badge variant="secondary" className="rounded-full px-3 py-1.5 text-xs">
                   {formatFocusRange(focusEvent.startDate, focusEvent.endDate)}
@@ -1012,6 +1087,7 @@ export function TimelineCanvas({
           </div>
 
           <YearView
+            years={years}
             sections={sections}
             projects={projects}
             previewProjects={previewProjects}

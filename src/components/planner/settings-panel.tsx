@@ -1,5 +1,6 @@
 "use client";
 
+import { addDays, format, startOfDay } from "date-fns";
 import { useEffect, useMemo, useState } from "react";
 import { Plus, RefreshCw, Save, Trash2 } from "lucide-react";
 
@@ -135,11 +136,13 @@ function defaultImpactForClosure(type: ClosureFormState["type"]): ClosureFormSta
 }
 
 function buildEmptyClosureState(): ClosureFormState {
+  const today = startOfDay(new Date());
+
   return {
     title: "",
     type: "company_closure",
-    startDate: "",
-    endDate: "",
+    startDate: format(today, "yyyy-MM-dd"),
+    endDate: format(addDays(today, 1), "yyyy-MM-dd"),
     impact: "blocking",
     details: "",
   };

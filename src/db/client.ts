@@ -14,6 +14,7 @@ export type PlannerDb =
 type PlannerDbState = {
   db: PlannerDb;
   ready: Promise<void>;
+  dispose: () => Promise<void>;
 };
 
 const globalForPlannerDb = globalThis as typeof globalThis & {
@@ -47,6 +48,7 @@ function createDbState(): PlannerDbState {
     return {
       db: drizzleNodePg({ client: pool }),
       ready: Promise.resolve(),
+      dispose: () => pool.end(),
     };
   }
 
@@ -60,6 +62,7 @@ function createDbState(): PlannerDbState {
         migrationsFolder: getProjectPath("drizzle"),
       })
     ),
+    dispose: () => client.close(),
   };
 }
 
@@ -80,4 +83,14 @@ export function getDb() {
 
 export async function ensureDbReady() {
   await getDbState().ready;
+}
+
+export async function closeDb() {
+  const state = globalForPlannerDb.__plannerDbState;
+  if (!state) {
+    return;
+  }
+
+  delete globalForPlannerDb.__plannerDbState;
+  await state.dispose();
 }

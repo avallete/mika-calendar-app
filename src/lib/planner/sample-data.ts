@@ -1,9 +1,9 @@
-import { addDays, format } from "date-fns";
+import { addDays, format, startOfDay } from "date-fns";
 
 import type { HolidaySource, PlannerState, Team } from "@/lib/planner/types";
 import { makeSlotKey } from "@/lib/planner/calendar";
 
-const today = new Date("2026-03-24T08:00:00Z");
+const today = startOfDay(new Date());
 
 export const seedTeams: Team[] = [
   {
@@ -188,8 +188,8 @@ export const initialPlannerState: PlannerState = {
       id: "ccccccc1-cccc-4ccc-8ccc-ccccccccccc1",
       title: "Fermeture inventaire depot",
       type: "company_closure",
-      startDate: "2026-04-10",
-      endDate: "2026-04-10",
+      startDate: format(addDays(today, 18), "yyyy-MM-dd"),
+      endDate: format(addDays(today, 18), "yyyy-MM-dd"),
       impact: "blocking",
       details: "Arret total du depot pour inventaire, controle nacelles et livraison materiaux.",
       source: "custom",
@@ -199,8 +199,8 @@ export const initialPlannerState: PlannerState = {
       id: "ccccccc2-cccc-4ccc-8ccc-ccccccccccc2",
       title: "Formation securite harnais",
       type: "custom_time_off",
-      startDate: "2026-04-14",
-      endDate: "2026-04-14",
+      startDate: format(addDays(today, 22), "yyyy-MM-dd"),
+      endDate: format(addDays(today, 22), "yyyy-MM-dd"),
       impact: "blocking",
       details: "Les trois equipes sont mobilisees en formation securite et travail en hauteur.",
       source: "custom",
@@ -210,8 +210,8 @@ export const initialPlannerState: PlannerState = {
       id: "ccccccc3-cccc-4ccc-8ccc-ccccccccccc3",
       title: "Pluie continue secteur nord",
       type: "weather",
-      startDate: "2026-04-02",
-      endDate: "2026-04-02",
+      startDate: format(addDays(today, 10), "yyyy-MM-dd"),
+      endDate: format(addDays(today, 10), "yyyy-MM-dd"),
       impact: "advisory",
       details: "Alerte meteo pour les chantiers ouverts. Intervention possible mais cadence reduite a anticiper.",
       source: "custom",

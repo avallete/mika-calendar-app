@@ -1,11 +1,5 @@
 import { asc, and, desc, eq, isNotNull, isNull, sql } from "drizzle-orm";
 import { format } from "date-fns";
-import type { NodePgDatabase } from "drizzle-orm/node-postgres";
-import type { NodePgTransaction } from "drizzle-orm/node-postgres/session";
-import type { PgliteDatabase } from "drizzle-orm/pglite";
-import type { PgliteTransaction } from "drizzle-orm/pglite/session";
-import type { TablesRelationalConfig } from "drizzle-orm/relations";
-
 import { ensureDbReady, getDb } from "@/db/client";
 import {
   type ClosurePeriodRow,
@@ -20,6 +14,14 @@ import {
   projects,
   teams,
 } from "@/db/schema";
+import {
+  type DbExecutor,
+  type PersistentPlannerState,
+  ensureClosureMarkerSchema,
+  getBasePersistentState,
+  plannerStateToPersistentState,
+  replacePersistentState,
+} from "@/lib/planner/persistence";
 import {
   buildFrancePublicHolidays,
   getCoveredYears,
@@ -42,7 +44,6 @@ import {
 import { rescheduleProjects } from "@/lib/planner/scheduler";
 import type {
   ClosureFormState,
-  ClosurePeriod,
   PlannerHistoryState,
   PlannerState,
   ProjectDeleteMode,
@@ -53,17 +54,6 @@ import type {
   TeamEditorState,
 } from "@/lib/planner/types";
 import { getSortedTeams } from "@/lib/planner/types";
-
-type DbExecutor =
-  | ReturnType<typeof getDb>
-  | NodePgDatabase<Record<string, unknown>>
-  | NodePgTransaction<Record<string, unknown>, TablesRelationalConfig>
-  | PgliteDatabase<Record<string, unknown>>
-  | PgliteTransaction<Record<string, unknown>, TablesRelationalConfig>;
-
-type PersistentPlannerState = Omit<PlannerState, "closures" | "history"> & {
-  customClosures: ClosurePeriod[];
-};
 
 function toDateString(value: Date | string | null | undefined) {
   if (!value) {
@@ -113,47 +103,6 @@ function buildHistoryState(params?: {
     undoLabel: params?.undoActionType ? actionLabel(params.undoActionType) : undefined,
     redoLabel: params?.redoActionType ? actionLabel(params.redoActionType) : undefined,
   };
-}
-
-function getBasePersistentState() {
-  return {
-    teams: initialPlannerState.teams,
-    holidaySources: initialPlannerState.holidaySources,
-    projects: initialPlannerState.projects,
-    dependencies: initialPlannerState.dependencies,
-    customClosures: initialPlannerState.closures.filter(
-      (closure) => closure.source === "custom"
-    ),
-  } satisfies PersistentPlannerState;
-}
-
-async function ensureClosureMarkerSchema(executor: DbExecutor) {
-  await executor.execute(sql.raw(`
-DO $$
-BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'closure_impact') THEN
-    CREATE TYPE "public"."closure_impact" AS ENUM ('blocking', 'advisory');
-  END IF;
-END $$;
-`));
-  await executor.execute(
-    sql.raw(`ALTER TYPE "public"."closure_type" ADD VALUE IF NOT EXISTS 'weather';`)
-  );
-  await executor.execute(
-    sql.raw(`ALTER TYPE "public"."closure_type" ADD VALUE IF NOT EXISTS 'annotation';`)
-  );
-  await executor.execute(
-    sql.raw(`
-ALTER TABLE "closure_periods"
-  ADD COLUMN IF NOT EXISTS "impact" "closure_impact" DEFAULT 'blocking' NOT NULL;
-`)
-  );
-  await executor.execute(
-    sql.raw(`ALTER TABLE "closure_periods" ADD COLUMN IF NOT EXISTS "details" text;`)
-  );
-  await executor.execute(
-    sql.raw(`UPDATE "closure_periods" SET "impact" = 'blocking' WHERE "impact" IS NULL;`)
-  );
 }
 
 async function readPersistentState(executor: DbExecutor): Promise<PersistentPlannerState> {
@@ -220,85 +169,6 @@ async function readPersistentState(executor: DbExecutor): Promise<PersistentPlan
   };
 }
 
-async function replacePersistentState(
-  executor: DbExecutor,
-  state: PersistentPlannerState
-) {
-  await executor.delete(projectDependencies);
-  await executor.delete(projects);
-  await executor.delete(closurePeriods);
-  await executor.delete(holidaySources);
-  await executor.delete(teams);
-
-  if (state.teams.length) {
-    await executor.insert(teams).values(
-      state.teams.map((team) => ({
-        id: team.id,
-        slug: team.slug,
-        nameFr: team.nameFr,
-        displayOrder: team.displayOrder,
-        accentColor: team.accentColor,
-        softColor: team.softColor,
-        isActive: team.isActive,
-      }))
-    );
-  }
-
-  if (state.holidaySources.length) {
-    await executor.insert(holidaySources).values(
-      state.holidaySources.map((source) => ({
-        id: source.id,
-        code: source.code,
-        labelFr: source.labelFr,
-        enabled: source.enabled,
-      }))
-    );
-  }
-
-  if (state.projects.length) {
-    await executor.insert(projects).values(
-      state.projects.map((project) => ({
-        id: project.id,
-        title: project.title,
-        status: project.status,
-        plannedTeamId: project.plannedTeam,
-        estimatedDurationHalfDays: project.estimatedDurationHalfDays,
-        scheduledTeamId: project.scheduledTeam ?? null,
-        scheduledStartSlot: project.scheduledStartSlot ?? null,
-        scheduledDurationHalfDays: project.scheduledDurationHalfDays ?? null,
-        sequenceOrder: project.sequenceOrder ?? null,
-        targetDateHint: project.targetDateHint ? new Date(`${project.targetDateHint}T00:00:00.000Z`) : null,
-        notes: project.notes ?? null,
-      }))
-    );
-  }
-
-  if (state.dependencies.length) {
-    await executor.insert(projectDependencies).values(
-      state.dependencies.map((dependency) => ({
-        id: dependency.id,
-        predecessorProjectId: dependency.predecessorProjectId,
-        successorProjectId: dependency.successorProjectId,
-        lagHalfDays: dependency.lagHalfDays,
-      }))
-    );
-  }
-
-  if (state.customClosures.length) {
-    await executor.insert(closurePeriods).values(
-      state.customClosures.map((closure) => ({
-        id: closure.id,
-        title: closure.title,
-        type: closure.type,
-        impact: closure.impact,
-        startDate: new Date(`${closure.startDate}T00:00:00.000Z`),
-        endDate: new Date(`${closure.endDate}T00:00:00.000Z`),
-        details: closure.details ?? null,
-      }))
-    );
-  }
-}
-
 function buildEffectiveClosures(state: PersistentPlannerState) {
   const relevantDates = [
     ...state.projects.flatMap((project) => {
@@ -357,16 +227,6 @@ function normalizePlannerSnapshot(
   return {
     ...normalized,
     history,
-  };
-}
-
-function toPersistentPlannerState(snapshot: PlannerState): PersistentPlannerState {
-  return {
-    teams: snapshot.teams,
-    holidaySources: snapshot.holidaySources,
-    projects: snapshot.projects,
-    dependencies: snapshot.dependencies,
-    customClosures: snapshot.closures.filter((closure) => closure.source === "custom"),
   };
 }
 
@@ -483,12 +343,12 @@ async function commitLoggedMutation(
     const beforeSnapshot = normalizePlannerSnapshot(persistentBefore, historyBefore);
     const nextSnapshot = mutator(beforeSnapshot);
     const normalizedAfter = normalizePlannerSnapshot(
-      toPersistentPlannerState(nextSnapshot),
+      plannerStateToPersistentState(nextSnapshot),
       buildHistoryState({
         undoActionType: actionType,
       })
     );
-    const persistentAfter = toPersistentPlannerState(normalizedAfter);
+    const persistentAfter = plannerStateToPersistentState(normalizedAfter);
 
     await replacePersistentState(tx, persistentAfter);
 
@@ -665,7 +525,7 @@ export async function undoPlannerAction(sessionId: string) {
     }
 
     const snapshot = entry.beforeSnapshot as PlannerState;
-    await replacePersistentState(tx, toPersistentPlannerState(snapshot));
+    await replacePersistentState(tx, plannerStateToPersistentState(snapshot));
     await tx
       .update(plannerActionLog)
       .set({
@@ -704,7 +564,7 @@ export async function redoPlannerAction(sessionId: string) {
     }
 
     const snapshot = entry.afterSnapshot as PlannerState;
-    await replacePersistentState(tx, toPersistentPlannerState(snapshot));
+    await replacePersistentState(tx, plannerStateToPersistentState(snapshot));
     await tx
       .update(plannerActionLog)
       .set({
