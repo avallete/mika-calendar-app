@@ -151,6 +151,7 @@ describe("scheduler", () => {
           type: "company_closure",
           startDate: "2026-03-25",
           endDate: "2026-03-26",
+          impact: "blocking",
           source: "custom",
           editable: true,
         },
@@ -159,6 +160,28 @@ describe("scheduler", () => {
 
     const downstream = nextState.projects.find((project) => project.id === "a-2");
     expect(downstream?.scheduledStartSlot).toBe(makeSlotKey("2026-03-27", "AM"));
+  });
+
+  test("ignores advisory markers when recalculating project finishes", () => {
+    const nextState = rescheduleProjects(withPlannerShape({
+      ...baseState(),
+      closures: [
+        {
+          id: "weather",
+          title: "Rain advisory",
+          type: "weather",
+          startDate: "2026-03-25",
+          endDate: "2026-03-25",
+          impact: "advisory",
+          details: "Conditions humides mais chantier maintenu.",
+          source: "custom",
+          editable: true,
+        },
+      ],
+    }));
+
+    const downstream = nextState.projects.find((project) => project.id === "a-2");
+    expect(downstream?.scheduledStartSlot).toBe(makeSlotKey("2026-03-25", "AM"));
   });
 
   test("recalculates both lane sequences when moving a project between teams", () => {
@@ -244,6 +267,18 @@ describe("scheduler", () => {
 
     const movedProject = nextState.projects.find((project) => project.id === "a-2");
     expect(movedProject?.scheduledStartSlot).toBe(makeSlotKey("2026-03-30", "AM"));
+  });
+
+  test("supports half-day moves and durations", () => {
+    const nextState = updateProjectPlacement(baseState(), "a-2", {
+      teamId: "team-a",
+      startSlot: makeSlotKey("2026-03-25", "PM"),
+      durationHalfDays: 1,
+    });
+
+    const movedProject = nextState.projects.find((project) => project.id === "a-2");
+    expect(movedProject?.scheduledStartSlot).toBe(makeSlotKey("2026-03-25", "PM"));
+    expect(movedProject?.scheduledDurationHalfDays).toBe(1);
   });
 
   test("suggests an earlier-shift prompt only when the earlier gap is empty", () => {

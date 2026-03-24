@@ -18,7 +18,10 @@ export const closureTypeEnum = pgEnum("closure_type", [
   "holiday",
   "company_closure",
   "custom_time_off",
+  "weather",
+  "annotation",
 ]);
+export const closureImpactEnum = pgEnum("closure_impact", ["blocking", "advisory"]);
 
 export const teams = pgTable(
   "teams",
@@ -152,10 +155,12 @@ export const closurePeriods = pgTable(
     id: uuid("id").defaultRandom().primaryKey(),
     title: varchar("title", { length: 160 }).notNull(),
     type: closureTypeEnum("type").notNull(),
+    impact: closureImpactEnum("impact").notNull().default("blocking"),
     startDate: timestamp("start_date", { withTimezone: true, mode: "date" })
       .notNull(),
     endDate: timestamp("end_date", { withTimezone: true, mode: "date" })
       .notNull(),
+    details: text("details"),
     createdAt: timestamp("created_at", { withTimezone: true, mode: "date" })
       .defaultNow()
       .notNull(),

@@ -18,6 +18,7 @@ import {
   placeProjectAction,
   placeProjectsAction,
   redoPlannerActionAction,
+  resetDemoDataAction,
   saveProjectAction,
   setHolidaySourceEnabledAction,
   undoPlannerActionAction,
@@ -93,6 +94,7 @@ type PlannerContextValue = {
   updateTeam: (teamId: string, values: TeamEditorState) => void;
   deleteTeam: (teamId: string) => void;
   setHolidaySourceEnabled: (sourceCode: string, enabled: boolean) => void;
+  resetDemoData: () => void;
   undo: () => void;
   redo: () => void;
 };
@@ -223,6 +225,9 @@ export function PlannerProvider({
       runMutation((session) =>
         setHolidaySourceEnabledAction(session, sourceCode, enabled)
       );
+    },
+    resetDemoData() {
+      runMutation((session) => resetDemoDataAction(session));
     },
     undo() {
       runMutation((session) => undoPlannerActionAction(session));

@@ -19,6 +19,7 @@ import {
   placeProject,
   placeProjects,
   redoPlannerAction,
+  resetDemoData,
   saveProject,
   setHolidaySourceEnabled,
   undoPlannerAction,
@@ -97,6 +98,10 @@ export async function setHolidaySourceEnabledAction(
   enabled: boolean
 ) {
   return setHolidaySourceEnabled(sessionId, sourceCode, enabled);
+}
+
+export async function resetDemoDataAction(sessionId: string) {
+  return resetDemoData(sessionId);
 }
 
 export async function undoPlannerActionAction(sessionId: string) {

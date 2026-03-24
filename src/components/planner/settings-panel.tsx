@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { Plus, Save, Trash2 } from "lucide-react";
+import { Plus, RefreshCw, Save, Trash2 } from "lucide-react";
 
 import { usePlanner } from "@/components/planner/planner-provider";
 import { Badge } from "@/components/ui/badge";
@@ -9,7 +9,12 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Textarea } from "@/components/ui/textarea";
 import { fr } from "@/lib/i18n/fr";
+import {
+  getClosureImpactLabelFr,
+  getClosureTypeLabelFr,
+} from "@/lib/planner/day-markers";
 import type { ClosureFormState, TeamEditorState } from "@/lib/planner/types";
 import { closureTypeOptions, getSortedTeams } from "@/lib/planner/types";
 
@@ -122,6 +127,21 @@ function buildEmptyTeamState(displayOrder: number): TeamEditorState {
     accentColor: DEFAULT_TEAM_ACCENT_COLOR,
     softColor: DEFAULT_TEAM_SOFT_COLOR,
     displayOrder,
+  };
+}
+
+function defaultImpactForClosure(type: ClosureFormState["type"]): ClosureFormState["impact"] {
+  return type === "weather" || type === "annotation" ? "advisory" : "blocking";
+}
+
+function buildEmptyClosureState(): ClosureFormState {
+  return {
+    title: "",
+    type: "company_closure",
+    startDate: "",
+    endDate: "",
+    impact: "blocking",
+    details: "",
   };
 }
 
@@ -261,6 +281,7 @@ export function SettingsPanel() {
     setHolidaySourceEnabled,
     addClosure,
     removeClosure,
+    resetDemoData,
   } = usePlanner();
   const teams = useMemo(() => getSortedTeams(state.teams), [state.teams]);
   const customClosures = useMemo(
@@ -274,12 +295,9 @@ export function SettingsPanel() {
   const [newTeam, setNewTeam] = useState<TeamEditorState>(() =>
     buildEmptyTeamState(teams.length)
   );
-  const [newClosure, setNewClosure] = useState<ClosureFormState>({
-    title: "",
-    type: "company_closure",
-    startDate: "",
-    endDate: "",
-  });
+  const [newClosure, setNewClosure] = useState<ClosureFormState>(() =>
+    buildEmptyClosureState()
+  );
 
   return (
     <section className="mx-auto flex w-full max-w-[1800px] flex-1 flex-col gap-6 px-4 py-5 sm:px-6">
@@ -409,10 +427,45 @@ export function SettingsPanel() {
               </div>
             ))}
 
+            <Card className="border-dashed border-border/80 bg-muted/20">
+              <CardContent className="space-y-3 p-4">
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                  <div>
+                    <p className="font-medium text-foreground">{fr.settings.demoTitle}</p>
+                    <p className="text-sm leading-6 text-muted-foreground">
+                      {fr.settings.demoDescription}
+                    </p>
+                  </div>
+                  <Button
+                    variant="outline"
+                    disabled={isPending}
+                    onClick={() => {
+                      if (window.confirm(fr.settings.resetDemoConfirm)) {
+                        resetDemoData();
+                        setNewClosure(buildEmptyClosureState());
+                      }
+                    }}
+                  >
+                    <RefreshCw className="size-4" />
+                    {fr.settings.resetDemo}
+                  </Button>
+                </div>
+              </CardContent>
+            </Card>
+
             <div className="space-y-2 rounded-2xl border border-border/60 bg-muted/20 p-4">
               {generatedFranceClosures.map((closure) => (
-                <div key={closure.id} className="flex items-center justify-between gap-4 text-sm">
-                  <span className="font-medium text-foreground">{closure.title}</span>
+                <div
+                  key={closure.id}
+                  className="flex flex-wrap items-center justify-between gap-4 rounded-2xl border border-border/50 bg-background/80 p-3 text-sm"
+                >
+                  <div className="space-y-1">
+                    <span className="font-medium text-foreground">{closure.title}</span>
+                    <div className="flex flex-wrap gap-2">
+                      <Badge variant="secondary">{getClosureTypeLabelFr(closure.type)}</Badge>
+                      <Badge variant="outline">{getClosureImpactLabelFr(closure.impact)}</Badge>
+                    </div>
+                  </div>
                   <Badge variant="outline">{closure.startDate}</Badge>
                 </div>
               ))}
@@ -431,15 +484,30 @@ export function SettingsPanel() {
               {customClosures.map((closure) => (
                 <div
                   key={closure.id}
-                  className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-border/60 p-4"
+                  className="flex flex-wrap items-start justify-between gap-3 rounded-2xl border border-border/60 p-4"
                 >
-                  <div>
+                  <div className="space-y-2">
                     <p className="font-medium text-foreground">{closure.title}</p>
+                    <div className="flex flex-wrap gap-2">
+                      <Badge variant="secondary">{getClosureTypeLabelFr(closure.type)}</Badge>
+                      <Badge variant={closure.impact === "blocking" ? "default" : "outline"}>
+                        {getClosureImpactLabelFr(closure.impact)}
+                      </Badge>
+                    </div>
                     <p className="text-sm text-muted-foreground">
                       {closure.startDate} {"->"} {closure.endDate}
                     </p>
+                    {closure.details ? (
+                      <p className="max-w-xl text-sm leading-6 text-muted-foreground">
+                        {closure.details}
+                      </p>
+                    ) : null}
                   </div>
-                  <Button variant="destructive" onClick={() => removeClosure(closure.id)}>
+                  <Button
+                    variant="destructive"
+                    disabled={isPending}
+                    onClick={() => removeClosure(closure.id)}
+                  >
                     <Trash2 className="size-4" />
                     {fr.settings.deleteClosure}
                   </Button>
@@ -471,6 +539,9 @@ export function SettingsPanel() {
                         setNewClosure((current) => ({
                           ...current,
                           type: event.target.value as ClosureFormState["type"],
+                          impact: defaultImpactForClosure(
+                            event.target.value as ClosureFormState["type"]
+                          ),
                         }))
                       }
                     >
@@ -507,17 +578,64 @@ export function SettingsPanel() {
                       }
                     />
                   </div>
+                  <div className="space-y-2">
+                    <Label>{fr.settings.fields.impact}</Label>
+                    <div className="grid grid-cols-2 gap-2 rounded-2xl border border-border/60 bg-background/90 p-1">
+                      {(["blocking", "advisory"] as const).map((impact) => (
+                        <button
+                          key={impact}
+                          type="button"
+                          className={
+                            newClosure.impact === impact
+                              ? "rounded-xl bg-foreground px-3 py-2 text-sm font-medium text-background"
+                              : "rounded-xl px-3 py-2 text-sm font-medium text-muted-foreground transition-colors hover:text-foreground"
+                          }
+                          onClick={() =>
+                            setNewClosure((current) => ({
+                              ...current,
+                              impact,
+                            }))
+                          }
+                        >
+                          {getClosureImpactLabelFr(impact)}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="space-y-2 md:col-span-2">
+                    <Label>{fr.settings.fields.details}</Label>
+                    <Textarea
+                      rows={4}
+                      value={newClosure.details}
+                      onChange={(event) =>
+                        setNewClosure((current) => ({
+                          ...current,
+                          details: event.target.value,
+                        }))
+                      }
+                    />
+                  </div>
                 </div>
 
                 <Button
+                  disabled={
+                    isPending ||
+                    !newClosure.title.trim() ||
+                    !newClosure.startDate ||
+                    !newClosure.endDate
+                  }
                   onClick={() => {
+                    if (
+                      isPending ||
+                      !newClosure.title.trim() ||
+                      !newClosure.startDate ||
+                      !newClosure.endDate
+                    ) {
+                      return;
+                    }
+
                     addClosure(newClosure);
-                    setNewClosure({
-                      title: "",
-                      type: "company_closure",
-                      startDate: "",
-                      endDate: "",
-                    });
+                    setNewClosure(buildEmptyClosureState());
                   }}
                 >
                   <Plus className="size-4" />

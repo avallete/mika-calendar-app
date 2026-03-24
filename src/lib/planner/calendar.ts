@@ -97,7 +97,9 @@ export function isNonWorkingDate(date: string, closures: ClosurePeriod[]) {
     return true;
   }
 
-  return closures.some((closure) => isDateInsideClosure(date, closure));
+  return closures.some(
+    (closure) => closure.impact === "blocking" && isDateInsideClosure(date, closure)
+  );
 }
 
 export function nextWorkingDate(date: string, closures: ClosurePeriod[]) {
@@ -121,7 +123,12 @@ export function previousWorkingDate(date: string, closures: ClosurePeriod[]) {
 }
 
 export function normalizeToWorkingSlot(slotKey: SlotKey, closures: ClosurePeriod[]) {
-  const { date } = parseSlotKey(slotKey);
+  const { date, part } = parseSlotKey(slotKey);
+
+  if (!isNonWorkingDate(date, closures)) {
+    return makeSlotKey(date, part);
+  }
+
   return makeSlotKey(nextWorkingDate(date, closures), "AM");
 }
 

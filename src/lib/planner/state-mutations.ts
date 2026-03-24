@@ -5,6 +5,7 @@ import {
   updateProjectPlacements,
   wouldCreateDependencyCycle,
 } from "@/lib/planner/scheduler";
+import { initialPlannerState } from "@/lib/planner/sample-data";
 import type {
   ClosureFormState,
   PlannerState,
@@ -166,6 +167,8 @@ export function addClosureInState(state: PlannerState, values: ClosureFormState)
         type: values.type,
         startDate: values.startDate,
         endDate: values.endDate,
+        impact: values.impact,
+        details: values.details || undefined,
         source: "custom",
         editable: true,
       },
@@ -255,4 +258,15 @@ export function toggleHolidaySourceInState(
       source.code === sourceCode ? { ...source, enabled } : { ...source }
     ),
   });
+}
+
+export function resetPlannerDemoDataInState(state: PlannerState) {
+  return {
+    ...cloneState(state),
+    teams: initialPlannerState.teams.map((team) => ({ ...team })),
+    holidaySources: initialPlannerState.holidaySources.map((source) => ({ ...source })),
+    projects: initialPlannerState.projects.map((project) => ({ ...project })),
+    dependencies: initialPlannerState.dependencies.map((dependency) => ({ ...dependency })),
+    closures: initialPlannerState.closures.map((closure) => ({ ...closure })),
+  };
 }

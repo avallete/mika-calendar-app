@@ -28,6 +28,7 @@ function buildHoliday(id: string, title: string, date: string): ClosurePeriod {
     type: "holiday",
     startDate: date,
     endDate: date,
+    impact: "blocking",
     source: "fr-public-holiday",
     editable: false,
   };

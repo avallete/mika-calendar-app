@@ -32,6 +32,7 @@ import {
   deleteTeamInState,
   placeProjectInState,
   placeProjectsInState,
+  resetPlannerDemoDataInState,
   removeClosureInState,
   toggleHolidaySourceInState,
   unscheduleProjectInState,
@@ -95,6 +96,8 @@ function actionLabel(actionType: string) {
       return "supprimer une equipe";
     case "holiday-source.toggle":
       return "modifier les jours feries France";
+    case "demo.reset":
+      return "recharger les donnees de demo";
     default:
       return "modifier le planning";
   }
@@ -122,6 +125,35 @@ function getBasePersistentState() {
       (closure) => closure.source === "custom"
     ),
   } satisfies PersistentPlannerState;
+}
+
+async function ensureClosureMarkerSchema(executor: DbExecutor) {
+  await executor.execute(sql.raw(`
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'closure_impact') THEN
+    CREATE TYPE "public"."closure_impact" AS ENUM ('blocking', 'advisory');
+  END IF;
+END $$;
+`));
+  await executor.execute(
+    sql.raw(`ALTER TYPE "public"."closure_type" ADD VALUE IF NOT EXISTS 'weather';`)
+  );
+  await executor.execute(
+    sql.raw(`ALTER TYPE "public"."closure_type" ADD VALUE IF NOT EXISTS 'annotation';`)
+  );
+  await executor.execute(
+    sql.raw(`
+ALTER TABLE "closure_periods"
+  ADD COLUMN IF NOT EXISTS "impact" "closure_impact" DEFAULT 'blocking' NOT NULL;
+`)
+  );
+  await executor.execute(
+    sql.raw(`ALTER TABLE "closure_periods" ADD COLUMN IF NOT EXISTS "details" text;`)
+  );
+  await executor.execute(
+    sql.raw(`UPDATE "closure_periods" SET "impact" = 'blocking' WHERE "impact" IS NULL;`)
+  );
 }
 
 async function readPersistentState(executor: DbExecutor): Promise<PersistentPlannerState> {
@@ -180,6 +212,8 @@ async function readPersistentState(executor: DbExecutor): Promise<PersistentPlan
       type: row.type,
       startDate: toDateString(row.startDate)!,
       endDate: toDateString(row.endDate)!,
+      impact: row.impact,
+      details: row.details ?? undefined,
       source: "custom",
       editable: true,
     })),
@@ -256,8 +290,10 @@ async function replacePersistentState(
         id: closure.id,
         title: closure.title,
         type: closure.type,
+        impact: closure.impact,
         startDate: new Date(`${closure.startDate}T00:00:00.000Z`),
         endDate: new Date(`${closure.endDate}T00:00:00.000Z`),
+        details: closure.details ?? null,
       }))
     );
   }
@@ -376,6 +412,8 @@ async function readHistoryState(
 }
 
 async function ensurePlannerBootstrapped(executor: DbExecutor) {
+  await ensureClosureMarkerSchema(executor);
+
   const existingTeamCount = await executor
     .select({ count: sql<number>`count(*)` })
     .from(teams);
@@ -595,6 +633,12 @@ export async function setHolidaySourceEnabled(
     "holiday-source.toggle",
     { sourceCode, enabled },
     (state) => toggleHolidaySourceInState(state, sourceCode, enabled)
+  );
+}
+
+export async function resetDemoData(sessionId: string) {
+  return commitLoggedMutation(sessionId, "demo.reset", {}, (state) =>
+    resetPlannerDemoDataInState(state)
   );
 }
 

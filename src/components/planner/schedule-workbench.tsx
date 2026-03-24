@@ -1,10 +1,10 @@
 "use client";
 
 import Link from "next/link";
-import { addDays, format, parseISO } from "date-fns";
 import {
   DndContext,
   DragOverlay,
+  type DragOverEvent,
   KeyboardSensor,
   PointerSensor,
   pointerWithin,
@@ -13,7 +13,7 @@ import {
   type DragEndEvent,
   type DragStartEvent,
 } from "@dnd-kit/core";
-import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { useDeferredValue, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { Settings2, Sparkles } from "lucide-react";
 
 import { DraftSidebar } from "@/components/planner/draft-sidebar";
@@ -44,18 +44,25 @@ import {
   compareSlotKeys,
   countWorkingHalfDays,
   countWorkingSlotDistance,
+  isNonWorkingDate,
   makeSlotKey,
   nextCalendarSlot,
   normalizeToWorkingSlot,
   parseSlotKey,
-  previousWorkingDate,
   shiftWorkingSlot,
 } from "@/lib/planner/calendar";
+import {
+  getClosureImpactLabelFr,
+  getClosureTone,
+  getClosureTypeLabelFr,
+} from "@/lib/planner/day-markers";
 import {
   detectDependencyConflicts,
   getEarlierShiftPrompt,
   getTouchingProjectChain,
   setSchedulerTraceEnabled,
+  updateProjectPlacement,
+  updateProjectPlacements,
 } from "@/lib/planner/scheduler";
 import type {
   CalendarBucket,
@@ -71,6 +78,7 @@ import type {
   TeamId,
 } from "@/lib/planner/types";
 import { isScheduledProject } from "@/lib/planner/types";
+import { cn } from "@/lib/utils";
 
 const TRACE_STORAGE_KEY = "planner-trace-enabled";
 const TRACE_STORAGE_EVENT = "planner-trace-storage";
@@ -315,17 +323,34 @@ function getDragLabel(activeDrag: DragProjectMeta | null) {
   return activeDrag.title;
 }
 
+function getClosureChipClasses(closure: ClosurePeriod) {
+  const tone = getClosureTone(closure);
+
+  switch (tone) {
+    case "custom-blocking":
+      return "border-red-200/70 bg-[linear-gradient(145deg,rgba(255,244,241,0.96),rgba(255,235,228,0.94))] hover:border-red-300/80 hover:shadow-[0_14px_28px_-24px_rgba(220,38,38,0.45)]";
+    case "public-holiday":
+      return "border-amber-200/70 bg-[linear-gradient(145deg,rgba(255,249,233,0.96),rgba(255,241,206,0.94))] hover:border-amber-300/80 hover:shadow-[0_14px_28px_-24px_rgba(217,119,6,0.45)]";
+    case "advisory":
+      return "border-sky-200/70 bg-[linear-gradient(145deg,rgba(240,250,255,0.96),rgba(226,244,255,0.94))] hover:border-sky-300/80 hover:shadow-[0_14px_28px_-24px_rgba(2,132,199,0.4)]";
+    default:
+      return "border-border/70 bg-card/95 hover:border-border";
+  }
+}
+
+function renderClosureSourceLabel(closure: ClosurePeriod) {
+  if (closure.source === "fr-public-holiday") {
+    return fr.schedule.sourceFrance;
+  }
+
+  return closure.impact === "advisory" ? fr.schedule.sourceAdvisory : fr.schedule.sourceCustom;
+}
+
 function getLatestAllowedResizeStartSlot(
   calendarEndSlot: SlotKey,
   closures: ClosurePeriod[]
 ) {
-  const { date, part } = parseSlotKey(calendarEndSlot);
-  const inclusiveEndDate =
-    part === "AM"
-      ? format(addDays(parseISO(date), -1), "yyyy-MM-dd")
-      : previousWorkingDate(date, closures);
-
-  return makeSlotKey(previousWorkingDate(inclusiveEndDate, closures), "AM");
+  return shiftWorkingSlot(calendarEndSlot, -1, closures);
 }
 
 function buildScheduledPlacement(
@@ -347,29 +372,32 @@ function buildScheduledPlacement(
 
   if (active.intent === "resize-start") {
     const latestAllowedStart = getLatestAllowedResizeStartSlot(active.calendarEndSlot, closures);
+    const requestedStart = normalizeToWorkingSlot(bucket.startSlot, closures);
     const startSlot =
-      compareSlotKeys(bucket.startSlot, latestAllowedStart) > 0
+      compareSlotKeys(requestedStart, latestAllowedStart) > 0
         ? latestAllowedStart
-        : bucket.startSlot;
+        : requestedStart;
 
     return {
       teamId: active.teamId,
       startSlot,
       durationHalfDays: Math.max(
-        2,
+        1,
         countWorkingHalfDays(startSlot, active.calendarEndSlot, closures)
       ),
     };
   }
 
-  const targetDate = previousWorkingDate(bucket.startSlot.slice(0, 10), closures);
-  const endSlotExclusive = nextCalendarSlot(makeSlotKey(targetDate, "PM"));
+  const { date } = parseSlotKey(bucket.startSlot);
+  const endSlotExclusive = isNonWorkingDate(date, closures)
+    ? nextCalendarSlot(shiftWorkingSlot(makeSlotKey(date, "AM"), -1, closures))
+    : nextCalendarSlot(bucket.startSlot);
 
   return {
     teamId: active.teamId,
     startSlot: active.startSlot,
     durationHalfDays: Math.max(
-      2,
+      1,
       countWorkingHalfDays(active.startSlot, endSlotExclusive, closures)
     ),
   };
@@ -437,6 +465,27 @@ function buildMovePlacementRequests(
   };
 }
 
+function summarizePreviewChanges(currentProjects: Project[], previewProjects: Project[]) {
+  const currentById = new Map(currentProjects.map((project) => [project.id, project] as const));
+
+  return previewProjects
+    .filter(isScheduledProject)
+    .filter((project) => {
+      const current = currentById.get(project.id);
+      if (!current || !isScheduledProject(current)) {
+        return true;
+      }
+
+      return (
+        current.scheduledTeam !== project.scheduledTeam ||
+        current.scheduledStartSlot !== project.scheduledStartSlot ||
+        current.scheduledDurationHalfDays !== project.scheduledDurationHalfDays ||
+        current.sequenceOrder !== project.sequenceOrder
+      );
+    })
+    .map((project) => project.id);
+}
+
 export function ScheduleWorkbench() {
   const {
     state,
@@ -454,12 +503,20 @@ export function ScheduleWorkbench() {
   const [pendingDependencyConflict, setPendingDependencyConflict] =
     useState<DependencyConflictPromptState | null>(null);
   const [activeDrag, setActiveDrag] = useState<DragProjectMeta | null>(null);
+  const [hoveredBucketId, setHoveredBucketId] = useState<string | null>(null);
+  const [hoveredBucket, setHoveredBucket] = useState<CalendarBucket | null>(null);
+  const [calendarFocus, setCalendarFocus] = useState<{
+    id: string;
+    startDate: string;
+    endDate: string;
+  } | null>(null);
   const handledDragIdRef = useRef<string | null>(null);
   const traceEnabled = useSyncExternalStore(
     subscribeToTracePreference,
     getTracePreferenceSnapshot,
     () => false
   );
+  const deferredHoveredBucket = useDeferredValue(hoveredBucket);
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
     useSensor(KeyboardSensor)
@@ -473,10 +530,97 @@ export function ScheduleWorkbench() {
     () => state.projects.find((project) => project.id === selectedProjectId) ?? null,
     [selectedProjectId, state.projects]
   );
+  const previewState = useMemo(() => {
+    if (!activeDrag || !deferredHoveredBucket) {
+      return null;
+    }
+
+    if (activeDrag.type === "draft") {
+      const preview = updateProjectPlacement(state, activeDrag.projectId, {
+        teamId: deferredHoveredBucket.teamId,
+        startSlot: deferredHoveredBucket.startSlot,
+        durationHalfDays: activeDrag.durationHalfDays,
+      });
+
+      return {
+        projects: preview.projects,
+        changedProjectIds: summarizePreviewChanges(state.projects, preview.projects),
+        primaryProjectId: activeDrag.projectId,
+      };
+    }
+
+    const activeSelectionProjectIds =
+      activeDrag.intent === "move" && selectedProjectIds.includes(activeDrag.projectId)
+        ? selectedProjectIds
+        : [activeDrag.projectId];
+    const activeWithSelection =
+      activeDrag.intent === "move"
+        ? {
+            ...activeDrag,
+            selectionProjectIds: activeSelectionProjectIds,
+          }
+        : activeDrag;
+
+    if (activeDrag.intent === "move") {
+      const movePlan = buildMovePlacementRequests(
+        activeWithSelection,
+        deferredHoveredBucket,
+        state.projects,
+        state.closures
+      );
+
+      if (!movePlan || !movePlan.snappedRequests.length) {
+        return null;
+      }
+
+      const preview = updateProjectPlacements(state, movePlan.snappedRequests, {
+        source: "preview",
+        dependencyResolution: "preserve-dependencies",
+      });
+
+      return {
+        projects: preview.projects,
+        changedProjectIds: summarizePreviewChanges(state.projects, preview.projects),
+        primaryProjectId: activeDrag.projectId,
+      };
+    }
+
+    const nextPlacement = buildScheduledPlacement(
+      activeWithSelection,
+      deferredHoveredBucket,
+      state.closures
+    );
+    if (!nextPlacement) {
+      return null;
+    }
+
+    const preview = updateProjectPlacement(state, activeDrag.projectId, nextPlacement, {
+      source: "preview",
+      dependencyResolution: "preserve-dependencies",
+    });
+
+    return {
+      projects: preview.projects,
+      changedProjectIds: summarizePreviewChanges(state.projects, preview.projects),
+      primaryProjectId: activeDrag.projectId,
+    };
+  }, [activeDrag, deferredHoveredBucket, selectedProjectIds, state]);
 
   useEffect(() => {
     setSchedulerTraceEnabled(traceEnabled);
   }, [traceEnabled]);
+
+  useEffect(() => {
+    if (!calendarFocus) {
+      return;
+    }
+
+    const timer = window.setTimeout(() => {
+      setCalendarFocus((current) => (current?.id === calendarFocus.id ? null : current));
+    }, 1800);
+
+    return () => window.clearTimeout(timer);
+  }, [calendarFocus]);
 
   const updateTraceEnabled = (enabled: boolean) => {
     if (typeof window === "undefined") {
@@ -518,6 +662,8 @@ export function ScheduleWorkbench() {
   const handleDragStart = (event: DragStartEvent) => {
     const data = event.active.data.current as DragProjectMeta | undefined;
     handledDragIdRef.current = null;
+    setHoveredBucket(null);
+    setHoveredBucketId(null);
 
     if (
       data?.type === "scheduled" &&
@@ -534,12 +680,20 @@ export function ScheduleWorkbench() {
     setActiveDrag(data ?? null);
   };
 
+  const handleDragOver = (event: DragOverEvent) => {
+    const bucket = (event.over?.data.current as CalendarBucket | undefined) ?? null;
+    setHoveredBucket(bucket);
+    setHoveredBucketId(bucket?.bucketId ?? null);
+  };
+
   const handleDragEnd = (event: DragEndEvent) => {
     const active = event.active.data.current as DragProjectMeta | undefined;
     const bucket = event.over?.data.current as CalendarBucket | undefined;
     const dragId = String(event.active.id);
 
     setActiveDrag(null);
+    setHoveredBucket(null);
+    setHoveredBucketId(null);
 
     if (handledDragIdRef.current === dragId) {
       tracePlannerUi(traceEnabled, "dragEnd.ignoredDuplicate", {
@@ -729,10 +883,13 @@ export function ScheduleWorkbench() {
         sensors={sensors}
         collisionDetection={pointerWithin}
         onDragStart={handleDragStart}
+        onDragOver={handleDragOver}
         onDragEnd={handleDragEnd}
         onDragCancel={() => {
           handledDragIdRef.current = null;
           setActiveDrag(null);
+          setHoveredBucket(null);
+          setHoveredBucketId(null);
         }}
       >
         <DraftSidebar
@@ -795,35 +952,67 @@ export function ScheduleWorkbench() {
 
               <Separator />
 
-              <div className="flex flex-wrap gap-2">
+              <div className="flex flex-wrap gap-3">
                 {state.closures.map((closure) => (
-                  <Badge
+                  <button
                     key={closure.id}
-                    variant="outline"
-                    className="gap-2 rounded-full px-3 py-1.5 text-sm"
+                    type="button"
+                    className={cn(
+                      "group flex min-w-[220px] flex-1 flex-col items-start gap-2 rounded-2xl border px-4 py-3 text-left transition-all duration-200 hover:-translate-y-0.5",
+                      getClosureChipClasses(closure),
+                      calendarFocus?.id === closure.id && "ring-2 ring-primary/40"
+                    )}
+                    onClick={() =>
+                      setCalendarFocus({
+                        id: closure.id,
+                        startDate: closure.startDate,
+                        endDate: closure.endDate,
+                      })
+                    }
                   >
-                    {closure.title}
-                    <span className="rounded-full bg-muted px-2 py-0.5 text-[11px] uppercase tracking-[0.12em] text-muted-foreground">
-                      {closure.source === "fr-public-holiday"
-                        ? fr.schedule.sourceFrance
-                        : fr.schedule.sourceCustom}
-                    </span>
-                    <span className="text-muted-foreground">
-                      {closure.startDate} {"->"} {closure.endDate}
-                    </span>
-                  </Badge>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="font-medium text-foreground">{closure.title}</span>
+                      <Badge variant="secondary" className="rounded-full">
+                        {getClosureTypeLabelFr(closure.type)}
+                      </Badge>
+                      <Badge
+                        variant={closure.impact === "blocking" ? "default" : "outline"}
+                        className="rounded-full"
+                      >
+                        {getClosureImpactLabelFr(closure.impact)}
+                      </Badge>
+                    </div>
+                    <div className="flex flex-wrap gap-2 text-xs text-muted-foreground">
+                      <span className="rounded-full bg-background/75 px-2 py-1 uppercase tracking-[0.14em]">
+                        {renderClosureSourceLabel(closure)}
+                      </span>
+                      <span>
+                        {closure.startDate} {"->"} {closure.endDate}
+                      </span>
+                    </div>
+                    {closure.details ? (
+                      <p className="line-clamp-2 text-sm leading-5 text-muted-foreground">
+                        {closure.details}
+                      </p>
+                    ) : null}
+                  </button>
                 ))}
               </div>
             </div>
 
             <TimelineCanvas
               projects={state.projects}
+              previewProjects={previewState?.projects ?? null}
+              previewChangedProjectIds={previewState?.changedProjectIds ?? []}
+              previewPrimaryProjectId={previewState?.primaryProjectId ?? null}
+              hoveredBucketId={hoveredBucketId}
               dependencies={state.dependencies}
               closures={state.closures}
               pendingPlacement={pendingPlacement}
               selectedProjectIds={selectedProjectIds}
               traceEnabled={traceEnabled}
               teams={state.teams}
+              focusEvent={calendarFocus}
               onTraceEnabledChange={updateTraceEnabled}
               onPendingPlacementChange={setPendingPlacement}
               onQuickPlacementCommit={(projectId, placement) => {
@@ -885,8 +1074,18 @@ export function ScheduleWorkbench() {
 
         <DragOverlay>
           {activeDrag ? (
-            <div className="rounded-2xl border border-border bg-background/95 px-4 py-3 text-sm font-medium shadow-2xl backdrop-blur">
-              {getDragLabel(activeDrag)}
+            <div className="rounded-2xl border border-border bg-background/95 px-4 py-3 shadow-2xl backdrop-blur">
+              <p className="text-sm font-semibold text-foreground">{getDragLabel(activeDrag)}</p>
+              <div className="mt-2 flex flex-wrap gap-2 text-xs text-muted-foreground">
+                <Badge variant="secondary" className="rounded-full">
+                  {(activeDrag.durationHalfDays ?? 1) / 2} j
+                </Badge>
+                {activeDrag.type === "scheduled" ? (
+                  <Badge variant="outline" className="rounded-full">
+                    {activeDrag.startSlot}
+                  </Badge>
+                ) : null}
+              </div>
             </div>
           ) : null}
         </DragOverlay>

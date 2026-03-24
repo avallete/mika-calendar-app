@@ -4,11 +4,14 @@ export const closureTypeOptions = [
   { id: "holiday", labelFr: "Jour ferie" },
   { id: "company_closure", labelFr: "Fermeture" },
   { id: "custom_time_off", labelFr: "Indisponibilite" },
+  { id: "weather", labelFr: "Meteo" },
+  { id: "annotation", labelFr: "Annotation" },
 ] as const;
 
 export type TeamId = string;
 export type ZoomLevel = (typeof zoomLevels)[number];
 export type ClosureType = (typeof closureTypeOptions)[number]["id"];
+export type ClosureImpact = "blocking" | "advisory";
 export type ClosureSource = "custom" | "fr-public-holiday";
 export type ProjectStatus = "draft" | "scheduled";
 export type ProjectDeleteMode = "preserve-dates" | "compact-schedule";
@@ -64,8 +67,37 @@ export type ClosurePeriod = {
   type: ClosureType;
   startDate: string;
   endDate: string;
+  impact: ClosureImpact;
+  details?: string;
   source: ClosureSource;
   editable: boolean;
+};
+
+export type CalendarDayMarkerTone =
+  | "custom-blocking"
+  | "public-holiday"
+  | "weekend"
+  | "advisory"
+  | "working";
+
+export type CalendarDayMarker = {
+  id: string;
+  title: string;
+  shortLabelFr: string;
+  type: ClosureType | "weekend";
+  source: ClosureSource | "derived";
+  impact: ClosureImpact;
+  startDate: string;
+  endDate: string;
+  details?: string;
+  tone: Exclude<CalendarDayMarkerTone, "working">;
+};
+
+export type CalendarDayState = {
+  date: string;
+  markers: CalendarDayMarker[];
+  isBlocking: boolean;
+  tone: CalendarDayMarkerTone;
 };
 
 export type PlannerHistoryState = {
@@ -185,6 +217,8 @@ export type ClosureFormState = {
   type: ClosureType;
   startDate: string;
   endDate: string;
+  impact: ClosureImpact;
+  details: string;
 };
 
 export type TeamEditorState = {

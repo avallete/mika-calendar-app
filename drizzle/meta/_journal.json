@@ -15,6 +15,13 @@
       "when": 1774371000000,
       "tag": "0001_db_first_planner",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1774402200000,
+      "tag": "0002_closure_markers",
+      "breakpoints": true
     }
   ]
 }
