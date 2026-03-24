@@ -32,6 +32,7 @@ export function ClosureSheet({
   const [startDate, setStartDate] = useState(defaultStartDate);
   const [endDate, setEndDate] = useState(defaultEndDate);
   const [details, setDetails] = useState("");
+  const [repeatsAnnually, setRepeatsAnnually] = useState(false);
 
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
@@ -134,12 +135,29 @@ export function ClosureSheet({
             </p>
             <Input value={details} onChange={(event) => setDetails(event.target.value)} />
           </div>
+
+          <label className="flex items-center gap-3 rounded-2xl border border-border bg-card px-3 py-3 text-sm text-foreground">
+            <input
+              type="checkbox"
+              checked={repeatsAnnually}
+              onChange={(event) => setRepeatsAnnually(event.target.checked)}
+            />
+            Repeat every year
+          </label>
         </div>
 
         <SheetFooter className="border-t border-border/60">
           <Button
             onClick={() => {
-              onSave({ title, type, startDate, endDate, impact, details });
+              onSave({
+                title,
+                type,
+                startDate,
+                endDate,
+                impact,
+                details,
+                repeatsAnnually,
+              });
               onOpenChange(false);
             }}
           >

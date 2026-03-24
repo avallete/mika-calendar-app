@@ -1,7 +1,7 @@
 import { endOfMonth, format, parseISO, startOfMonth } from "date-fns";
 import { fr as localeFr } from "date-fns/locale";
 
-import type { ClosurePeriod, Project, YearMonthSection } from "@/lib/planner/types";
+import type { Project, YearMonthSection } from "@/lib/planner/types";
 import { isScheduledProject } from "@/lib/planner/types";
 
 export type TimelineYearRange = {
@@ -10,11 +10,19 @@ export type TimelineYearRange = {
   years: number[];
 };
 
+export type TimelineDateRange = {
+  startDate: string;
+  endDate: string;
+};
+
 export function getTodayDateString(now: Date = new Date()) {
   return format(now, "yyyy-MM-dd");
 }
 
-export function collectTimelineRelevantDates(projects: Project[], closures: ClosurePeriod[]) {
+export function collectTimelineRelevantDates(
+  projects: Project[],
+  ranges: TimelineDateRange[]
+) {
   return [
     ...projects.flatMap((project) => {
       const values: string[] = [];
@@ -26,17 +34,17 @@ export function collectTimelineRelevantDates(projects: Project[], closures: Clos
       }
       return values;
     }),
-    ...closures.flatMap((closure) => [closure.startDate, closure.endDate]),
+    ...ranges.flatMap((range) => [range.startDate, range.endDate]),
   ].filter((value): value is string => Boolean(value));
 }
 
 export function buildTimelineYearRange(
   projects: Project[],
-  closures: ClosurePeriod[],
+  ranges: TimelineDateRange[],
   now: Date = new Date(),
   bufferYears = 1
 ): TimelineYearRange {
-  const relevantDates = collectTimelineRelevantDates(projects, closures);
+  const relevantDates = collectTimelineRelevantDates(projects, ranges);
   const fallbackYear = now.getFullYear();
   const coveredYears = relevantDates.map((date) => parseISO(date).getFullYear());
   const minYear = coveredYears.length ? Math.min(...coveredYears) : fallbackYear;
@@ -53,11 +61,11 @@ export function buildTimelineYearRange(
 
 export function buildTimelineSections(
   projects: Project[],
-  closures: ClosurePeriod[],
+  ranges: TimelineDateRange[],
   now: Date = new Date(),
   bufferYears = 1
 ): YearMonthSection[] {
-  const { years } = buildTimelineYearRange(projects, closures, now, bufferYears);
+  const { years } = buildTimelineYearRange(projects, ranges, now, bufferYears);
 
   return years.flatMap((year) =>
     Array.from({ length: 12 }, (_, index) => {

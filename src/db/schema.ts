@@ -161,6 +161,7 @@ export const closurePeriods = pgTable(
     endDate: timestamp("end_date", { withTimezone: true, mode: "date" })
       .notNull(),
     details: text("details"),
+    repeatsAnnually: boolean("repeats_annually").notNull().default(false),
     createdAt: timestamp("created_at", { withTimezone: true, mode: "date" })
       .defaultNow()
       .notNull(),

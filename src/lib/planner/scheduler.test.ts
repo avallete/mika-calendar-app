@@ -45,11 +45,13 @@ const baseHolidaySources = [
 ] as const;
 
 function withPlannerShape(
-  state: Pick<PlannerState, "projects" | "dependencies" | "closures">
+  state: Pick<PlannerState, "projects" | "dependencies" | "closures"> &
+    Partial<Pick<PlannerState, "customClosures">>
 ): PlannerState {
   return {
     teams: [...baseTeams],
     holidaySources: [...baseHolidaySources],
+    customClosures: state.customClosures ?? [],
     history: {
       canUndo: false,
       canRedo: false,
@@ -142,43 +144,47 @@ describe("scheduler", () => {
   });
 
   test("skips closure dates when recalculating project finishes", () => {
-    const nextState = rescheduleProjects(withPlannerShape({
-      ...baseState(),
-      closures: [
-        {
-          id: "closure",
-          title: "Company closure",
-          type: "company_closure",
-          startDate: "2026-03-25",
-          endDate: "2026-03-26",
-          impact: "blocking",
-          source: "custom",
-          editable: true,
-        },
-      ],
-    }));
+    const nextState = rescheduleProjects(
+      withPlannerShape({
+        ...baseState(),
+        customClosures: [
+          {
+            id: "closure",
+            title: "Company closure",
+            type: "company_closure",
+            startDate: "2026-03-25",
+            endDate: "2026-03-26",
+            impact: "blocking",
+            repeatsAnnually: false,
+          },
+        ],
+        closures: [],
+      })
+    );
 
     const downstream = nextState.projects.find((project) => project.id === "a-2");
     expect(downstream?.scheduledStartSlot).toBe(makeSlotKey("2026-03-27", "AM"));
   });
 
   test("ignores advisory markers when recalculating project finishes", () => {
-    const nextState = rescheduleProjects(withPlannerShape({
-      ...baseState(),
-      closures: [
-        {
-          id: "weather",
-          title: "Rain advisory",
-          type: "weather",
-          startDate: "2026-03-25",
-          endDate: "2026-03-25",
-          impact: "advisory",
-          details: "Conditions humides mais chantier maintenu.",
-          source: "custom",
-          editable: true,
-        },
-      ],
-    }));
+    const nextState = rescheduleProjects(
+      withPlannerShape({
+        ...baseState(),
+        customClosures: [
+          {
+            id: "weather",
+            title: "Rain advisory",
+            type: "weather",
+            startDate: "2026-03-25",
+            endDate: "2026-03-25",
+            impact: "advisory",
+            details: "Conditions humides mais chantier maintenu.",
+            repeatsAnnually: false,
+          },
+        ],
+        closures: [],
+      })
+    );
 
     const downstream = nextState.projects.find((project) => project.id === "a-2");
     expect(downstream?.scheduledStartSlot).toBe(makeSlotKey("2026-03-25", "AM"));

@@ -2,7 +2,7 @@
 
 import { useDraggable, useDroppable } from "@dnd-kit/core";
 import { CSS } from "@dnd-kit/utilities";
-import { addDays, eachDayOfInterval, format, parseISO } from "date-fns";
+import { addDays, endOfMonth, eachDayOfInterval, format, getDate, getMonth, parseISO } from "date-fns";
 import { fr as localeFr } from "date-fns/locale";
 import {
   ArrowRightLeft,
@@ -12,7 +12,7 @@ import {
   Sparkles,
   StretchHorizontal,
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, useTransition } from "react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -40,6 +40,11 @@ import {
 } from "@/lib/planner/day-markers";
 import { fr } from "@/lib/i18n/fr";
 import {
+  buildTimelineYearSummaries,
+  getTimelineMonthId,
+  shiftTimelineDate,
+} from "@/lib/planner/timeline-folding";
+import {
   buildTimelineSections,
   buildTimelineYearRange,
   getTodayDateString,
@@ -49,6 +54,7 @@ import type {
   CalendarDayMarkerTone,
   CalendarDayState,
   ClosurePeriod,
+  CustomClosure,
   Project,
   ProjectDependency,
   ProjectPlacement,
@@ -56,6 +62,7 @@ import type {
   SlotKey,
   Team,
   TeamId,
+  TimelineViewMode,
   YearMonthSection,
 } from "@/lib/planner/types";
 import { getSortedTeams, getTeamById, isScheduledProject } from "@/lib/planner/types";
@@ -152,6 +159,28 @@ function scrollToTimelineYear(year: number, behavior: ScrollBehavior) {
   });
 
   return true;
+}
+
+function scrollToTimelineSection(sectionId: string, behavior: ScrollBehavior) {
+  const anchor = document.querySelector<HTMLElement>(`[data-section-anchor="${sectionId}"]`);
+  if (!anchor) {
+    return false;
+  }
+
+  anchor.scrollIntoView({
+    behavior,
+    block: "start",
+  });
+
+  return true;
+}
+
+function replaceYearInDate(date: string, year: number) {
+  const parsed = parseISO(date);
+  const month = getMonth(parsed);
+  const day = getDate(parsed);
+  const maxDay = getDate(endOfMonth(new Date(year, month, 1)));
+  return format(new Date(year, month, Math.min(day, maxDay)), "yyyy-MM-dd");
 }
 
 function toneClasses(tone: CalendarDayMarkerTone) {
@@ -827,9 +856,11 @@ function YearMonthRow({
 
 function YearJumpStrip({
   years,
+  activeYear,
   onJumpToYear,
 }: {
   years: number[];
+  activeYear: number;
   onJumpToYear: (year: number) => void;
 }) {
   return (
@@ -841,7 +872,7 @@ function YearJumpStrip({
         <Button
           key={year}
           size="sm"
-          variant="outline"
+          variant={year === activeYear ? "default" : "outline"}
           className="rounded-full"
           onClick={() => onJumpToYear(year)}
         >
@@ -852,9 +883,61 @@ function YearJumpStrip({
   );
 }
 
-function YearView({
-  years,
-  sections,
+function FoldedMonthCard({
+  summary,
+  onOpen,
+}: {
+  summary: ReturnType<typeof buildTimelineYearSummaries>[number]["months"][number];
+  onOpen: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      className={cn(
+        "flex w-full flex-col items-start gap-3 rounded-[24px] border border-border/70 bg-card/85 p-4 text-left shadow-[0_18px_40px_-34px_rgba(15,23,42,0.35)] transition-transform duration-150 hover:-translate-y-0.5",
+        summary.containsFocus && "ring-2 ring-primary/25",
+        summary.containsToday && "border-primary/40"
+      )}
+      onClick={onOpen}
+    >
+      <div className="flex w-full items-start justify-between gap-3">
+        <div>
+          <p className="text-xs font-semibold uppercase tracking-[0.22em] text-muted-foreground">
+            {fr.schedule.foldedMonthTitle}
+          </p>
+          <h4 className="mt-1 font-heading text-lg font-semibold text-foreground">
+            {summary.section.label}
+          </h4>
+        </div>
+        <Badge variant="outline" className="rounded-full">
+          {summary.section.dayCount} {fr.schedule.daysSuffix}
+        </Badge>
+      </div>
+
+      <div className="flex flex-wrap gap-2 text-xs text-muted-foreground">
+        <Badge variant="secondary" className="rounded-full">
+          {summary.projectCount} {fr.schedule.projectCount}
+        </Badge>
+        <Badge variant="outline" className="rounded-full">
+          {summary.closureCount} {fr.schedule.closureCount}
+        </Badge>
+        {summary.containsToday ? (
+          <Badge variant="outline" className="rounded-full">
+            {fr.schedule.containsToday}
+          </Badge>
+        ) : null}
+        {summary.containsFocus ? (
+          <Badge variant="outline" className="rounded-full">
+            {fr.schedule.containsFocus}
+          </Badge>
+        ) : null}
+      </div>
+    </button>
+  );
+}
+
+function ExpandedMonthSection({
+  section,
   projects,
   previewProjects,
   previewChangedProjectIds,
@@ -869,8 +952,7 @@ function YearView({
   onSelectProject,
   onProjectPointerDown,
 }: {
-  years: number[];
-  sections: YearMonthSection[];
+  section: YearMonthSection;
   projects: Project[];
   previewProjects: Project[] | null;
   previewChangedProjectIds: string[];
@@ -888,76 +970,273 @@ function YearView({
   const sortedTeams = useMemo(() => getSortedTeams(teams), [teams]);
   const scheduledProjects = projects.filter(isScheduledProject);
   const previewScheduledProjects = (previewProjects ?? []).filter(isScheduledProject);
-  const sectionsByYear = useMemo(
-    () =>
-      years.map((year) => ({
-        year,
-        sections: sections.filter((section) => section.year === year),
-      })),
-    [sections, years]
-  );
 
   return (
+    <section
+      data-section-anchor={section.id}
+      className="rounded-[28px] border border-border/70 bg-card/95 p-4 shadow-[0_24px_50px_-42px_rgba(15,23,42,0.55)] [contain:layout_paint]"
+    >
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+        <div>
+          <p className="text-xs font-semibold uppercase tracking-[0.22em] text-muted-foreground">
+            {fr.schedule.monthOverview}
+          </p>
+          <h4 className="mt-1 font-heading text-xl font-semibold text-foreground">
+            {section.label}
+          </h4>
+        </div>
+        <Badge variant="outline" className="rounded-full px-3 py-1 text-xs">
+          {section.dayCount} {fr.schedule.daysSuffix}
+        </Badge>
+      </div>
+
+      <div className="mt-4 space-y-4">
+        {sortedTeams.map((team, index) => (
+          <YearMonthRow
+            key={`${section.id}-${team.id}`}
+            teamId={team.id}
+            section={section}
+            closures={closures}
+            projects={scheduledProjects.filter((project) => project.scheduledTeam === team.id)}
+            previewProjects={previewScheduledProjects}
+            previewChangedProjectIds={previewChangedProjectIds}
+            previewPrimaryProjectId={previewPrimaryProjectId}
+            dependencies={dependencies}
+            pendingPlacement={pendingPlacement}
+            hoveredBucketId={hoveredBucketId}
+            focusedRange={focusedRange}
+            selectedProjectIds={selectedProjectIds}
+            teams={teams}
+            isAnchorLane={index === 0}
+            onSelectProject={onSelectProject}
+            onProjectPointerDown={onProjectPointerDown}
+          />
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function FoldedYearCard({
+  summary,
+  onOpen,
+}: {
+  summary: ReturnType<typeof buildTimelineYearSummaries>[number];
+  onOpen: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      data-year-anchor={summary.year}
+      className={cn(
+        "flex w-full flex-col items-start gap-3 rounded-[28px] border border-border/70 bg-card/90 p-5 text-left shadow-[0_20px_44px_-34px_rgba(15,23,42,0.4)] transition-transform duration-150 hover:-translate-y-0.5",
+        summary.containsFocus && "ring-2 ring-primary/25",
+        summary.containsToday && "border-primary/40"
+      )}
+      onClick={onOpen}
+    >
+      <div className="flex w-full items-start justify-between gap-3">
+        <div>
+          <p className="text-xs font-semibold uppercase tracking-[0.22em] text-muted-foreground">
+            {fr.schedule.foldedYearTitle}
+          </p>
+          <h3 className="mt-1 font-heading text-2xl font-semibold text-foreground">
+            {summary.year}
+          </h3>
+        </div>
+        <Badge variant="outline" className="rounded-full">
+          {summary.months.length} {fr.schedule.monthView.toLowerCase()}
+        </Badge>
+      </div>
+
+      <div className="flex flex-wrap gap-2 text-xs text-muted-foreground">
+        <Badge variant="secondary" className="rounded-full">
+          {summary.projectCount} {fr.schedule.projectCount}
+        </Badge>
+        <Badge variant="outline" className="rounded-full">
+          {summary.closureCount} {fr.schedule.closureCount}
+        </Badge>
+        {summary.containsToday ? (
+          <Badge variant="outline" className="rounded-full">
+            {fr.schedule.containsToday}
+          </Badge>
+        ) : null}
+        {summary.containsFocus ? (
+          <Badge variant="outline" className="rounded-full">
+            {fr.schedule.containsFocus}
+          </Badge>
+        ) : null}
+      </div>
+    </button>
+  );
+}
+
+function MonthModeView({
+  summaries,
+  projects,
+  previewProjects,
+  previewChangedProjectIds,
+  previewPrimaryProjectId,
+  dependencies,
+  closures,
+  pendingPlacement,
+  hoveredBucketId,
+  focusedRange,
+  selectedProjectIds,
+  teams,
+  onOpenMonth,
+  onSelectProject,
+  onProjectPointerDown,
+}: {
+  summaries: ReturnType<typeof buildTimelineYearSummaries>;
+  projects: Project[];
+  previewProjects: Project[] | null;
+  previewChangedProjectIds: string[];
+  previewPrimaryProjectId: string | null;
+  dependencies: ProjectDependency[];
+  closures: ClosurePeriod[];
+  pendingPlacement: QuickPlacementState | null;
+  hoveredBucketId: string | null;
+  focusedRange: CalendarFocusEvent;
+  selectedProjectIds: string[];
+  teams: Team[];
+  onOpenMonth: (date: string) => void;
+  onSelectProject: (projectId: string, shiftKey: boolean) => void;
+  onProjectPointerDown: (projectId: string, shiftKey: boolean) => void;
+}) {
+  return (
     <div className="space-y-8">
-      {sectionsByYear.map(({ year, sections: yearSections }) => (
-        <section key={year} data-year-anchor={year} className="space-y-4 scroll-mt-6">
-          <div className="sticky top-3 z-10 rounded-[24px] border border-border/70 bg-background/90 px-4 py-3 shadow-[0_18px_40px_-34px_rgba(15,23,42,0.55)] backdrop-blur-sm">
+      {summaries.map((yearSummary) => (
+        <section
+          key={yearSummary.year}
+          data-year-anchor={yearSummary.year}
+          className="space-y-4 scroll-mt-6"
+        >
+          <div className="rounded-[24px] border border-border/70 bg-background/90 px-4 py-3 shadow-[0_18px_40px_-34px_rgba(15,23,42,0.4)]">
             <p className="text-xs font-semibold uppercase tracking-[0.22em] text-muted-foreground">
               {fr.schedule.yearOverview}
             </p>
             <h3 className="mt-1 font-heading text-2xl font-semibold text-foreground">
-              {year}
+              {yearSummary.year}
             </h3>
           </div>
 
-          {yearSections.map((section) => (
-            <section
-              key={section.id}
-              className="rounded-[28px] border border-border/70 bg-card/90 p-4 shadow-[0_24px_50px_-42px_rgba(15,23,42,0.55)]"
-            >
-              <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-                <div>
-                  <p className="text-xs font-semibold uppercase tracking-[0.22em] text-muted-foreground">
-                    {fr.schedule.yearOverview}
-                  </p>
-                  <h4 className="mt-1 font-heading text-xl font-semibold text-foreground">
-                    {section.label}
-                  </h4>
-                </div>
-                <Badge variant="outline" className="rounded-full px-3 py-1 text-xs">
-                  {section.dayCount} {fr.schedule.daysSuffix}
-                </Badge>
-              </div>
-
-              <div className="mt-4 space-y-4">
-                {sortedTeams.map((team, index) => (
-                  <YearMonthRow
-                    key={`${section.id}-${team.id}`}
-                    teamId={team.id}
-                    section={section}
-                    closures={closures}
-                    projects={scheduledProjects.filter(
-                      (project) => project.scheduledTeam === team.id
-                    )}
-                    previewProjects={previewScheduledProjects}
-                    previewChangedProjectIds={previewChangedProjectIds}
-                    previewPrimaryProjectId={previewPrimaryProjectId}
-                    dependencies={dependencies}
-                    pendingPlacement={pendingPlacement}
-                    hoveredBucketId={hoveredBucketId}
-                    focusedRange={focusedRange}
-                    selectedProjectIds={selectedProjectIds}
-                    teams={teams}
-                    isAnchorLane={index === 0}
-                    onSelectProject={onSelectProject}
-                    onProjectPointerDown={onProjectPointerDown}
-                  />
-                ))}
-              </div>
-            </section>
-          ))}
+          <div className="space-y-4">
+            {yearSummary.months.map((monthSummary) =>
+              monthSummary.isActive ? (
+                <ExpandedMonthSection
+                  key={monthSummary.section.id}
+                  section={monthSummary.section}
+                  projects={projects}
+                  previewProjects={previewProjects}
+                  previewChangedProjectIds={previewChangedProjectIds}
+                  previewPrimaryProjectId={previewPrimaryProjectId}
+                  dependencies={dependencies}
+                  closures={closures}
+                  pendingPlacement={pendingPlacement}
+                  hoveredBucketId={hoveredBucketId}
+                  focusedRange={focusedRange}
+                  selectedProjectIds={selectedProjectIds}
+                  teams={teams}
+                  onSelectProject={onSelectProject}
+                  onProjectPointerDown={onProjectPointerDown}
+                />
+              ) : (
+                <FoldedMonthCard
+                  key={monthSummary.section.id}
+                  summary={monthSummary}
+                  onOpen={() => onOpenMonth(monthSummary.section.startDate)}
+                />
+              )
+            )}
+          </div>
         </section>
       ))}
+    </div>
+  );
+}
+
+function YearModeView({
+  summaries,
+  projects,
+  previewProjects,
+  previewChangedProjectIds,
+  previewPrimaryProjectId,
+  dependencies,
+  closures,
+  pendingPlacement,
+  hoveredBucketId,
+  focusedRange,
+  selectedProjectIds,
+  teams,
+  onOpenYear,
+  onSelectProject,
+  onProjectPointerDown,
+}: {
+  summaries: ReturnType<typeof buildTimelineYearSummaries>;
+  projects: Project[];
+  previewProjects: Project[] | null;
+  previewChangedProjectIds: string[];
+  previewPrimaryProjectId: string | null;
+  dependencies: ProjectDependency[];
+  closures: ClosurePeriod[];
+  pendingPlacement: QuickPlacementState | null;
+  hoveredBucketId: string | null;
+  focusedRange: CalendarFocusEvent;
+  selectedProjectIds: string[];
+  teams: Team[];
+  onOpenYear: (year: number) => void;
+  onSelectProject: (projectId: string, shiftKey: boolean) => void;
+  onProjectPointerDown: (projectId: string, shiftKey: boolean) => void;
+}) {
+  return (
+    <div className="space-y-8">
+      {summaries.map((yearSummary) =>
+        yearSummary.isActive ? (
+          <section
+            key={yearSummary.year}
+            data-year-anchor={yearSummary.year}
+            className="space-y-4 scroll-mt-6"
+          >
+            <div className="rounded-[24px] border border-border/70 bg-background/90 px-4 py-3 shadow-[0_18px_40px_-34px_rgba(15,23,42,0.45)]">
+              <p className="text-xs font-semibold uppercase tracking-[0.22em] text-muted-foreground">
+                {fr.schedule.yearOverview}
+              </p>
+              <h3 className="mt-1 font-heading text-2xl font-semibold text-foreground">
+                {yearSummary.year}
+              </h3>
+            </div>
+
+            <div className="space-y-4">
+              {yearSummary.months.map((monthSummary) => (
+                <ExpandedMonthSection
+                  key={monthSummary.section.id}
+                  section={monthSummary.section}
+                  projects={projects}
+                  previewProjects={previewProjects}
+                  previewChangedProjectIds={previewChangedProjectIds}
+                  previewPrimaryProjectId={previewPrimaryProjectId}
+                  dependencies={dependencies}
+                  closures={closures}
+                  pendingPlacement={pendingPlacement}
+                  hoveredBucketId={hoveredBucketId}
+                  focusedRange={focusedRange}
+                  selectedProjectIds={selectedProjectIds}
+                  teams={teams}
+                  onSelectProject={onSelectProject}
+                  onProjectPointerDown={onProjectPointerDown}
+                />
+              ))}
+            </div>
+          </section>
+        ) : (
+          <FoldedYearCard
+            key={yearSummary.year}
+            summary={yearSummary}
+            onOpen={() => onOpenYear(yearSummary.year)}
+          />
+        )
+      )}
     </div>
   );
 }
@@ -969,12 +1248,14 @@ export function TimelineCanvas({
   previewPrimaryProjectId,
   hoveredBucketId,
   dependencies,
+  customClosures,
   closures,
   pendingPlacement,
   selectedProjectIds,
   traceEnabled,
   teams,
   focusEvent,
+  onActiveDateChange,
   onTraceEnabledChange,
   onPendingPlacementChange,
   onQuickPlacementCommit,
@@ -987,12 +1268,14 @@ export function TimelineCanvas({
   previewPrimaryProjectId: string | null;
   hoveredBucketId: string | null;
   dependencies: ProjectDependency[];
+  customClosures: CustomClosure[];
   closures: ClosurePeriod[];
   pendingPlacement: QuickPlacementState | null;
   selectedProjectIds: string[];
   traceEnabled: boolean;
   teams: Team[];
   focusEvent: CalendarFocusEvent;
+  onActiveDateChange?: (date: string) => void;
   onTraceEnabledChange: (enabled: boolean) => void;
   onPendingPlacementChange: (placement: QuickPlacementState | null) => void;
   onQuickPlacementCommit: (projectId: string, placement: ProjectPlacement) => void;
@@ -1001,45 +1284,133 @@ export function TimelineCanvas({
 }) {
   const visibleProjects = previewProjects ?? projects;
   const initialScrollDoneRef = useRef(false);
+  const pendingFocusDateRef = useRef<string | null>(null);
+  const [isNavigating, startNavigationTransition] = useTransition();
   const timelineNow = useMemo(() => new Date(), []);
+  const todayDate = useMemo(() => getTodayDateString(timelineNow), [timelineNow]);
+  const [viewMode, setViewMode] = useState<TimelineViewMode>("month");
+  const [activeDate, setActiveDate] = useState(todayDate);
   const sections = useMemo(
-    () => buildTimelineSections(visibleProjects, closures, timelineNow),
-    [closures, timelineNow, visibleProjects]
+    () => buildTimelineSections(visibleProjects, customClosures, timelineNow),
+    [customClosures, timelineNow, visibleProjects]
   );
   const { years } = useMemo(
-    () => buildTimelineYearRange(visibleProjects, closures, timelineNow),
-    [closures, timelineNow, visibleProjects]
+    () => buildTimelineYearRange(visibleProjects, customClosures, timelineNow),
+    [customClosures, timelineNow, visibleProjects]
   );
+  const summaries = useMemo(
+    () =>
+      buildTimelineYearSummaries({
+        sections,
+        projects: visibleProjects,
+        closures,
+        activeDate,
+        todayDate,
+        focusDate: focusEvent?.startDate ?? null,
+        viewMode,
+      }),
+    [activeDate, closures, focusEvent, sections, todayDate, viewMode, visibleProjects]
+  );
+  const activeYear = parseISO(activeDate).getFullYear();
+
+  useEffect(() => {
+    onActiveDateChange?.(activeDate);
+  }, [activeDate, onActiveDateChange]);
+
+  useEffect(() => {
+    if (!sections.length) {
+      return;
+    }
+
+    const activeInRange = sections.some(
+      (section) => activeDate >= section.startDate && activeDate <= section.endDate
+    );
+    if (activeInRange) {
+      return;
+    }
+
+    const todaySection = sections.find(
+      (section) => todayDate >= section.startDate && todayDate <= section.endDate
+    );
+
+    startNavigationTransition(() => {
+      setActiveDate(todaySection?.startDate ?? sections[0].startDate);
+    });
+  }, [activeDate, sections, startNavigationTransition, todayDate]);
 
   useEffect(() => {
     if (!focusEvent) {
       return;
     }
 
-    if (scrollToTimelineDate(focusEvent.startDate, "smooth")) {
-      return;
-    }
-
-    if (years[0]) {
-      scrollToTimelineYear(years[0], "smooth");
-    }
-  }, [focusEvent, years]);
+    pendingFocusDateRef.current = focusEvent.startDate;
+    startNavigationTransition(() => {
+      setActiveDate(focusEvent.startDate);
+    });
+  }, [focusEvent, startNavigationTransition]);
 
   useEffect(() => {
-    if (focusEvent || initialScrollDoneRef.current) {
+    if (!sections.length) {
       return;
+    }
+
+    const behavior: ScrollBehavior = initialScrollDoneRef.current ? "smooth" : "auto";
+    const pendingFocusDate = pendingFocusDateRef.current;
+
+    if (pendingFocusDate && scrollToTimelineDate(pendingFocusDate, behavior)) {
+      initialScrollDoneRef.current = true;
+      pendingFocusDateRef.current = null;
+      return;
+    }
+
+    const didScroll =
+      viewMode === "month"
+        ? scrollToTimelineSection(getTimelineMonthId(activeDate), behavior)
+        : scrollToTimelineYear(activeYear, behavior);
+
+    if (!didScroll && years[0]) {
+      const scrolledToActiveYear = scrollToTimelineYear(activeYear, behavior);
+      if (!scrolledToActiveYear) {
+        scrollToTimelineYear(years[0], behavior);
+      }
     }
 
     initialScrollDoneRef.current = true;
-    const today = getTodayDateString();
-    if (scrollToTimelineDate(today, "auto")) {
+  }, [activeDate, activeYear, sections, viewMode, years]);
+
+  const navigate = (direction: -1 | 1) => {
+    if (!sections.length || !years.length) {
       return;
     }
 
-    if (years[0]) {
-      scrollToTimelineYear(years[0], "auto");
-    }
-  }, [focusEvent, years]);
+    startNavigationTransition(() => {
+      setActiveDate((current) => {
+        const shifted = shiftTimelineDate(current, viewMode, direction);
+        if (viewMode === "month") {
+          const shiftedMonthId = getTimelineMonthId(shifted);
+          const targetSection = sections.find((section) => section.id === shiftedMonthId);
+          if (targetSection) {
+            return shifted;
+          }
+
+          return direction < 0 ? sections[0].startDate : sections.at(-1)?.startDate ?? current;
+        }
+
+        const shiftedYear = parseISO(shifted).getFullYear();
+        if (years.includes(shiftedYear)) {
+          return shifted;
+        }
+
+        return replaceYearInDate(current, direction < 0 ? years[0] : years.at(-1)!);
+      });
+    });
+  };
+
+  const jumpToYear = (year: number) => {
+    startNavigationTransition(() => {
+      setActiveDate((current) => replaceYearInDate(current, year));
+    });
+  };
 
   return (
     <Popover
@@ -1068,9 +1439,36 @@ export function TimelineCanvas({
 
             <div className="flex flex-wrap items-center gap-2">
               <Badge variant="outline" className="rounded-full px-3 py-1.5 text-xs">
-                {fr.schedule.yearOnly}
+                {fr.schedule.yearOnly} : {viewMode === "month" ? fr.schedule.monthView : fr.schedule.yearView}
               </Badge>
-              <YearJumpStrip years={years} onJumpToYear={(year) => scrollToTimelineYear(year, "smooth")} />
+              <div className="flex rounded-full border border-border bg-background p-1">
+                {(["month", "year"] as const).map((mode) => (
+                  <button
+                    key={mode}
+                    type="button"
+                    className={cn(
+                      "rounded-full px-3 py-1.5 text-sm transition-colors",
+                      viewMode === mode
+                        ? "bg-foreground text-background"
+                        : "text-muted-foreground hover:text-foreground"
+                    )}
+                    onClick={() =>
+                      startNavigationTransition(() => {
+                        setViewMode(mode);
+                      })
+                    }
+                  >
+                    {mode === "month" ? fr.schedule.monthView : fr.schedule.yearView}
+                  </button>
+                ))}
+              </div>
+              <Button size="sm" variant="outline" onClick={() => navigate(-1)} disabled={isNavigating}>
+                {fr.schedule.previousPeriod}
+              </Button>
+              <Button size="sm" variant="outline" onClick={() => navigate(1)} disabled={isNavigating}>
+                {fr.schedule.nextPeriod}
+              </Button>
+              <YearJumpStrip years={years} activeYear={activeYear} onJumpToYear={jumpToYear} />
               {focusEvent ? (
                 <Badge variant="secondary" className="rounded-full px-3 py-1.5 text-xs">
                   {formatFocusRange(focusEvent.startDate, focusEvent.endDate)}
@@ -1086,23 +1484,51 @@ export function TimelineCanvas({
             </div>
           </div>
 
-          <YearView
-            years={years}
-            sections={sections}
-            projects={projects}
-            previewProjects={previewProjects}
-            previewChangedProjectIds={previewChangedProjectIds}
-            previewPrimaryProjectId={previewPrimaryProjectId}
-            dependencies={dependencies}
-            closures={closures}
-            pendingPlacement={pendingPlacement}
-            hoveredBucketId={hoveredBucketId}
-            focusedRange={focusEvent}
-            selectedProjectIds={selectedProjectIds}
-            teams={teams}
-            onSelectProject={onSelectProject}
-            onProjectPointerDown={onProjectPointerDown}
-          />
+          {viewMode === "month" ? (
+            <MonthModeView
+              summaries={summaries}
+              projects={projects}
+              previewProjects={previewProjects}
+              previewChangedProjectIds={previewChangedProjectIds}
+              previewPrimaryProjectId={previewPrimaryProjectId}
+              dependencies={dependencies}
+              closures={closures}
+              pendingPlacement={pendingPlacement}
+              hoveredBucketId={hoveredBucketId}
+              focusedRange={focusEvent}
+              selectedProjectIds={selectedProjectIds}
+              teams={teams}
+              onOpenMonth={(date) =>
+                startNavigationTransition(() => {
+                  setActiveDate(date);
+                })
+              }
+              onSelectProject={onSelectProject}
+              onProjectPointerDown={onProjectPointerDown}
+            />
+          ) : (
+            <YearModeView
+              summaries={summaries}
+              projects={projects}
+              previewProjects={previewProjects}
+              previewChangedProjectIds={previewChangedProjectIds}
+              previewPrimaryProjectId={previewPrimaryProjectId}
+              dependencies={dependencies}
+              closures={closures}
+              pendingPlacement={pendingPlacement}
+              hoveredBucketId={hoveredBucketId}
+              focusedRange={focusEvent}
+              selectedProjectIds={selectedProjectIds}
+              teams={teams}
+              onOpenYear={(year) =>
+                startNavigationTransition(() => {
+                  setActiveDate((current) => replaceYearInDate(current, year));
+                })
+              }
+              onSelectProject={onSelectProject}
+              onProjectPointerDown={onProjectPointerDown}
+            />
+          )}
         </CardContent>
       </Card>
 

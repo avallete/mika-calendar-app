@@ -47,8 +47,14 @@ describe("planner state mutations", () => {
       endDate: "2026-04-20",
       impact: "advisory",
       details: "Prevoir baches et temps de pose reduit.",
+      repeatsAnnually: true,
     });
 
+    expect(nextState.customClosures.find((closure) => closure.title === "Averse continue")).toEqual(
+      expect.objectContaining({
+        repeatsAnnually: true,
+      })
+    );
     expect(nextState.closures.find((closure) => closure.title === "Averse continue")).toEqual(
       expect.objectContaining({
         type: "weather",
@@ -72,6 +78,7 @@ describe("planner state mutations", () => {
     expect(reset.teams).toEqual(initialPlannerState.teams);
     expect(reset.projects).toEqual(initialPlannerState.projects);
     expect(reset.dependencies).toEqual(initialPlannerState.dependencies);
+    expect(reset.customClosures).toEqual(initialPlannerState.customClosures);
     expect(reset.closures).toEqual(initialPlannerState.closures);
     expect(reset.holidaySources).toEqual(initialPlannerState.holidaySources);
   });

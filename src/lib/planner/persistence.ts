@@ -14,7 +14,7 @@ import {
   teams,
 } from "@/db/schema";
 import { initialPlannerState } from "@/lib/planner/sample-data";
-import type { ClosurePeriod, PlannerState } from "@/lib/planner/types";
+import type { PlannerState } from "@/lib/planner/types";
 
 export type DbExecutor =
   | NodePgDatabase<Record<string, unknown>>
@@ -22,9 +22,7 @@ export type DbExecutor =
   | PgliteDatabase<Record<string, unknown>>
   | PgliteTransaction<Record<string, unknown>, TablesRelationalConfig>;
 
-export type PersistentPlannerState = Omit<PlannerState, "closures" | "history"> & {
-  customClosures: ClosurePeriod[];
-};
+export type PersistentPlannerState = Omit<PlannerState, "closures" | "history">;
 
 export function plannerStateToPersistentState(snapshot: PlannerState): PersistentPlannerState {
   return {
@@ -32,7 +30,7 @@ export function plannerStateToPersistentState(snapshot: PlannerState): Persisten
     holidaySources: snapshot.holidaySources,
     projects: snapshot.projects,
     dependencies: snapshot.dependencies,
-    customClosures: snapshot.closures.filter((closure) => closure.source === "custom"),
+    customClosures: snapshot.customClosures,
   };
 }
 
@@ -65,7 +63,20 @@ ALTER TABLE "closure_periods"
     sql.raw(`ALTER TABLE "closure_periods" ADD COLUMN IF NOT EXISTS "details" text;`)
   );
   await executor.execute(
+    sql.raw(`
+ALTER TABLE "closure_periods"
+  ADD COLUMN IF NOT EXISTS "repeats_annually" boolean DEFAULT false NOT NULL;
+`)
+  );
+  await executor.execute(
     sql.raw(`UPDATE "closure_periods" SET "impact" = 'blocking' WHERE "impact" IS NULL;`)
+  );
+  await executor.execute(
+    sql.raw(`
+UPDATE "closure_periods"
+SET "repeats_annually" = false
+WHERE "repeats_annually" IS NULL;
+`)
   );
 }
 
@@ -146,6 +157,7 @@ export async function replacePersistentState(
         startDate: new Date(`${closure.startDate}T00:00:00.000Z`),
         endDate: new Date(`${closure.endDate}T00:00:00.000Z`),
         details: closure.details ?? null,
+        repeatsAnnually: closure.repeatsAnnually,
       }))
     );
   }

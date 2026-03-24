@@ -22,6 +22,13 @@
       "when": 1774402200000,
       "tag": "0002_closure_markers",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1774455000000,
+      "tag": "0003_recurring_closures",
+      "breakpoints": true
     }
   ]
 }

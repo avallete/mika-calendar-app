@@ -57,6 +57,10 @@ import {
   getClosureTypeLabelFr,
 } from "@/lib/planner/day-markers";
 import {
+  buildFranceHolidayStripSummary,
+  resolveCustomClosureFocusTarget,
+} from "@/lib/planner/calendar-strip";
+import {
   detectDependencyConflicts,
   getEarlierShiftPrompt,
   getTouchingProjectChain,
@@ -64,9 +68,11 @@ import {
   updateProjectPlacement,
   updateProjectPlacements,
 } from "@/lib/planner/scheduler";
+import { getTodayDateString } from "@/lib/planner/timeline-range";
 import type {
   CalendarBucket,
   ClosurePeriod,
+  CustomClosure,
   DependencyConflictPromptState,
   DragProjectMeta,
   EarlierShiftPromptState,
@@ -346,6 +352,14 @@ function renderClosureSourceLabel(closure: ClosurePeriod) {
   return closure.impact === "advisory" ? fr.schedule.sourceAdvisory : fr.schedule.sourceCustom;
 }
 
+function asDisplayClosure(closure: CustomClosure): ClosurePeriod {
+  return {
+    ...closure,
+    source: "custom",
+    editable: true,
+  };
+}
+
 function getLatestAllowedResizeStartSlot(
   calendarEndSlot: SlotKey,
   closures: ClosurePeriod[]
@@ -505,6 +519,9 @@ export function ScheduleWorkbench() {
   const [activeDrag, setActiveDrag] = useState<DragProjectMeta | null>(null);
   const [hoveredBucketId, setHoveredBucketId] = useState<string | null>(null);
   const [hoveredBucket, setHoveredBucket] = useState<CalendarBucket | null>(null);
+  const [timelineActiveDate, setTimelineActiveDate] = useState<string>(() =>
+    getTodayDateString()
+  );
   const [calendarFocus, setCalendarFocus] = useState<{
     id: string;
     startDate: string;
@@ -529,6 +546,14 @@ export function ScheduleWorkbench() {
   const selectedProject = useMemo(
     () => state.projects.find((project) => project.id === selectedProjectId) ?? null,
     [selectedProjectId, state.projects]
+  );
+  const franceHolidayStripSummary = useMemo(
+    () =>
+      buildFranceHolidayStripSummary({
+        holidaySources: state.holidaySources,
+        closures: state.closures,
+      }),
+    [state.closures, state.holidaySources]
   );
   const previewState = useMemo(() => {
     if (!activeDrag || !deferredHoveredBucket) {
@@ -953,50 +978,114 @@ export function ScheduleWorkbench() {
               <Separator />
 
               <div className="flex flex-wrap gap-3">
-                {state.closures.map((closure) => (
-                  <button
-                    key={closure.id}
-                    type="button"
+                {franceHolidayStripSummary ? (
+                  <div
                     className={cn(
-                      "group flex min-w-[220px] flex-1 flex-col items-start gap-2 rounded-2xl border px-4 py-3 text-left transition-all duration-200 hover:-translate-y-0.5",
-                      getClosureChipClasses(closure),
-                      calendarFocus?.id === closure.id && "ring-2 ring-primary/40"
-                    )}
-                    onClick={() =>
-                      setCalendarFocus({
-                        id: closure.id,
-                        startDate: closure.startDate,
-                        endDate: closure.endDate,
+                      "flex min-w-[220px] flex-1 flex-col items-start gap-2 rounded-2xl border px-4 py-3",
+                      getClosureChipClasses({
+                        id: "france-holidays-summary",
+                        title: franceHolidayStripSummary.labelFr,
+                        type: "holiday",
+                        startDate: `${franceHolidayStripSummary.startYear ?? Number(timelineActiveDate.slice(0, 4))}-01-01`,
+                        endDate: `${franceHolidayStripSummary.endYear ?? Number(timelineActiveDate.slice(0, 4))}-12-31`,
+                        impact: "blocking",
+                        source: "fr-public-holiday",
+                        editable: false,
                       })
-                    }
+                    )}
                   >
                     <div className="flex flex-wrap items-center gap-2">
-                      <span className="font-medium text-foreground">{closure.title}</span>
+                      <span className="font-medium text-foreground">
+                        {franceHolidayStripSummary.labelFr}
+                      </span>
                       <Badge variant="secondary" className="rounded-full">
-                        {getClosureTypeLabelFr(closure.type)}
+                        {fr.schedule.generatedSource}
                       </Badge>
-                      <Badge
-                        variant={closure.impact === "blocking" ? "default" : "outline"}
-                        className="rounded-full"
-                      >
-                        {getClosureImpactLabelFr(closure.impact)}
+                      <Badge variant="outline" className="rounded-full">
+                        {fr.schedule.enabled}
                       </Badge>
                     </div>
                     <div className="flex flex-wrap gap-2 text-xs text-muted-foreground">
                       <span className="rounded-full bg-background/75 px-2 py-1 uppercase tracking-[0.14em]">
-                        {renderClosureSourceLabel(closure)}
+                        {fr.schedule.sourceFrance}
                       </span>
                       <span>
-                        {closure.startDate} {"->"} {closure.endDate}
+                        {franceHolidayStripSummary.closureCount} {fr.schedule.generatedHolidayCount}
                       </span>
                     </div>
-                    {closure.details ? (
-                      <p className="line-clamp-2 text-sm leading-5 text-muted-foreground">
-                        {closure.details}
+                    {franceHolidayStripSummary.startYear !== null &&
+                    franceHolidayStripSummary.endYear !== null ? (
+                      <p className="text-sm leading-5 text-muted-foreground">
+                        {fr.schedule.visibleYears}: {franceHolidayStripSummary.startYear} {"->"}{" "}
+                        {franceHolidayStripSummary.endYear}
                       </p>
                     ) : null}
-                  </button>
-                ))}
+                  </div>
+                ) : null}
+
+                {state.customClosures.map((closure) => {
+                  const displayClosure = asDisplayClosure(closure);
+                  const isFocused =
+                    calendarFocus?.id === closure.id ||
+                    calendarFocus?.id?.startsWith(`${closure.id}::`) === true;
+
+                  return (
+                    <button
+                      key={closure.id}
+                      type="button"
+                      className={cn(
+                        "group flex min-w-[220px] flex-1 flex-col items-start gap-2 rounded-2xl border px-4 py-3 text-left transition-all duration-200 hover:-translate-y-0.5",
+                        getClosureChipClasses(displayClosure),
+                        isFocused && "ring-2 ring-primary/40"
+                      )}
+                      onClick={() =>
+                        setCalendarFocus(
+                          resolveCustomClosureFocusTarget({
+                            closure,
+                            closures: state.closures,
+                            activeDate: timelineActiveDate,
+                          })
+                        )
+                      }
+                    >
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="font-medium text-foreground">{closure.title}</span>
+                        <Badge variant="secondary" className="rounded-full">
+                          {getClosureTypeLabelFr(closure.type)}
+                        </Badge>
+                        <Badge
+                          variant={closure.impact === "blocking" ? "default" : "outline"}
+                          className="rounded-full"
+                        >
+                          {getClosureImpactLabelFr(closure.impact)}
+                        </Badge>
+                        {closure.repeatsAnnually ? (
+                          <Badge variant="outline" className="rounded-full">
+                            {fr.schedule.repeatsAnnually}
+                          </Badge>
+                        ) : null}
+                      </div>
+                      <div className="flex flex-wrap gap-2 text-xs text-muted-foreground">
+                        <span className="rounded-full bg-background/75 px-2 py-1 uppercase tracking-[0.14em]">
+                          {renderClosureSourceLabel(displayClosure)}
+                        </span>
+                        <span>
+                          {closure.startDate} {"->"} {closure.endDate}
+                        </span>
+                      </div>
+                      {closure.repeatsAnnually ? (
+                        <p className="text-sm leading-5 text-muted-foreground">
+                          {fr.schedule.recurringFocusHint}
+                        </p>
+                      ) : null}
+                      {closure.details ? (
+                        <p className="line-clamp-2 text-sm leading-5 text-muted-foreground">
+                          {closure.details}
+                        </p>
+                      ) : null}
+                    </button>
+                  );
+                })}
               </div>
             </div>
 
@@ -1007,12 +1096,14 @@ export function ScheduleWorkbench() {
               previewPrimaryProjectId={previewState?.primaryProjectId ?? null}
               hoveredBucketId={hoveredBucketId}
               dependencies={state.dependencies}
+              customClosures={state.customClosures}
               closures={state.closures}
               pendingPlacement={pendingPlacement}
               selectedProjectIds={selectedProjectIds}
               traceEnabled={traceEnabled}
               teams={state.teams}
               focusEvent={calendarFocus}
+              onActiveDateChange={setTimelineActiveDate}
               onTraceEnabledChange={updateTraceEnabled}
               onPendingPlacementChange={setPendingPlacement}
               onQuickPlacementCommit={(projectId, placement) => {

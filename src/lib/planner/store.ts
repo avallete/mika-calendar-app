@@ -23,9 +23,9 @@ import {
   replacePersistentState,
 } from "@/lib/planner/persistence";
 import {
-  buildFrancePublicHolidays,
-  getCoveredYears,
-} from "@/lib/planner/france-holidays";
+  buildEffectiveClosures,
+  materializePlannerState,
+} from "@/lib/planner/closure-materialization";
 import { initialPlannerState } from "@/lib/planner/sample-data";
 import {
   addClosureInState,
@@ -163,44 +163,9 @@ async function readPersistentState(executor: DbExecutor): Promise<PersistentPlan
       endDate: toDateString(row.endDate)!,
       impact: row.impact,
       details: row.details ?? undefined,
-      source: "custom",
-      editable: true,
+      repeatsAnnually: row.repeatsAnnually,
     })),
   };
-}
-
-function buildEffectiveClosures(state: PersistentPlannerState) {
-  const relevantDates = [
-    ...state.projects.flatMap((project) => {
-      const values: string[] = [];
-      if (project.targetDateHint) {
-        values.push(project.targetDateHint);
-      }
-      if (project.scheduledStartSlot) {
-        values.push(project.scheduledStartSlot.slice(0, 10));
-      }
-      return values;
-    }),
-    ...state.customClosures.flatMap((closure) => [closure.startDate, closure.endDate]),
-  ];
-
-  const generatedClosures = state.holidaySources.flatMap((source) => {
-    if (!source.enabled || source.code !== "FR") {
-      return [];
-    }
-
-    return getCoveredYears(relevantDates).flatMap((year) =>
-      buildFrancePublicHolidays(year)
-    );
-  });
-
-  return [...generatedClosures, ...state.customClosures].sort((left, right) => {
-    if (left.startDate !== right.startDate) {
-      return left.startDate.localeCompare(right.startDate);
-    }
-
-    return left.title.localeCompare(right.title, "fr");
-  });
 }
 
 function toPlannerSnapshot(
@@ -212,7 +177,12 @@ function toPlannerSnapshot(
     holidaySources: persistentState.holidaySources,
     projects: persistentState.projects,
     dependencies: persistentState.dependencies,
-    closures: buildEffectiveClosures(persistentState),
+    customClosures: persistentState.customClosures,
+    closures: buildEffectiveClosures({
+      projects: persistentState.projects,
+      holidaySources: persistentState.holidaySources,
+      customClosures: persistentState.customClosures,
+    }),
     history,
   };
 }
@@ -222,7 +192,7 @@ function normalizePlannerSnapshot(
   history: PlannerHistoryState
 ) {
   const snapshot = toPlannerSnapshot(persistentState, history);
-  const normalized = rescheduleProjects(snapshot);
+  const normalized = rescheduleProjects(materializePlannerState(snapshot));
 
   return {
     ...normalized,

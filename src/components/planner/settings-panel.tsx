@@ -145,6 +145,7 @@ function buildEmptyClosureState(): ClosureFormState {
     endDate: format(addDays(today, 1), "yyyy-MM-dd"),
     impact: "blocking",
     details: "",
+    repeatsAnnually: false,
   };
 }
 
@@ -288,8 +289,8 @@ export function SettingsPanel() {
   } = usePlanner();
   const teams = useMemo(() => getSortedTeams(state.teams), [state.teams]);
   const customClosures = useMemo(
-    () => state.closures.filter((closure) => closure.source === "custom"),
-    [state.closures]
+    () => state.customClosures,
+    [state.customClosures]
   );
   const generatedFranceClosures = useMemo(
     () => state.closures.filter((closure) => closure.source === "fr-public-holiday"),
@@ -500,6 +501,9 @@ export function SettingsPanel() {
                     <p className="text-sm text-muted-foreground">
                       {closure.startDate} {"->"} {closure.endDate}
                     </p>
+                    {closure.repeatsAnnually ? (
+                      <Badge variant="outline">{fr.settings.fields.repeatsAnnually}</Badge>
+                    ) : null}
                     {closure.details ? (
                       <p className="max-w-xl text-sm leading-6 text-muted-foreground">
                         {closure.details}
@@ -617,6 +621,25 @@ export function SettingsPanel() {
                         }))
                       }
                     />
+                  </div>
+                  <div className="space-y-2 md:col-span-2">
+                    <Label>{fr.settings.fields.repeatsAnnually}</Label>
+                    <label className="flex items-start gap-3 rounded-2xl border border-border/60 bg-background/90 px-4 py-3 text-sm">
+                      <input
+                        type="checkbox"
+                        checked={newClosure.repeatsAnnually}
+                        onChange={(event) =>
+                          setNewClosure((current) => ({
+                            ...current,
+                            repeatsAnnually: event.target.checked,
+                          }))
+                        }
+                        className="mt-1"
+                      />
+                      <span className="leading-6 text-muted-foreground">
+                        {fr.settings.repeatsAnnuallyHint}
+                      </span>
+                    </label>
                   </div>
                 </div>
 

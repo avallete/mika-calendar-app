@@ -5,6 +5,7 @@ import {
   updateProjectPlacements,
   wouldCreateDependencyCycle,
 } from "@/lib/planner/scheduler";
+import { materializePlannerState } from "@/lib/planner/closure-materialization";
 import { initialPlannerState } from "@/lib/planner/sample-data";
 import type {
   ClosureFormState,
@@ -43,6 +44,7 @@ function cloneState(state: PlannerState): PlannerState {
     holidaySources: state.holidaySources.map((source) => ({ ...source })),
     projects: state.projects.map((project) => ({ ...project })),
     dependencies: state.dependencies.map((dependency) => ({ ...dependency })),
+    customClosures: state.customClosures.map((closure) => ({ ...closure })),
     closures: state.closures.map((closure) => ({ ...closure })),
     history: { ...state.history },
   };
@@ -157,10 +159,11 @@ export function deleteProjectInState(
 }
 
 export function addClosureInState(state: PlannerState, values: ClosureFormState) {
-  return rescheduleProjects({
+  return rescheduleProjects(
+    materializePlannerState({
     ...cloneState(state),
-    closures: [
-      ...state.closures.filter((closure) => closure.source === "custom"),
+    customClosures: [
+      ...state.customClosures,
       {
         id: crypto.randomUUID(),
         title: values.title,
@@ -169,18 +172,20 @@ export function addClosureInState(state: PlannerState, values: ClosureFormState)
         endDate: values.endDate,
         impact: values.impact,
         details: values.details || undefined,
-        source: "custom",
-        editable: true,
+        repeatsAnnually: values.repeatsAnnually,
       },
     ],
-  });
+    })
+  );
 }
 
 export function removeClosureInState(state: PlannerState, closureId: string) {
-  return rescheduleProjects({
+  return rescheduleProjects(
+    materializePlannerState({
     ...cloneState(state),
-    closures: state.closures.filter((closure) => closure.id !== closureId),
-  });
+    customClosures: state.customClosures.filter((closure) => closure.id !== closureId),
+    })
+  );
 }
 
 export function createTeamInState(state: PlannerState, values: TeamEditorState) {
@@ -253,10 +258,12 @@ export function toggleHolidaySourceInState(
   enabled: boolean
 ) {
   return rescheduleProjects({
-    ...cloneState(state),
-    holidaySources: state.holidaySources.map((source) =>
-      source.code === sourceCode ? { ...source, enabled } : { ...source }
-    ),
+    ...materializePlannerState({
+      ...cloneState(state),
+      holidaySources: state.holidaySources.map((source) =>
+        source.code === sourceCode ? { ...source, enabled } : { ...source }
+      ),
+    }),
   });
 }
 
@@ -267,6 +274,7 @@ export function resetPlannerDemoDataInState(state: PlannerState) {
     holidaySources: initialPlannerState.holidaySources.map((source) => ({ ...source })),
     projects: initialPlannerState.projects.map((project) => ({ ...project })),
     dependencies: initialPlannerState.dependencies.map((dependency) => ({ ...dependency })),
+    customClosures: initialPlannerState.customClosures.map((closure) => ({ ...closure })),
     closures: initialPlannerState.closures.map((closure) => ({ ...closure })),
   };
 }

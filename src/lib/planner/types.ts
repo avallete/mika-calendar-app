@@ -22,6 +22,7 @@ export type DependencyResolutionMode =
 export type SlotPart = "AM" | "PM";
 export type SlotKey = `${string}-${SlotPart}`;
 export type ScheduledDragIntent = "move" | "resize-start" | "resize-end";
+export type TimelineViewMode = "month" | "year";
 
 export type Team = {
   id: TeamId;
@@ -59,6 +60,17 @@ export type ProjectDependency = {
   predecessorProjectId: string;
   successorProjectId: string;
   lagHalfDays: number;
+};
+
+export type CustomClosure = {
+  id: string;
+  title: string;
+  type: ClosureType;
+  startDate: string;
+  endDate: string;
+  impact: ClosureImpact;
+  details?: string;
+  repeatsAnnually: boolean;
 };
 
 export type ClosurePeriod = {
@@ -112,6 +124,7 @@ export type PlannerState = {
   holidaySources: HolidaySource[];
   projects: Project[];
   dependencies: ProjectDependency[];
+  customClosures: CustomClosure[];
   closures: ClosurePeriod[];
   history: PlannerHistoryState;
 };
@@ -220,6 +233,7 @@ export type ClosureFormState = {
   endDate: string;
   impact: ClosureImpact;
   details: string;
+  repeatsAnnually: boolean;
 };
 
 export type TeamEditorState = {

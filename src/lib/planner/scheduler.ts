@@ -27,6 +27,7 @@ import {
   getSortedTeams,
   isScheduledProject,
 } from "@/lib/planner/types";
+import { materializePlannerState } from "@/lib/planner/closure-materialization";
 import {
   collectTimelineRelevantDates,
   getTodayDateString,
@@ -456,12 +457,13 @@ function collectTransitiveSuccessors(
 }
 
 export function getTouchingProjectChain(state: PlannerState, projectId: string) {
-  const project = state.projects.find((candidate) => candidate.id === projectId);
+  const preparedState = materializePlannerState(state);
+  const project = preparedState.projects.find((candidate) => candidate.id === projectId);
   if (!project || !isScheduledProject(project)) {
     return [];
   }
 
-  const teamProjects = state.projects
+  const teamProjects = preparedState.projects
     .filter(isScheduledProject)
     .filter((candidate) => candidate.scheduledTeam === project.scheduledTeam)
     .sort(compareScheduledProjectsByPlacement);
@@ -480,7 +482,7 @@ export function getTouchingProjectChain(state: PlannerState, projectId: string) 
     const previousReadySlot = advanceWorkingDuration(
       previousProject.scheduledStartSlot,
       previousProject.scheduledDurationHalfDays,
-      state.closures
+      preparedState.closures
     ).readySlot;
 
     if (compareSlotKeys(previousReadySlot, currentProject.scheduledStartSlot) !== 0) {
@@ -496,7 +498,7 @@ export function getTouchingProjectChain(state: PlannerState, projectId: string) 
     const currentReadySlot = advanceWorkingDuration(
       currentProject.scheduledStartSlot,
       currentProject.scheduledDurationHalfDays,
-      state.closures
+      preparedState.closures
     ).readySlot;
 
     if (compareSlotKeys(currentReadySlot, nextProject.scheduledStartSlot) !== 0) {
@@ -513,16 +515,20 @@ export function detectDependencyConflicts(
   state: PlannerState,
   placementRequests: ProjectPlacementRequest[]
 ) {
+  const anticipatedState = materializePlannerState({
+    ...state,
+    projects: applyPlacementRequests(state.projects, placementRequests),
+  });
   const normalizedRequests = placementRequests.map((request) =>
-    normalizePlacementRequest(request, state.closures)
+    normalizePlacementRequest(request, anticipatedState.closures)
   );
   const movedProjectIds = new Set(normalizedRequests.map((request) => request.projectId));
-  const nextProjects = applyPlacementRequests(state.projects, normalizedRequests);
+  const nextProjects = applyPlacementRequests(anticipatedState.projects, normalizedRequests);
   const nextProjectsById = new Map(nextProjects.map((project) => [project.id, project] as const));
 
   const conflicts: DependencyConflict[] = [];
 
-  for (const dependency of state.dependencies) {
+  for (const dependency of anticipatedState.dependencies) {
     const touchesMovedSelection =
       movedProjectIds.has(dependency.predecessorProjectId) ||
       movedProjectIds.has(dependency.successorProjectId);
@@ -544,10 +550,10 @@ export function detectDependencyConflicts(
       advanceWorkingDuration(
         predecessor.scheduledStartSlot,
         predecessor.scheduledDurationHalfDays,
-        state.closures
+        anticipatedState.closures
       ).readySlot,
       dependency.lagHalfDays,
-      state.closures
+      anticipatedState.closures
     );
 
     if (compareSlotKeys(successor.scheduledStartSlot, predecessorReadySlot) >= 0) {
@@ -618,37 +624,38 @@ export function rescheduleProjects(
   state: PlannerState,
   options?: RescheduleOptions
 ): PlannerState {
+  const preparedState = materializePlannerState(state);
   const trace =
     options?.trace ??
     startSchedulerTrace(options?.action ?? "rescheduleProjects", options?.metadata);
   const ownsTrace = !options?.trace;
-  const previousProjects = state.projects.map((project) => ({ ...project }));
+  const previousProjects = preparedState.projects.map((project) => ({ ...project }));
   const nextProjects = normalizeSequenceOrders(
-    state.projects.map((project) => ({
+    preparedState.projects.map((project) => ({
       ...project,
     })),
-    state.dependencies,
-    state.teams,
+    preparedState.dependencies,
+    preparedState.teams,
     trace
   );
   const computations = new Map<string, ScheduledComputation>();
 
-  traceLog(trace, "queues.before", summarizeTeamQueues(previousProjects, state.teams));
+  traceLog(trace, "queues.before", summarizeTeamQueues(previousProjects, preparedState.teams));
 
   let stabilized = false;
   for (let iteration = 0; iteration < MAX_ITERATIONS; iteration += 1) {
     let changed = false;
 
-    for (const team of getSortedTeams(state.teams)) {
+    for (const team of getSortedTeams(preparedState.teams)) {
       const teamProjects = sortScheduledProjects(nextProjects, team.id);
       let previousReadySlot: SlotKey | null = null;
 
       for (const project of teamProjects) {
         const dependencyReady = getPredecessorReadySlot(
           project.id,
-          state.dependencies,
+          preparedState.dependencies,
           computations,
-          state.closures
+          preparedState.closures
         );
 
         const requestedStart = [project.scheduledStartSlot, previousReadySlot, dependencyReady]
@@ -665,7 +672,7 @@ export function rescheduleProjects(
         const computed = advanceWorkingDuration(
           requestedStart,
           project.scheduledDurationHalfDays,
-          state.closures
+          preparedState.closures
         );
         const previous = computations.get(project.id);
 
@@ -705,16 +712,16 @@ export function rescheduleProjects(
   if (!stabilized) {
     traceLog(trace, "reschedule.unstable", {
       maxIterations: MAX_ITERATIONS,
-      queues: summarizeTeamQueues(nextProjects, state.teams),
+      queues: summarizeTeamQueues(nextProjects, preparedState.teams),
     });
   }
 
-  const nextState = {
-    ...state,
+  const nextState = materializePlannerState({
+    ...preparedState,
     projects: nextProjects,
-  };
+  });
 
-  traceLog(trace, "queues.after", summarizeTeamQueues(nextProjects, state.teams));
+  traceLog(trace, "queues.after", summarizeTeamQueues(nextProjects, preparedState.teams));
   traceLog(trace, "changes", listScheduledChanges(previousProjects, nextProjects));
 
   if (ownsTrace) {
@@ -743,8 +750,9 @@ export function getEarlierShiftPrompt(
   placement: ProjectPlacement,
   interaction: Extract<ScheduledDragIntent, "move" | "resize-start">
 ): EarlierShiftPromptState | null {
-  const normalizedPlacement = normalizePlacement(placement, state.closures);
-  const project = state.projects.find((candidate) => candidate.id === projectId);
+  const preparedState = materializePlannerState(state);
+  const normalizedPlacement = normalizePlacement(placement, preparedState.closures);
+  const project = preparedState.projects.find((candidate) => candidate.id === projectId);
 
   if (!project || !isScheduledProject(project)) {
     return null;
@@ -760,7 +768,7 @@ export function getEarlierShiftPrompt(
 
   const gapStart = normalizedPlacement.startSlot;
   const gapEnd = project.scheduledStartSlot;
-  const overlappingProject = state.projects
+  const overlappingProject = preparedState.projects
     .filter(isScheduledProject)
     .filter(
       (candidate) => candidate.id !== projectId && candidate.scheduledTeam === project.scheduledTeam
@@ -769,7 +777,7 @@ export function getEarlierShiftPrompt(
       const computed = advanceWorkingDuration(
         candidate.scheduledStartSlot,
         candidate.scheduledDurationHalfDays,
-        state.closures
+        preparedState.closures
       );
 
       return overlapExists(
@@ -798,8 +806,12 @@ export function updateProjectPlacements(
   placementRequests: ProjectPlacementRequest[],
   options?: ProjectPlacementOptions
 ) {
+  const anticipatedState = materializePlannerState({
+    ...state,
+    projects: applyPlacementRequests(state.projects, placementRequests),
+  });
   const normalizedRequests = placementRequests.map((request) =>
-    normalizePlacementRequest(request, state.closures)
+    normalizePlacementRequest(request, anticipatedState.closures)
   );
   const strategy = options?.strategy ?? "preserve";
   const dependencyResolution =
@@ -807,7 +819,7 @@ export function updateProjectPlacements(
   const nextDependencies =
     dependencyResolution === "break-conflicting-links"
       ? removeDependencies(state.dependencies, options?.removeDependencyIds)
-      : state.dependencies;
+      : anticipatedState.dependencies;
   const trace = startSchedulerTrace(
     normalizedRequests.length === 1 ? "updateProjectPlacement" : "updateProjectPlacements",
     {
@@ -822,9 +834,9 @@ export function updateProjectPlacements(
     }
   );
 
-  traceLog(trace, "queues.before", summarizeTeamQueues(state.projects, state.teams));
+  traceLog(trace, "queues.before", summarizeTeamQueues(anticipatedState.projects, anticipatedState.teams));
 
-  const insertedProjects = applyPlacementRequests(state.projects, normalizedRequests);
+  const insertedProjects = applyPlacementRequests(anticipatedState.projects, normalizedRequests);
   const nextProjects =
     strategy === "compact-same-team" && normalizedRequests.length === 1
       ? compactLaterSameTeamProjects(
@@ -847,7 +859,7 @@ export function updateProjectPlacements(
 
   const nextState = rescheduleProjects(
     {
-      ...state,
+      ...anticipatedState,
       dependencies: nextDependencies,
       projects: nextProjects,
     },
@@ -1038,7 +1050,8 @@ export function findScheduledComputation(
   state: PlannerState,
   projectId: string
 ): ScheduledComputation | null {
-  const scheduled = state.projects.find((project) => project.id === projectId);
+  const preparedState = materializePlannerState(state);
+  const scheduled = preparedState.projects.find((project) => project.id === projectId);
   if (!scheduled || !isScheduledProject(scheduled)) {
     return null;
   }
@@ -1046,7 +1059,7 @@ export function findScheduledComputation(
   return advanceWorkingDuration(
     scheduled.scheduledStartSlot,
     scheduled.scheduledDurationHalfDays,
-    state.closures
+    preparedState.closures
   );
 }
 

@@ -88,7 +88,7 @@ describe("planner persistence seed", () => {
         initialPlannerState.dependencies.length
       );
       expect(Number(closureCount?.count ?? 0)).toBe(
-        initialPlannerState.closures.filter((closure) => closure.source === "custom").length
+        initialPlannerState.customClosures.length
       );
       expect(Number(actionLogCount?.count ?? 0)).toBe(0);
 
@@ -121,6 +121,7 @@ describe("planner persistence seed", () => {
         .from(closurePeriods)
         .where(eq(closurePeriods.title, "Pluie continue secteur nord"));
       expect(knownClosure[0]?.impact).toBe("advisory");
+      expect(knownClosure[0]?.repeatsAnnually).toBe(false);
     } finally {
       await client.close();
     }
