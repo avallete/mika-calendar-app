@@ -76,6 +76,14 @@ describe("timeline folding", () => {
     expect(activeMonths[0]?.section.id).toBe("2026-03");
   });
 
+  test("marks exactly one active year in month mode", () => {
+    const summaries = buildSummaries("month");
+    const activeYears = summaries.filter((year) => year.isActive);
+
+    expect(activeYears).toHaveLength(1);
+    expect(activeYears[0]?.year).toBe(2026);
+  });
+
   test("marks exactly one active year in year mode", () => {
     const summaries = buildSummaries("year");
     const activeYears = summaries.filter((year) => year.isActive);

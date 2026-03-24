@@ -2,13 +2,17 @@ import { describe, expect, test } from "bun:test";
 
 import {
   buildFranceHolidayStripSummary,
+  getNextCustomClosureOccurrence,
   resolveCustomClosureFocusTarget,
+  shouldShowCustomClosureInStrip,
 } from "@/lib/planner/calendar-strip";
 import type {
   ClosurePeriod,
   CustomClosure,
   HolidaySource,
 } from "@/lib/planner/types";
+
+const todayDate = "2026-03-24";
 
 function makeHolidaySource(
   overrides: Partial<HolidaySource> = {}
@@ -53,12 +57,13 @@ function makeClosure(
 }
 
 describe("calendar strip", () => {
-  test("builds a single France holiday summary from materialized holidays", () => {
+  test("builds a future-filtered France holiday summary from materialized holidays", () => {
     expect(
       buildFranceHolidayStripSummary({
         holidaySources: [makeHolidaySource()],
         closures: [
-          makeClosure({ startDate: "2025-01-01", endDate: "2025-01-01" }),
+          makeClosure({ startDate: "2026-01-01", endDate: "2026-01-01" }),
+          makeClosure({ startDate: "2026-04-21", endDate: "2026-04-21" }),
           makeClosure({ startDate: "2027-12-25", endDate: "2027-12-25" }),
           makeClosure({
             id: "custom",
@@ -70,13 +75,23 @@ describe("calendar strip", () => {
             editable: true,
           }),
         ],
+        todayDate,
       })
     ).toEqual({
       code: "FR",
       labelFr: "Jours feries France",
-      closureCount: 2,
-      startYear: 2025,
-      endYear: 2027,
+      closureCount: 1,
+      startYear: 2026,
+      endYear: 2026,
+      upcomingClosures: [
+        makeClosure({ startDate: "2026-04-21", endDate: "2026-04-21" }),
+      ],
+      upcomingYearGroups: [
+        {
+          year: 2026,
+          items: [makeClosure({ startDate: "2026-04-21", endDate: "2026-04-21" })],
+        },
+      ],
     });
   });
 
@@ -85,11 +100,105 @@ describe("calendar strip", () => {
       buildFranceHolidayStripSummary({
         holidaySources: [makeHolidaySource({ enabled: false })],
         closures: [makeClosure()],
+        todayDate,
       })
     ).toBeNull();
   });
 
-  test("resolves a recurring custom closure to the closest visible occurrence", () => {
+  test("hides past one-shot custom closures from the strip", () => {
+    expect(
+      shouldShowCustomClosureInStrip({
+        closure: makeCustomClosure({
+          id: "past-one-shot",
+          startDate: "2026-02-01",
+          endDate: "2026-02-02",
+          repeatsAnnually: false,
+        }),
+        closures: [],
+        todayDate,
+      })
+    ).toBe(false);
+  });
+
+  test("keeps recurring custom closures visible only when they have a non-past occurrence", () => {
+    const recurringClosure = makeCustomClosure({
+      id: "annual-close",
+      repeatsAnnually: true,
+    });
+
+    expect(
+      shouldShowCustomClosureInStrip({
+        closure: recurringClosure,
+        closures: [
+          makeClosure({
+            id: "annual-close::2026",
+            title: recurringClosure.title,
+            type: recurringClosure.type,
+            startDate: "2026-02-01",
+            endDate: "2026-02-02",
+            source: "custom",
+            editable: true,
+          }),
+          makeClosure({
+            id: "annual-close::2027",
+            title: recurringClosure.title,
+            type: recurringClosure.type,
+            startDate: "2027-04-11",
+            endDate: "2027-04-12",
+            source: "custom",
+            editable: true,
+          }),
+        ],
+        todayDate,
+      })
+    ).toBe(true);
+  });
+
+  test("returns the next non-past occurrence for a recurring closure", () => {
+    const recurringClosure = makeCustomClosure({
+      id: "annual-close",
+      repeatsAnnually: true,
+    });
+
+    expect(
+      getNextCustomClosureOccurrence({
+        closure: recurringClosure,
+        closures: [
+          makeClosure({
+            id: "annual-close::2026",
+            title: recurringClosure.title,
+            type: recurringClosure.type,
+            startDate: "2026-02-01",
+            endDate: "2026-02-02",
+            source: "custom",
+            editable: true,
+          }),
+          makeClosure({
+            id: "annual-close::2027",
+            title: recurringClosure.title,
+            type: recurringClosure.type,
+            startDate: "2027-04-11",
+            endDate: "2027-04-12",
+            source: "custom",
+            editable: true,
+          }),
+        ],
+        todayDate,
+      })
+    ).toEqual(
+      makeClosure({
+        id: "annual-close::2027",
+        title: recurringClosure.title,
+        type: recurringClosure.type,
+        startDate: "2027-04-11",
+        endDate: "2027-04-12",
+        source: "custom",
+        editable: true,
+      })
+    );
+  });
+
+  test("resolves a recurring custom closure to the closest non-past occurrence", () => {
     const closure = makeCustomClosure({
       id: "annual-close",
       repeatsAnnually: true,
@@ -103,8 +212,8 @@ describe("calendar strip", () => {
             id: "annual-close::2026",
             title: closure.title,
             type: closure.type,
-            startDate: "2026-04-11",
-            endDate: "2026-04-12",
+            startDate: "2026-02-01",
+            endDate: "2026-02-02",
             source: "custom",
             editable: true,
           }),
@@ -117,33 +226,47 @@ describe("calendar strip", () => {
             source: "custom",
             editable: true,
           }),
+          makeClosure({
+            id: "annual-close::2028",
+            title: closure.title,
+            type: closure.type,
+            startDate: "2028-04-11",
+            endDate: "2028-04-12",
+            source: "custom",
+            editable: true,
+          }),
         ],
-        activeDate: "2026-12-20",
+        activeDate: "2027-12-20",
+        todayDate,
       })
     ).toEqual({
-      id: "annual-close::2027",
-      startDate: "2027-04-11",
-      endDate: "2027-04-12",
+      id: "annual-close::2028",
+      startDate: "2028-04-11",
+      endDate: "2028-04-12",
     });
   });
 
-  test("falls back to the template range when no materialized occurrence is available", () => {
-    const closure = makeCustomClosure({
-      id: "one-shot",
-      startDate: "2026-07-08",
-      endDate: "2026-07-09",
-    });
-
+  test("returns null when only past occurrences remain", () => {
     expect(
       resolveCustomClosureFocusTarget({
-        closure,
-        closures: [],
-        activeDate: "2026-07-01",
+        closure: makeCustomClosure({
+          id: "past-recurring",
+          startDate: "2026-02-01",
+          endDate: "2026-02-02",
+          repeatsAnnually: true,
+        }),
+        closures: [
+          makeClosure({
+            id: "past-recurring::2026",
+            startDate: "2026-02-01",
+            endDate: "2026-02-02",
+            source: "custom",
+            editable: true,
+          }),
+        ],
+        activeDate: "2026-03-24",
+        todayDate,
       })
-    ).toEqual({
-      id: "one-shot",
-      startDate: "2026-07-08",
-      endDate: "2026-07-09",
-    });
+    ).toBeNull();
   });
 });
