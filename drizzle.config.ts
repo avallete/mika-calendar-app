@@ -1,4 +1,11 @@
+import path from "node:path";
 import { defineConfig } from "drizzle-kit";
+
+const databaseUrl = process.env.DATABASE_URL;
+const pgliteDataDir = path.resolve(
+  process.cwd(),
+  process.env.PGLITE_DATA_DIR ?? ".pglite"
+);
 
 export default defineConfig({
   dialect: "postgresql",
@@ -7,9 +14,16 @@ export default defineConfig({
   casing: "snake_case",
   verbose: true,
   strict: true,
-  dbCredentials: {
-    url:
-      process.env.DATABASE_URL ??
-      "postgres://planner:planner@localhost:5432/app_calendar_mika",
-  },
+  ...(databaseUrl
+    ? {
+        dbCredentials: {
+          url: databaseUrl,
+        },
+      }
+    : {
+        driver: "pglite" as const,
+        dbCredentials: {
+          url: pgliteDataDir,
+        },
+      }),
 });

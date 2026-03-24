@@ -14,20 +14,16 @@ import {
   SheetHeader,
   SheetTitle,
 } from "@/components/ui/sheet";
+import { usePlanner } from "@/components/planner/planner-provider";
+import { fr } from "@/lib/i18n/fr";
 import type {
   Project,
   ProjectDependency,
   ProjectDeleteMode,
   ProjectPlacement,
-  TeamId,
 } from "@/lib/planner/types";
-import { isScheduledProject } from "@/lib/planner/types";
+import { getSortedTeams, isScheduledProject } from "@/lib/planner/types";
 import { cn } from "@/lib/utils";
-
-const teamChoices: { id: TeamId; label: string }[] = [
-  { id: "team-a", label: "Team A" },
-  { id: "team-b", label: "Team B" },
-];
 
 export function ProjectEditorSheet({
   open,
@@ -72,24 +68,21 @@ export function ProjectEditorSheet({
       <SheetContent className="w-full max-w-xl overflow-y-auto bg-[linear-gradient(180deg,rgba(255,255,255,0.96),rgba(248,244,238,0.96))] sm:max-w-xl">
         <SheetHeader className="border-b border-border/60 pb-4">
           <p className="text-xs font-semibold uppercase tracking-[0.24em] text-muted-foreground">
-            Scheduler editor
+            {fr.projectEditor.eyebrow}
           </p>
           <SheetTitle className="mt-2 text-2xl">{project.title}</SheetTitle>
-          <SheetDescription>
-            Adjust the assigned team, start slot, and duration before the schedule is
-            recalculated.
-          </SheetDescription>
+          <SheetDescription>{fr.projectEditor.description}</SheetDescription>
         </SheetHeader>
 
         <div className="space-y-6 p-4">
           <div className="flex flex-wrap gap-2">
             <Badge variant="secondary">
               <CalendarDays className="size-3.5" />
-              Estimated {project.estimatedDurationHalfDays / 2} days
+              {fr.projectEditor.estimated} {project.estimatedDurationHalfDays / 2} j
             </Badge>
             <Badge variant="outline">
               <ArrowRightLeft className="size-3.5" />
-              {incomingDependencies.length} blockers
+              {incomingDependencies.length} {fr.projectEditor.blockers}
             </Badge>
           </div>
 
@@ -118,7 +111,7 @@ export function ProjectEditorSheet({
               }}
             >
               <PauseCircle className="size-4" />
-              Return to draft queue
+              {fr.projectEditor.returnToDrafts}
             </Button>
           ) : null}
           {isScheduledProject(project) && onDelete ? (
@@ -126,34 +119,26 @@ export function ProjectEditorSheet({
               <Button
                 variant="destructive"
                 onClick={() => {
-                  if (
-                    window.confirm(
-                      "Delete this planned project and keep the remaining schedule dates as they are?"
-                    )
-                  ) {
+                  if (window.confirm(fr.projectEditor.confirmKeepDates)) {
                     onDelete(project.id, "preserve-dates");
                     onOpenChange(false);
                   }
                 }}
               >
                 <Trash2 className="size-4" />
-                Delete and keep dates
+                {fr.projectEditor.deleteKeepDates}
               </Button>
               <Button
                 variant="destructive"
                 onClick={() => {
-                  if (
-                    window.confirm(
-                      "Delete this planned project and compact later dates where dependencies allow?"
-                    )
-                  ) {
+                  if (window.confirm(fr.projectEditor.confirmCompact)) {
                     onDelete(project.id, "compact-schedule");
                     onOpenChange(false);
                   }
                 }}
               >
                 <Trash2 className="size-4" />
-                Delete and compact
+                {fr.projectEditor.deleteCompact}
               </Button>
             </>
           ) : null}
@@ -174,19 +159,21 @@ function ProjectEditorForm({
   onSave: (projectId: string, placement: ProjectPlacement) => void;
   onOpenChange: (open: boolean) => void;
 }) {
+  const { state } = usePlanner();
+  const teams = getSortedTeams(state.teams);
   const initialPlacement = placementOverride
     ? placementOverride
     : {
         teamId: isScheduledProject(project) ? project.scheduledTeam : project.plannedTeam,
         startSlot: isScheduledProject(project)
           ? project.scheduledStartSlot
-          : ((project.targetDateHint ? `${project.targetDateHint}-AM` : "2026-03-24-AM") as ProjectPlacement["startSlot"]),
+          : ((project.targetDateHint ? `${project.targetDateHint}-AM` : "2026-03-25-AM") as ProjectPlacement["startSlot"]),
         durationHalfDays: isScheduledProject(project)
           ? project.scheduledDurationHalfDays
           : project.estimatedDurationHalfDays,
       };
 
-  const [teamId, setTeamId] = useState<TeamId>(initialPlacement.teamId);
+  const [teamId, setTeamId] = useState(initialPlacement.teamId);
   const [date, setDate] = useState(initialPlacement.startSlot.slice(0, 10));
   const [part, setPart] = useState<"AM" | "PM">(
     initialPlacement.startSlot.endsWith("-PM") ? "PM" : "AM"
@@ -200,10 +187,10 @@ function ProjectEditorForm({
       <div className="space-y-4">
         <div className="space-y-2">
           <p className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">
-            Assign to team
+            {fr.projectEditor.assignTeam}
           </p>
           <div className="grid gap-2 sm:grid-cols-2">
-            {teamChoices.map((team) => (
+            {teams.map((team) => (
               <button
                 key={team.id}
                 type="button"
@@ -215,7 +202,7 @@ function ProjectEditorForm({
                 )}
                 onClick={() => setTeamId(team.id)}
               >
-                {team.label}
+                {team.nameFr}
               </button>
             ))}
           </div>
@@ -224,7 +211,7 @@ function ProjectEditorForm({
         <div className="grid gap-3 sm:grid-cols-[1fr_auto]">
           <div className="space-y-2">
             <p className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">
-              Start date
+              {fr.projectEditor.startDate}
             </p>
             <Input
               type="date"
@@ -234,7 +221,7 @@ function ProjectEditorForm({
           </div>
           <div className="space-y-2">
             <p className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">
-              Slot
+              {fr.projectEditor.slot}
             </p>
             <div className="flex rounded-xl border border-border bg-card p-1">
               {(["AM", "PM"] as const).map((value) => (
@@ -258,7 +245,7 @@ function ProjectEditorForm({
 
         <div className="space-y-2">
           <p className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">
-            Duration (half-days)
+            {fr.projectEditor.duration}
           </p>
           <Input
             min={1}
@@ -282,7 +269,7 @@ function ProjectEditorForm({
           onOpenChange(false);
         }}
       >
-        Save placement
+        {fr.projectEditor.savePlacement}
       </Button>
     </>
   );

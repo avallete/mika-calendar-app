@@ -1,30 +1,31 @@
 import { ArrowRightLeft, Archive, FolderKanban, PauseOctagon } from "lucide-react";
 
 import { Card, CardContent } from "@/components/ui/card";
+import { fr } from "@/lib/i18n/fr";
 import type { ProjectMetrics } from "@/lib/planner/types";
 
 const metricMeta = [
   {
     key: "scheduledCount",
-    label: "Scheduled",
+    label: fr.metrics.scheduled,
     icon: FolderKanban,
-    tint: "var(--team-a-soft)",
+    tint: "oklch(0.95 0.03 205)",
   },
   {
     key: "draftCount",
-    label: "Draft queue",
+    label: fr.metrics.drafts,
     icon: Archive,
-    tint: "var(--team-b-soft)",
+    tint: "oklch(0.96 0.04 55)",
   },
   {
     key: "blockedCount",
-    label: "With blockers",
+    label: fr.metrics.blocked,
     icon: ArrowRightLeft,
     tint: "oklch(0.95 0.05 77)",
   },
   {
     key: "closureCount",
-    label: "Closures",
+    label: fr.metrics.closures,
     icon: PauseOctagon,
     tint: "oklch(0.94 0.03 20)",
   },

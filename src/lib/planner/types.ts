@@ -1,21 +1,15 @@
-export const teamOptions = [
-  { id: "team-a", label: "Team A", accent: "var(--team-a)" },
-  { id: "team-b", label: "Team B", accent: "var(--team-b)" },
-] as const;
-
-export const zoomLevels = [
-  "year",
-] as const;
+export const zoomLevels = ["year"] as const;
 
 export const closureTypeOptions = [
-  { id: "holiday", label: "Holiday" },
-  { id: "company_closure", label: "Company closure" },
-  { id: "custom_time_off", label: "Time off" },
+  { id: "holiday", labelFr: "Jour ferie" },
+  { id: "company_closure", labelFr: "Fermeture" },
+  { id: "custom_time_off", labelFr: "Indisponibilite" },
 ] as const;
 
-export type TeamId = (typeof teamOptions)[number]["id"];
+export type TeamId = string;
 export type ZoomLevel = (typeof zoomLevels)[number];
 export type ClosureType = (typeof closureTypeOptions)[number]["id"];
+export type ClosureSource = "custom" | "fr-public-holiday";
 export type ProjectStatus = "draft" | "scheduled";
 export type ProjectDeleteMode = "preserve-dates" | "compact-schedule";
 export type ProjectPlacementStrategy = "preserve" | "compact-same-team";
@@ -25,6 +19,23 @@ export type DependencyResolutionMode =
 export type SlotPart = "AM" | "PM";
 export type SlotKey = `${string}-${SlotPart}`;
 export type ScheduledDragIntent = "move" | "resize-start" | "resize-end";
+
+export type Team = {
+  id: TeamId;
+  slug: string;
+  nameFr: string;
+  displayOrder: number;
+  accentColor: string;
+  softColor: string;
+  isActive: boolean;
+};
+
+export type HolidaySource = {
+  id: string;
+  code: string;
+  labelFr: string;
+  enabled: boolean;
+};
 
 export type Project = {
   id: string;
@@ -53,12 +64,24 @@ export type ClosurePeriod = {
   type: ClosureType;
   startDate: string;
   endDate: string;
+  source: ClosureSource;
+  editable: boolean;
+};
+
+export type PlannerHistoryState = {
+  canUndo: boolean;
+  canRedo: boolean;
+  undoLabel?: string;
+  redoLabel?: string;
 };
 
 export type PlannerState = {
+  teams: Team[];
+  holidaySources: HolidaySource[];
   projects: Project[];
   dependencies: ProjectDependency[];
   closures: ClosurePeriod[];
+  history: PlannerHistoryState;
 };
 
 export type ProjectPlacement = {
@@ -164,6 +187,14 @@ export type ClosureFormState = {
   endDate: string;
 };
 
+export type TeamEditorState = {
+  nameFr: string;
+  slug: string;
+  accentColor: string;
+  softColor: string;
+  displayOrder: number;
+};
+
 export type ProjectMetrics = {
   scheduledCount: number;
   draftCount: number;
@@ -184,4 +215,24 @@ export function isScheduledProject(project: Project): project is Project & {
     typeof project.scheduledDurationHalfDays === "number" &&
     typeof project.sequenceOrder === "number"
   );
+}
+
+export function getSortedTeams(teams: Team[]) {
+  return [...teams]
+    .filter((team) => team.isActive)
+    .sort((left, right) => {
+      if (left.displayOrder !== right.displayOrder) {
+        return left.displayOrder - right.displayOrder;
+      }
+
+      return left.nameFr.localeCompare(right.nameFr, "fr");
+    });
+}
+
+export function getTeamById(teams: Team[], teamId: TeamId | undefined) {
+  if (!teamId) {
+    return null;
+  }
+
+  return teams.find((team) => team.id === teamId) ?? null;
 }

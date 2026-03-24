@@ -1,6 +1,8 @@
 import {
+  boolean,
   check,
   integer,
+  jsonb,
   pgEnum,
   pgTable,
   text,
@@ -11,7 +13,6 @@ import {
 } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
 
-export const teamEnum = pgEnum("team", ["team-a", "team-b"]);
 export const projectStatusEnum = pgEnum("project_status", ["draft", "scheduled"]);
 export const closureTypeEnum = pgEnum("closure_type", [
   "holiday",
@@ -19,17 +20,58 @@ export const closureTypeEnum = pgEnum("closure_type", [
   "custom_time_off",
 ]);
 
+export const teams = pgTable(
+  "teams",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    slug: varchar("slug", { length: 80 }).notNull(),
+    nameFr: varchar("name_fr", { length: 160 }).notNull(),
+    displayOrder: integer("display_order").notNull().default(0),
+    accentColor: varchar("accent_color", { length: 40 }).notNull(),
+    softColor: varchar("soft_color", { length: 40 }).notNull(),
+    isActive: boolean("is_active").notNull().default(true),
+    createdAt: timestamp("created_at", { withTimezone: true, mode: "date" })
+      .defaultNow()
+      .notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true, mode: "date" })
+      .defaultNow()
+      .notNull(),
+  },
+  (table) => [uniqueIndex("teams_slug_unique").on(table.slug)]
+);
+
+export const holidaySources = pgTable(
+  "holiday_sources",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    code: varchar("code", { length: 32 }).notNull(),
+    labelFr: varchar("label_fr", { length: 160 }).notNull(),
+    enabled: boolean("enabled").notNull().default(false),
+    createdAt: timestamp("created_at", { withTimezone: true, mode: "date" })
+      .defaultNow()
+      .notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true, mode: "date" })
+      .defaultNow()
+      .notNull(),
+  },
+  (table) => [uniqueIndex("holiday_sources_code_unique").on(table.code)]
+);
+
 export const projects = pgTable(
   "projects",
   {
     id: uuid("id").defaultRandom().primaryKey(),
     title: varchar("title", { length: 180 }).notNull(),
     status: projectStatusEnum("status").notNull().default("draft"),
-    plannedTeam: teamEnum("planned_team").notNull(),
+    plannedTeamId: uuid("planned_team_id")
+      .notNull()
+      .references(() => teams.id, { onDelete: "restrict" }),
     estimatedDurationHalfDays: integer("estimated_duration_half_days")
       .notNull()
       .default(2),
-    scheduledTeam: teamEnum("scheduled_team"),
+    scheduledTeamId: uuid("scheduled_team_id").references(() => teams.id, {
+      onDelete: "restrict",
+    }),
     scheduledStartSlot: varchar("scheduled_start_slot", { length: 20 }),
     scheduledDurationHalfDays: integer("scheduled_duration_half_days"),
     sequenceOrder: integer("sequence_order"),
@@ -58,13 +100,13 @@ export const projects = pgTable(
       "projects_scheduled_fields_match_status",
       sql`(
         ${table.status} = 'draft'
-        AND ${table.scheduledTeam} IS NULL
+        AND ${table.scheduledTeamId} IS NULL
         AND ${table.scheduledStartSlot} IS NULL
         AND ${table.scheduledDurationHalfDays} IS NULL
         AND ${table.sequenceOrder} IS NULL
       ) OR (
         ${table.status} = 'scheduled'
-        AND ${table.scheduledTeam} IS NOT NULL
+        AND ${table.scheduledTeamId} IS NOT NULL
         AND ${table.scheduledStartSlot} IS NOT NULL
         AND ${table.scheduledDurationHalfDays} IS NOT NULL
         AND ${table.sequenceOrder} IS NOT NULL
@@ -117,15 +159,37 @@ export const closurePeriods = pgTable(
     createdAt: timestamp("created_at", { withTimezone: true, mode: "date" })
       .defaultNow()
       .notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true, mode: "date" })
+      .defaultNow()
+      .notNull(),
   },
   (table) => [
     check("closure_periods_valid_range", sql`${table.endDate} >= ${table.startDate}`),
   ]
 );
 
+export const plannerActionLog = pgTable("planner_action_log", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  sessionId: varchar("session_id", { length: 120 }).notNull(),
+  actionType: varchar("action_type", { length: 80 }).notNull(),
+  payload: jsonb("payload").notNull(),
+  beforeSnapshot: jsonb("before_snapshot").notNull(),
+  afterSnapshot: jsonb("after_snapshot").notNull(),
+  undoneAt: timestamp("undone_at", { withTimezone: true, mode: "date" }),
+  invalidatedAt: timestamp("invalidated_at", { withTimezone: true, mode: "date" }),
+  createdAt: timestamp("created_at", { withTimezone: true, mode: "date" })
+    .defaultNow()
+    .notNull(),
+});
+
+export type TeamRow = typeof teams.$inferSelect;
+export type NewTeamRow = typeof teams.$inferInsert;
+export type HolidaySourceRow = typeof holidaySources.$inferSelect;
+export type NewHolidaySourceRow = typeof holidaySources.$inferInsert;
 export type ProjectRow = typeof projects.$inferSelect;
 export type NewProjectRow = typeof projects.$inferInsert;
 export type ProjectDependencyRow = typeof projectDependencies.$inferSelect;
 export type NewProjectDependencyRow = typeof projectDependencies.$inferInsert;
 export type ClosurePeriodRow = typeof closurePeriods.$inferSelect;
 export type NewClosurePeriodRow = typeof closurePeriods.$inferInsert;
+export type PlannerActionLogRow = typeof plannerActionLog.$inferSelect;

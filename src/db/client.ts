@@ -1,23 +1,83 @@
-import { drizzle } from "drizzle-orm/node-postgres";
+import { PGlite } from "@electric-sql/pglite";
+import { drizzle as drizzleNodePg } from "drizzle-orm/node-postgres";
+import type { NodePgDatabase } from "drizzle-orm/node-postgres";
+import { drizzle as drizzlePglite } from "drizzle-orm/pglite";
+import type { PgliteDatabase } from "drizzle-orm/pglite";
+import { migrate as migratePglite } from "drizzle-orm/pglite/migrator";
+import path from "node:path";
 import { Pool } from "pg";
 
-let _db: ReturnType<typeof drizzle> | null = null;
+export type PlannerDb =
+  | NodePgDatabase<Record<string, unknown>>
+  | PgliteDatabase<Record<string, unknown>>;
 
-export function getDb() {
-  if (_db) {
-    return _db;
+type PlannerDbState = {
+  db: PlannerDb;
+  ready: Promise<void>;
+};
+
+const globalForPlannerDb = globalThis as typeof globalThis & {
+  __plannerDbState?: PlannerDbState;
+};
+
+function getProjectPath(...segments: string[]) {
+  return path.join(/* turbopackIgnore: true */ process.cwd(), ...segments);
+}
+
+function getPgliteDataDir() {
+  const configuredDataDir = process.env.PGLITE_DATA_DIR;
+
+  if (!configuredDataDir) {
+    return getProjectPath(".pglite");
   }
 
+  return path.isAbsolute(configuredDataDir)
+    ? configuredDataDir
+    : getProjectPath(configuredDataDir);
+}
+
+function createDbState(): PlannerDbState {
   const connectionString = process.env.DATABASE_URL;
 
-  if (!connectionString) {
-    throw new Error("DATABASE_URL is not configured.");
+  if (connectionString) {
+    const pool = new Pool({
+      connectionString,
+    });
+
+    return {
+      db: drizzleNodePg({ client: pool }),
+      ready: Promise.resolve(),
+    };
   }
 
-  const pool = new Pool({
-    connectionString,
-  });
+  const client = new PGlite(getPgliteDataDir());
+  const db = drizzlePglite({ client });
 
-  _db = drizzle({ client: pool });
-  return _db;
+  return {
+    db,
+    ready: client.waitReady.then(() =>
+      migratePglite(db, {
+        migrationsFolder: getProjectPath("drizzle"),
+      })
+    ),
+  };
+}
+
+function getDbState() {
+  const existingState = globalForPlannerDb.__plannerDbState;
+  if (existingState) {
+    return existingState;
+  }
+
+  const state = createDbState();
+  globalForPlannerDb.__plannerDbState = state;
+  return state;
+}
+
+export function getDb() {
+  return getDbState().db;
+}
+
+export async function ensureDbReady() {
+  await getDbState().ready;
 }

@@ -1,180 +1,81 @@
 "use client";
 
-import { createContext, useContext, useMemo, useReducer } from "react";
-
-import { initialPlannerState } from "@/lib/planner/sample-data";
 import {
-  buildPlannerMetrics,
-  deleteProjectFromState,
-  rescheduleProjects,
-  updateProjectPlacement,
-  updateProjectPlacements,
-  wouldCreateDependencyCycle,
-} from "@/lib/planner/scheduler";
+  createContext,
+  useContext,
+  useEffect,
+  useState,
+  useTransition,
+} from "react";
+
+import {
+  createClosureAction,
+  createTeamAction,
+  deleteClosureAction,
+  deleteProjectAction,
+  deleteTeamAction,
+  loadPlannerSnapshotAction,
+  placeProjectAction,
+  placeProjectsAction,
+  redoPlannerActionAction,
+  saveProjectAction,
+  setHolidaySourceEnabledAction,
+  undoPlannerActionAction,
+  unscheduleProjectAction,
+  updateTeamAction,
+} from "@/lib/planner/actions";
+import { buildPlannerMetrics } from "@/lib/planner/scheduler";
 import type {
   ClosureFormState,
   PlannerState,
   ProjectDeleteMode,
   ProjectEditorState,
   ProjectPlacement,
-  ProjectPlacementRequest,
   ProjectPlacementOptions,
+  ProjectPlacementRequest,
+  TeamEditorState,
 } from "@/lib/planner/types";
 
-type PlannerAction =
-  | { type: "UPSERT_PROJECT"; projectId?: string; values: ProjectEditorState }
-  | {
-      type: "SET_DEPENDENCIES";
-      projectId: string;
-      dependencyIds: string[];
-    }
-  | {
-      type: "PLACE_PROJECT";
-      projectId: string;
-      placement: ProjectPlacement;
-      options?: ProjectPlacementOptions;
-    }
-  | {
-      type: "PLACE_PROJECTS";
-      placements: ProjectPlacementRequest[];
-      options?: ProjectPlacementOptions;
-    }
-  | {
-      type: "UNSCHEDULE_PROJECT";
-      projectId: string;
-    }
-  | {
-      type: "DELETE_PROJECT";
-      projectId: string;
-      mode?: ProjectDeleteMode;
-    }
-  | {
-      type: "ADD_CLOSURE";
-      values: ClosureFormState;
-    }
-  | {
-      type: "REMOVE_CLOSURE";
-      closureId: string;
-    }
-  | {
-      type: "RESET";
-    };
+const SESSION_STORAGE_KEY = "planner-session-id";
 
-function plannerReducer(state: PlannerState, action: PlannerAction): PlannerState {
-  switch (action.type) {
-    case "UPSERT_PROJECT": {
-      const { projectId, values } = action;
-      const nextProjects = state.projects.map((project) => ({ ...project }));
-      const existing = nextProjects.find((project) => project.id === projectId);
-
-      if (existing) {
-        existing.title = values.title;
-        existing.plannedTeam = values.plannedTeam;
-        existing.estimatedDurationHalfDays = values.estimatedDurationHalfDays;
-        existing.targetDateHint = values.targetDateHint || undefined;
-        existing.notes = values.notes || undefined;
-      } else {
-        nextProjects.push({
-          id: crypto.randomUUID(),
-          title: values.title,
-          status: "draft",
-          plannedTeam: values.plannedTeam,
-          estimatedDurationHalfDays: values.estimatedDurationHalfDays,
-          targetDateHint: values.targetDateHint || undefined,
-          notes: values.notes || undefined,
-        });
-      }
-
-      return state.projects.some((project) => project.id === projectId)
-        ? rescheduleProjects({ ...state, projects: nextProjects })
-        : { ...state, projects: nextProjects };
-    }
-    case "SET_DEPENDENCIES": {
-      const otherDependencies = state.dependencies.filter(
-        (dependency) => dependency.successorProjectId !== action.projectId
-      );
-      const nextDependencies = [...otherDependencies];
-
-      for (const predecessorProjectId of action.dependencyIds) {
-        if (
-          wouldCreateDependencyCycle(
-            nextDependencies,
-            predecessorProjectId,
-            action.projectId
-          )
-        ) {
-          continue;
-        }
-
-        nextDependencies.push({
-          id: crypto.randomUUID(),
-          predecessorProjectId,
-          successorProjectId: action.projectId,
-          lagHalfDays: 0,
-        });
-      }
-
-      return rescheduleProjects({
-        ...state,
-        dependencies: nextDependencies,
-      });
-    }
-    case "PLACE_PROJECT":
-      return updateProjectPlacement(state, action.projectId, action.placement, action.options);
-    case "PLACE_PROJECTS":
-      return updateProjectPlacements(state, action.placements, action.options);
-    case "UNSCHEDULE_PROJECT": {
-      const nextProjects = state.projects.map((project) =>
-        project.id === action.projectId
-          ? {
-              ...project,
-              status: "draft" as const,
-              scheduledTeam: undefined,
-              scheduledStartSlot: undefined,
-              scheduledDurationHalfDays: undefined,
-              sequenceOrder: undefined,
-            }
-          : { ...project }
-      );
-
-      return rescheduleProjects({
-        ...state,
-        projects: nextProjects,
-      });
-    }
-    case "DELETE_PROJECT":
-      return deleteProjectFromState(state, action.projectId, action.mode);
-    case "ADD_CLOSURE":
-      return rescheduleProjects({
-        ...state,
-        closures: [
-          ...state.closures,
-          {
-            id: crypto.randomUUID(),
-            title: action.values.title,
-            type: action.values.type,
-            startDate: action.values.startDate,
-            endDate: action.values.endDate,
-          },
-        ],
-      });
-    case "REMOVE_CLOSURE":
-      return rescheduleProjects({
-        ...state,
-        closures: state.closures.filter((closure) => closure.id !== action.closureId),
-      });
-    case "RESET":
-      return initialPlannerState;
-    default:
-      return state;
+function getOrCreateSessionId() {
+  if (typeof window === "undefined") {
+    return null;
   }
+
+  const existing = window.localStorage.getItem(SESSION_STORAGE_KEY);
+  if (existing) {
+    return existing;
+  }
+
+  const nextSessionId = window.crypto.randomUUID();
+  window.localStorage.setItem(SESSION_STORAGE_KEY, nextSessionId);
+  return nextSessionId;
+}
+
+function isEditableTarget(target: EventTarget | null) {
+  if (!(target instanceof HTMLElement)) {
+    return false;
+  }
+
+  return Boolean(
+    target.closest("input, textarea, [contenteditable='true'], [contenteditable='']")
+  );
+}
+
+function getErrorMessage(error: unknown) {
+  if (error instanceof Error) {
+    return error.message;
+  }
+
+  return "Une erreur inattendue est survenue.";
 }
 
 type PlannerContextValue = {
   state: PlannerState;
   metrics: ReturnType<typeof buildPlannerMetrics>;
+  isPending: boolean;
   upsertProject: (values: ProjectEditorState, projectId?: string) => void;
-  setDependencies: (projectId: string, dependencyIds: string[]) => void;
   placeProject: (
     projectId: string,
     placement: ProjectPlacement,
@@ -188,51 +89,148 @@ type PlannerContextValue = {
   deleteProject: (projectId: string, mode?: ProjectDeleteMode) => void;
   addClosure: (values: ClosureFormState) => void;
   removeClosure: (closureId: string) => void;
-  resetDemoData: () => void;
+  createTeam: (values: TeamEditorState) => void;
+  updateTeam: (teamId: string, values: TeamEditorState) => void;
+  deleteTeam: (teamId: string) => void;
+  setHolidaySourceEnabled: (sourceCode: string, enabled: boolean) => void;
+  undo: () => void;
+  redo: () => void;
 };
 
 const PlannerContext = createContext<PlannerContextValue | null>(null);
 
-export function PlannerProvider({ children }: { children: React.ReactNode }) {
-  const [state, dispatch] = useReducer(plannerReducer, initialPlannerState);
+export function PlannerProvider({
+  children,
+  initialState,
+}: {
+  children: React.ReactNode;
+  initialState: PlannerState;
+}) {
+  const [state, setState] = useState(initialState);
+  const [sessionId] = useState<string | null>(() => getOrCreateSessionId());
+  const [isPending, startTransition] = useTransition();
 
-  const value = useMemo<PlannerContextValue>(
-    () => ({
-      state,
-      metrics: buildPlannerMetrics(state),
-      upsertProject(values, projectId) {
-        dispatch({ type: "UPSERT_PROJECT", values, projectId });
-        if (projectId) {
-          dispatch({ type: "SET_DEPENDENCIES", projectId, dependencyIds: values.dependencyIds });
-        }
-      },
-      setDependencies(projectId, dependencyIds) {
-        dispatch({ type: "SET_DEPENDENCIES", projectId, dependencyIds });
-      },
-      placeProject(projectId, placement, options) {
-        dispatch({ type: "PLACE_PROJECT", projectId, placement, options });
-      },
-      placeProjects(placements, options) {
-        dispatch({ type: "PLACE_PROJECTS", placements, options });
-      },
-      unscheduleProject(projectId) {
-        dispatch({ type: "UNSCHEDULE_PROJECT", projectId });
-      },
-      deleteProject(projectId, mode) {
-        dispatch({ type: "DELETE_PROJECT", projectId, mode });
-      },
-      addClosure(values) {
-        dispatch({ type: "ADD_CLOSURE", values });
-      },
-      removeClosure(closureId) {
-        dispatch({ type: "REMOVE_CLOSURE", closureId });
-      },
-      resetDemoData() {
-        dispatch({ type: "RESET" });
-      },
-    }),
-    [state]
-  );
+  useEffect(() => {
+    if (!sessionId) {
+      return;
+    }
+
+    startTransition(() => {
+      void loadPlannerSnapshotAction(sessionId)
+        .then((snapshot) => {
+          setState(snapshot);
+        })
+        .catch((error) => {
+          window.alert(getErrorMessage(error));
+        });
+    });
+  }, [sessionId]);
+
+  useEffect(() => {
+    if (!sessionId) {
+      return;
+    }
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      const modifierPressed = event.ctrlKey || event.metaKey;
+      if (!modifierPressed || event.altKey || event.key.toLowerCase() !== "z") {
+        return;
+      }
+
+      if (isEditableTarget(event.target)) {
+        return;
+      }
+
+      event.preventDefault();
+
+      if (event.shiftKey) {
+        startTransition(() => {
+          void redoPlannerActionAction(sessionId)
+            .then((snapshot) => setState(snapshot))
+            .catch((error) => {
+              window.alert(getErrorMessage(error));
+            });
+        });
+        return;
+      }
+
+      startTransition(() => {
+        void undoPlannerActionAction(sessionId)
+          .then((snapshot) => setState(snapshot))
+          .catch((error) => {
+            window.alert(getErrorMessage(error));
+          });
+      });
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [sessionId]);
+
+  const runMutation = (mutator: (session: string) => Promise<PlannerState>) => {
+    if (!sessionId) {
+      return;
+    }
+
+    startTransition(() => {
+      void mutator(sessionId)
+        .then((snapshot) => {
+          setState(snapshot);
+        })
+        .catch((error) => {
+          window.alert(getErrorMessage(error));
+        });
+    });
+  };
+
+  const value: PlannerContextValue = {
+    state,
+    metrics: buildPlannerMetrics(state),
+    isPending,
+    upsertProject(values, projectId) {
+      runMutation((session) => saveProjectAction(session, values, projectId));
+    },
+    placeProject(projectId, placement, options) {
+      runMutation((session) =>
+        placeProjectAction(session, projectId, placement, options)
+      );
+    },
+    placeProjects(placements, options) {
+      runMutation((session) => placeProjectsAction(session, placements, options));
+    },
+    unscheduleProject(projectId) {
+      runMutation((session) => unscheduleProjectAction(session, projectId));
+    },
+    deleteProject(projectId, mode) {
+      runMutation((session) => deleteProjectAction(session, projectId, mode));
+    },
+    addClosure(values) {
+      runMutation((session) => createClosureAction(session, values));
+    },
+    removeClosure(closureId) {
+      runMutation((session) => deleteClosureAction(session, closureId));
+    },
+    createTeam(values) {
+      runMutation((session) => createTeamAction(session, values));
+    },
+    updateTeam(teamId, values) {
+      runMutation((session) => updateTeamAction(session, teamId, values));
+    },
+    deleteTeam(teamId) {
+      runMutation((session) => deleteTeamAction(session, teamId));
+    },
+    setHolidaySourceEnabled(sourceCode, enabled) {
+      runMutation((session) =>
+        setHolidaySourceEnabledAction(session, sourceCode, enabled)
+      );
+    },
+    undo() {
+      runMutation((session) => undoPlannerActionAction(session));
+    },
+    redo() {
+      runMutation((session) => redoPlannerActionAction(session));
+    },
+  };
 
   return <PlannerContext.Provider value={value}>{children}</PlannerContext.Provider>;
 }

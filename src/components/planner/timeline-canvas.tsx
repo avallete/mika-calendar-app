@@ -3,6 +3,7 @@
 import { useDraggable, useDroppable } from "@dnd-kit/core";
 import { CSS } from "@dnd-kit/utilities";
 import { addDays, eachDayOfInterval, endOfMonth, format, parseISO, startOfMonth } from "date-fns";
+import { fr as localeFr } from "date-fns/locale";
 import {
   ArrowRightLeft,
   CalendarClock,
@@ -31,6 +32,7 @@ import {
   makeSlotKey,
   parseSlotKey,
 } from "@/lib/planner/calendar";
+import { fr } from "@/lib/i18n/fr";
 import type {
   CalendarBucket,
   ClosurePeriod,
@@ -39,10 +41,11 @@ import type {
   ProjectPlacement,
   QuickPlacementState,
   SlotKey,
+  Team,
   TeamId,
   YearMonthSection,
 } from "@/lib/planner/types";
-import { isScheduledProject, teamOptions } from "@/lib/planner/types";
+import { getSortedTeams, getTeamById, isScheduledProject } from "@/lib/planner/types";
 import { cn } from "@/lib/utils";
 
 function makeBucketId(teamId: TeamId, startSlot: SlotKey) {
@@ -75,7 +78,7 @@ function buildYearSections(anchorYear: number): YearMonthSection[] {
 
     return {
       id: `${anchorYear}-${String(index + 1).padStart(2, "0")}`,
-      label: format(monthStart, "MMMM yyyy"),
+      label: format(monthStart, "MMMM yyyy", { locale: localeFr }),
       startDate: format(monthStart, "yyyy-MM-dd"),
       endDate: format(monthEnd, "yyyy-MM-dd"),
       dayCount: monthEnd.getDate(),
@@ -124,6 +127,7 @@ function ScheduledProjectCard({
   left,
   width,
   dependencyCount,
+  team,
   selected,
   onSelect,
   onPointerDown,
@@ -137,6 +141,7 @@ function ScheduledProjectCard({
   left: string;
   width: string;
   dependencyCount: number;
+  team: Team | null;
   selected: boolean;
   onSelect: (projectId: string, shiftKey: boolean) => void;
   onPointerDown: (projectId: string, shiftKey: boolean) => void;
@@ -197,9 +202,6 @@ function ScheduledProjectCard({
       ref={setMoveNodeRef}
       className={cn(
         "absolute top-3 h-[92px] rounded-2xl border border-black/10 shadow-[0_18px_36px_-24px_rgba(0,0,0,0.42)] transition-shadow",
-        project.scheduledTeam === "team-a"
-          ? "bg-[linear-gradient(150deg,rgba(41,123,138,0.18),rgba(255,255,255,0.96))]"
-          : "bg-[linear-gradient(150deg,rgba(203,129,53,0.18),rgba(255,255,255,0.96))]",
         selected && "border-primary/60 ring-2 ring-primary/35",
         isDragging && "opacity-40 shadow-lg"
       )}
@@ -207,6 +209,7 @@ function ScheduledProjectCard({
         left,
         width,
         transform: CSS.Translate.toString(moveTransform),
+        background: `linear-gradient(150deg, ${team?.softColor ?? "rgba(255,255,255,0.96)"}, rgba(255,255,255,0.96))`,
       }}
     >
       <button
@@ -221,7 +224,7 @@ function ScheduledProjectCard({
           <div>
             <p className="line-clamp-1 text-sm font-semibold text-foreground">{project.title}</p>
             <p className="mt-1 text-xs text-muted-foreground">
-              {project.scheduledDurationHalfDays / 2} days
+              {project.scheduledDurationHalfDays / 2} {fr.schedule.daysSuffix}
             </p>
           </div>
           <GripVertical className="size-4 shrink-0 text-muted-foreground" />
@@ -236,11 +239,11 @@ function ScheduledProjectCard({
           ) : null}
           <Badge variant="secondary" className="rounded-full">
             <MoveHorizontal className="size-3" />
-            Move
+            {fr.schedule.move}
           </Badge>
           {selected ? (
             <Badge variant="outline" className="rounded-full bg-background/70">
-              Selected
+              {fr.schedule.selected}
             </Badge>
           ) : null}
         </div>
@@ -250,7 +253,7 @@ function ScheduledProjectCard({
         ref={setResizeStartNodeRef}
         type="button"
         className="absolute inset-y-2 left-1 z-10 flex w-3 cursor-ew-resize items-center justify-center rounded-full bg-background/75 text-muted-foreground shadow-sm"
-        aria-label={`Resize start for ${project.title}`}
+        aria-label={`Redimensionner le debut de ${project.title}`}
         onClick={(event) => event.stopPropagation()}
         {...resizeStartAttributes}
         {...resizeStartListeners}
@@ -262,7 +265,7 @@ function ScheduledProjectCard({
         ref={setResizeEndNodeRef}
         type="button"
         className="absolute inset-y-2 right-1 z-10 flex w-3 cursor-ew-resize items-center justify-center rounded-full bg-background/75 text-muted-foreground shadow-sm"
-        aria-label={`Resize end for ${project.title}`}
+        aria-label={`Redimensionner la fin de ${project.title}`}
         onClick={(event) => event.stopPropagation()}
         {...resizeEndAttributes}
         {...resizeEndListeners}
@@ -300,7 +303,7 @@ function YearBucketCell({
         <button
           ref={setNodeRef}
           type="button"
-          aria-label={`Place project on ${date}`}
+          aria-label={`Placer un projet le ${date}`}
           className={cn(
             "absolute inset-y-0 border-r border-border/40 transition-colors last:border-r-0",
             isNonWorkingDate(date, closures) &&
@@ -321,10 +324,12 @@ function YearBucketCell({
 
 function QuickPlacementForm({
   pendingPlacement,
+  teams,
   onCommit,
   onCancel,
 }: {
   pendingPlacement: QuickPlacementState;
+  teams: Team[];
   onCommit: (projectId: string, placement: ProjectPlacement) => void;
   onCancel: () => void;
 }) {
@@ -339,30 +344,30 @@ function QuickPlacementForm({
   return (
     <div className="space-y-4">
       <PopoverHeader>
-        <PopoverTitle>Place {pendingPlacement.title}</PopoverTitle>
-        <PopoverDescription>
-          Confirm the drop target before scheduling this draft.
-        </PopoverDescription>
+        <PopoverTitle>
+          {fr.schedule.placeProject} : {pendingPlacement.title}
+        </PopoverTitle>
+        <PopoverDescription>{fr.schedule.confirmDrop}</PopoverDescription>
       </PopoverHeader>
 
       <div className="flex flex-wrap gap-2">
         <Badge variant="secondary">
           <CalendarClock className="size-3.5" />
-          {pendingPlacement.placement.teamId === "team-a" ? "Team A" : "Team B"}
+          {getTeamById(teams, pendingPlacement.placement.teamId)?.nameFr ?? "Equipe"}
         </Badge>
       </div>
 
       <div className="space-y-3">
         <div className="space-y-2">
           <p className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">
-            Start date
+            {fr.schedule.startDate}
           </p>
           <Input type="date" value={date} onChange={(event) => setDate(event.target.value)} />
         </div>
 
         <div className="space-y-2">
           <p className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">
-            Slot
+            {fr.schedule.slot}
           </p>
           <div className="flex rounded-xl border border-border bg-card p-1">
             {(["AM", "PM"] as const).map((value) => (
@@ -385,7 +390,7 @@ function QuickPlacementForm({
 
         <div className="space-y-2">
           <p className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">
-            Duration (half-days)
+            {fr.schedule.duration}
           </p>
           <Input
             min={1}
@@ -401,7 +406,7 @@ function QuickPlacementForm({
 
       <div className="flex gap-2">
         <Button variant="outline" className="flex-1" onClick={onCancel}>
-          Cancel
+          {fr.schedule.cancel}
         </Button>
         <Button
           className="flex-1"
@@ -413,7 +418,7 @@ function QuickPlacementForm({
             })
           }
         >
-          Place project
+          {fr.schedule.placeProject}
         </Button>
       </div>
     </div>
@@ -428,6 +433,7 @@ function YearMonthRow({
   dependencies,
   pendingPlacement,
   selectedProjectIds,
+  teams,
   onSelectProject,
   onProjectPointerDown,
 }: {
@@ -442,9 +448,11 @@ function YearMonthRow({
   dependencies: ProjectDependency[];
   pendingPlacement: QuickPlacementState | null;
   selectedProjectIds: string[];
+  teams: Team[];
   onSelectProject: (projectId: string, shiftKey: boolean) => void;
   onProjectPointerDown: (projectId: string, shiftKey: boolean) => void;
 }) {
+  const team = getTeamById(teams, teamId);
   const days = eachDayOfInterval({
     start: parseISO(section.startDate),
     end: parseISO(section.endDate),
@@ -454,17 +462,13 @@ function YearMonthRow({
     <div className="space-y-2">
       <div className="flex items-center justify-between">
         <p className="text-sm font-medium text-foreground">
-          {teamId === "team-a" ? "Team A" : "Team B"}
+          {team?.nameFr ?? "Equipe"}
         </p>
         <Badge
-          className={cn(
-            "rounded-full border-0 px-3 py-1 text-xs",
-            teamId === "team-a"
-              ? "bg-[var(--team-a-soft)] text-foreground"
-              : "bg-[var(--team-b-soft)] text-foreground"
-          )}
+          className="rounded-full border-0 px-3 py-1 text-xs text-foreground"
+          style={{ background: team?.softColor ?? "rgba(255,255,255,0.8)" }}
         >
-          {projects.length} scheduled
+          {projects.length} {fr.schedule.scheduledCountSuffix}
         </Badge>
       </div>
 
@@ -529,6 +533,7 @@ function YearMonthRow({
                 left={`${(bounds.startOffset / section.dayCount) * 100}%`}
                 width={`${(Math.max(bounds.endOffset - bounds.startOffset, 0.9) / section.dayCount) * 100}%`}
                 dependencyCount={dependencyCount}
+                team={team}
                 selected={selectedProjectIds.includes(project.id)}
                 onSelect={onSelectProject}
                 onPointerDown={onProjectPointerDown}
@@ -547,6 +552,7 @@ function YearView({
   closures,
   pendingPlacement,
   selectedProjectIds,
+  teams,
   onSelectProject,
   onProjectPointerDown,
 }: {
@@ -555,6 +561,7 @@ function YearView({
   closures: ClosurePeriod[];
   pendingPlacement: QuickPlacementState | null;
   selectedProjectIds: string[];
+  teams: Team[];
   onSelectProject: (projectId: string, shiftKey: boolean) => void;
   onProjectPointerDown: (projectId: string, shiftKey: boolean) => void;
 }) {
@@ -574,19 +581,19 @@ function YearView({
           <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
             <div>
               <p className="text-xs font-semibold uppercase tracking-[0.22em] text-muted-foreground">
-                Year overview
+                {fr.schedule.yearOverview}
               </p>
               <h3 className="mt-1 font-heading text-xl font-semibold text-foreground">
                 {section.label}
               </h3>
             </div>
             <Badge variant="outline" className="rounded-full px-3 py-1 text-xs">
-              {section.dayCount} days
+              {section.dayCount} {fr.schedule.daysSuffix}
             </Badge>
           </div>
 
           <div className="mt-4 space-y-4">
-            {teamOptions.map((team) => (
+            {getSortedTeams(teams).map((team) => (
               <YearMonthRow
                 key={`${section.id}-${team.id}`}
                 teamId={team.id}
@@ -596,6 +603,7 @@ function YearView({
                 dependencies={dependencies}
                 pendingPlacement={pendingPlacement}
                 selectedProjectIds={selectedProjectIds}
+                teams={teams}
                 onSelectProject={onSelectProject}
                 onProjectPointerDown={onProjectPointerDown}
               />
@@ -614,6 +622,7 @@ export function TimelineCanvas({
   pendingPlacement,
   selectedProjectIds,
   traceEnabled,
+  teams,
   onTraceEnabledChange,
   onPendingPlacementChange,
   onQuickPlacementCommit,
@@ -626,6 +635,7 @@ export function TimelineCanvas({
   pendingPlacement: QuickPlacementState | null;
   selectedProjectIds: string[];
   traceEnabled: boolean;
+  teams: Team[];
   onTraceEnabledChange: (enabled: boolean) => void;
   onPendingPlacementChange: (placement: QuickPlacementState | null) => void;
   onQuickPlacementCommit: (projectId: string, placement: ProjectPlacement) => void;
@@ -647,26 +657,26 @@ export function TimelineCanvas({
           <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
             <div>
               <p className="text-xs font-semibold uppercase tracking-[0.24em] text-muted-foreground">
-                Scheduler canvas
+                {fr.schedule.canvasEyebrow}
               </p>
               <h2 className="mt-1 font-heading text-2xl font-semibold text-foreground">
-                Year view with direct move and resize controls
+                {fr.schedule.canvasTitle}
               </h2>
               <p className="mt-2 text-sm text-muted-foreground">
-                Hold Shift on a touching chain to move the full block together.
+                {fr.schedule.canvasHint}
               </p>
             </div>
 
             <div className="flex flex-wrap items-center gap-2">
               <Badge variant="outline" className="rounded-full px-3 py-1.5 text-xs">
-                Year only
+                {fr.schedule.yearOnly}
               </Badge>
               <Button
                 size="sm"
                 variant={traceEnabled ? "default" : "outline"}
                 onClick={() => onTraceEnabledChange(!traceEnabled)}
               >
-                {traceEnabled ? "Trace on" : "Trace off"}
+                {traceEnabled ? fr.schedule.traceOn : fr.schedule.traceOff}
               </Button>
             </div>
           </div>
@@ -677,6 +687,7 @@ export function TimelineCanvas({
             closures={closures}
             pendingPlacement={pendingPlacement}
             selectedProjectIds={selectedProjectIds}
+            teams={teams}
             onSelectProject={onSelectProject}
             onProjectPointerDown={onProjectPointerDown}
           />
@@ -688,6 +699,7 @@ export function TimelineCanvas({
           <QuickPlacementForm
             key={pendingPlacement.triggerId}
             pendingPlacement={pendingPlacement}
+            teams={teams}
             onCancel={() => onPendingPlacementChange(null)}
             onCommit={onQuickPlacementCommit}
           />

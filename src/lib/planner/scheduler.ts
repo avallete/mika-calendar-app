@@ -22,9 +22,10 @@ import {
   type ProjectPlacementOptions,
   type ScheduledDragIntent,
   type SlotKey,
+  type Team,
   type TeamId,
+  getSortedTeams,
   isScheduledProject,
-  teamOptions,
 } from "@/lib/planner/types";
 
 type ScheduledComputation = ReturnType<typeof advanceWorkingDuration>;
@@ -99,9 +100,9 @@ function finishSchedulerTrace(trace: SchedulerTrace | null) {
   console.groupEnd();
 }
 
-function summarizeTeamQueues(projects: Project[]) {
+function summarizeTeamQueues(projects: Project[], teams: Team[]) {
   return Object.fromEntries(
-    teamOptions.map((team) => [
+    getSortedTeams(teams).map((team) => [
       team.id,
       sortScheduledProjects(projects, team.id).map((project) => ({
         id: project.id,
@@ -569,11 +570,12 @@ export function setSchedulerTraceEnabled(enabled: boolean) {
 export function normalizeSequenceOrders(
   projects: Project[],
   dependencies: ProjectDependency[],
+  teams: Team[],
   trace?: SchedulerTrace | null
 ) {
   const nextProjects = [...projects];
 
-  for (const team of teamOptions) {
+  for (const team of getSortedTeams(teams)) {
     const { requestedOrder, enforcedOrder } = buildDependencySafeTeamOrder(
       nextProjects,
       dependencies,
@@ -622,17 +624,18 @@ export function rescheduleProjects(
       ...project,
     })),
     state.dependencies,
+    state.teams,
     trace
   );
   const computations = new Map<string, ScheduledComputation>();
 
-  traceLog(trace, "queues.before", summarizeTeamQueues(previousProjects));
+  traceLog(trace, "queues.before", summarizeTeamQueues(previousProjects, state.teams));
 
   let stabilized = false;
   for (let iteration = 0; iteration < MAX_ITERATIONS; iteration += 1) {
     let changed = false;
 
-    for (const team of teamOptions) {
+    for (const team of getSortedTeams(state.teams)) {
       const teamProjects = sortScheduledProjects(nextProjects, team.id);
       let previousReadySlot: SlotKey | null = null;
 
@@ -698,7 +701,7 @@ export function rescheduleProjects(
   if (!stabilized) {
     traceLog(trace, "reschedule.unstable", {
       maxIterations: MAX_ITERATIONS,
-      queues: summarizeTeamQueues(nextProjects),
+      queues: summarizeTeamQueues(nextProjects, state.teams),
     });
   }
 
@@ -707,7 +710,7 @@ export function rescheduleProjects(
     projects: nextProjects,
   };
 
-  traceLog(trace, "queues.after", summarizeTeamQueues(nextProjects));
+  traceLog(trace, "queues.after", summarizeTeamQueues(nextProjects, state.teams));
   traceLog(trace, "changes", listScheduledChanges(previousProjects, nextProjects));
 
   if (ownsTrace) {
@@ -815,7 +818,7 @@ export function updateProjectPlacements(
     }
   );
 
-  traceLog(trace, "queues.before", summarizeTeamQueues(state.projects));
+  traceLog(trace, "queues.before", summarizeTeamQueues(state.projects, state.teams));
 
   const insertedProjects = applyPlacementRequests(state.projects, normalizedRequests);
   const nextProjects =

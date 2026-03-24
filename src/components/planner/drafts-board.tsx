@@ -19,18 +19,23 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { Textarea } from "@/components/ui/textarea";
-import type { ProjectEditorState } from "@/lib/planner/types";
-import { teamOptions } from "@/lib/planner/types";
+import { fr } from "@/lib/i18n/fr";
+import type { ProjectEditorState, Team } from "@/lib/planner/types";
+import { getSortedTeams, getTeamById } from "@/lib/planner/types";
 import { cn } from "@/lib/utils";
 
-const emptyForm: ProjectEditorState = {
-  title: "",
-  plannedTeam: "team-a",
-  estimatedDurationHalfDays: 2,
-  targetDateHint: "",
-  notes: "",
-  dependencyIds: [],
-};
+function createEmptyForm(teams: Team[]): ProjectEditorState {
+  const firstTeam = getSortedTeams(teams)[0];
+
+  return {
+    title: "",
+    plannedTeam: firstTeam?.id ?? "",
+    estimatedDurationHalfDays: 2,
+    targetDateHint: "",
+    notes: "",
+    dependencyIds: [],
+  };
+}
 
 export function DraftsBoard() {
   const { state, upsertProject, deleteProject } = usePlanner();
@@ -48,10 +53,10 @@ export function DraftsBoard() {
           <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
             <div>
               <p className="text-xs font-semibold uppercase tracking-[0.22em] text-muted-foreground">
-                Draft input view
+                {fr.draftsBoard.tableEyebrow}
               </p>
               <CardTitle className="mt-1 font-heading text-2xl">
-                Unscheduled projects waiting for a slot
+                {fr.draftsBoard.tableTitle}
               </CardTitle>
             </div>
             <Button
@@ -61,7 +66,7 @@ export function DraftsBoard() {
               }}
             >
               <Plus className="size-4" />
-              New draft
+              {fr.draftsBoard.newDraft}
             </Button>
           </div>
         </CardHeader>
@@ -70,11 +75,11 @@ export function DraftsBoard() {
           <Table>
             <TableHeader>
               <TableRow>
-                <TableHead>Project</TableHead>
-                <TableHead>Team</TableHead>
-                <TableHead>Duration</TableHead>
-                <TableHead>Target</TableHead>
-                <TableHead>Dependencies</TableHead>
+                <TableHead>{fr.draftsBoard.columns.project}</TableHead>
+                <TableHead>{fr.draftsBoard.columns.team}</TableHead>
+                <TableHead>{fr.draftsBoard.columns.duration}</TableHead>
+                <TableHead>{fr.draftsBoard.columns.target}</TableHead>
+                <TableHead>{fr.draftsBoard.columns.dependencies}</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -82,6 +87,7 @@ export function DraftsBoard() {
                 const dependencyCount = state.dependencies.filter(
                   (dependency) => dependency.successorProjectId === project.id
                 ).length;
+                const team = getTeamById(state.teams, project.plannedTeam);
 
                 return (
                   <TableRow
@@ -96,17 +102,15 @@ export function DraftsBoard() {
                       <div>
                         <p className="font-medium text-foreground">{project.title}</p>
                         <p className="text-xs text-muted-foreground">
-                          {project.notes || "Draft ready for scheduling"}
+                          {project.notes || fr.draftsBoard.readyForScheduling}
                         </p>
                       </div>
                     </TableCell>
                     <TableCell>
-                      <Badge variant="outline">
-                        {project.plannedTeam === "team-a" ? "Team A" : "Team B"}
-                      </Badge>
+                      <Badge variant="outline">{team?.nameFr ?? "Equipe"}</Badge>
                     </TableCell>
-                    <TableCell>{project.estimatedDurationHalfDays / 2} days</TableCell>
-                    <TableCell>{project.targetDateHint || "No hint"}</TableCell>
+                    <TableCell>{project.estimatedDurationHalfDays / 2} j</TableCell>
+                    <TableCell>{project.targetDateHint || fr.draftsBoard.noHint}</TableCell>
                     <TableCell>{dependencyCount}</TableCell>
                   </TableRow>
                 );
@@ -127,30 +131,27 @@ export function DraftsBoard() {
               return;
             }
 
-            if (window.confirm("Delete this draft permanently?")) {
+            if (window.confirm(fr.draftsBoard.deleteConfirm)) {
               deleteProject(selectedProjectId);
               setSelectedProjectId(null);
             }
           }}
-          allProjects={state.projects}
-          dependencies={state.dependencies}
         />
 
         <Card className="border-border/60 bg-[linear-gradient(145deg,rgba(255,255,255,0.9),rgba(240,234,226,0.92))] shadow-[0_24px_52px_-42px_rgba(18,25,38,0.55)]">
           <CardContent className="space-y-3 p-4">
             <div className="flex items-center gap-2 text-sm font-medium text-foreground">
-              <Rows3 className="size-4 text-[var(--team-a)]" />
-              Drafts stay visible in the scheduler sidebar
+              <Rows3 className="size-4 text-[oklch(0.58_0.11_205)]" />
+              {fr.draftsBoard.sideTitle}
             </div>
             <p className="text-sm leading-6 text-muted-foreground">
-              This list is the planning inbox. Once a draft is dragged onto the schedule,
-              the same project record becomes scheduled and inherits dependency logic.
+              {fr.draftsBoard.sideDescription}
             </p>
             <Link
               href="/"
               className="inline-flex w-full items-center justify-between rounded-lg border border-border bg-background px-3 py-2 text-sm font-medium transition-colors hover:bg-muted"
             >
-              Open scheduler
+              {fr.draftsBoard.openScheduler}
               <ArrowRight className="size-4" />
             </Link>
           </CardContent>
@@ -163,21 +164,19 @@ export function DraftsBoard() {
 function DraftEditorPanel({
   selectedProjectId,
   selectedProject,
-  allProjects,
-  dependencies,
   onSave,
   onDelete,
 }: {
   selectedProjectId: string | null;
-  selectedProject: (typeof allProjects)[number] | null;
-  allProjects: ReturnType<typeof usePlanner>["state"]["projects"];
-  dependencies: ReturnType<typeof usePlanner>["state"]["dependencies"];
+  selectedProject: ReturnType<typeof usePlanner>["state"]["projects"][number] | null;
   onSave: (values: ProjectEditorState) => void;
   onDelete: () => void;
 }) {
+  const { state } = usePlanner();
+  const sortedTeams = getSortedTeams(state.teams);
   const [form, setForm] = useState<ProjectEditorState>(() => {
     if (!selectedProject) {
-      return emptyForm;
+      return createEmptyForm(state.teams);
     }
 
     return {
@@ -186,7 +185,7 @@ function DraftEditorPanel({
       estimatedDurationHalfDays: selectedProject.estimatedDurationHalfDays,
       targetDateHint: selectedProject.targetDateHint ?? "",
       notes: selectedProject.notes ?? "",
-      dependencyIds: dependencies
+      dependencyIds: state.dependencies
         .filter((dependency) => dependency.successorProjectId === selectedProject.id)
         .map((dependency) => dependency.predecessorProjectId),
     };
@@ -198,10 +197,10 @@ function DraftEditorPanel({
         <div className="flex items-center justify-between gap-4">
           <div>
             <p className="text-xs font-semibold uppercase tracking-[0.22em] text-muted-foreground">
-              Draft editor
+              {fr.draftsBoard.editorEyebrow}
             </p>
             <CardTitle className="mt-1 font-heading text-2xl">
-              {selectedProject ? "Edit selected draft" : "Create a new draft"}
+              {selectedProject ? fr.draftsBoard.editTitle : fr.draftsBoard.createTitle}
             </CardTitle>
           </div>
           <PenSquare className="size-5 text-muted-foreground" />
@@ -211,24 +210,24 @@ function DraftEditorPanel({
       <CardContent className="space-y-5 p-4">
         <div className="space-y-2">
           <p className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">
-            Title
+            {fr.draftsBoard.fields.title}
           </p>
           <Input
             value={form.title}
             onChange={(event) =>
               setForm((current) => ({ ...current, title: event.target.value }))
             }
-            placeholder="Launch toolkit"
+            placeholder="Lancement toolkit"
           />
         </div>
 
         <div className="grid gap-3 sm:grid-cols-2">
           <div className="space-y-2">
             <p className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">
-              Planned team
+              {fr.draftsBoard.fields.plannedTeam}
             </p>
             <div className="grid gap-2">
-              {teamOptions.map((team) => (
+              {sortedTeams.map((team) => (
                 <button
                   key={team.id}
                   type="button"
@@ -245,7 +244,7 @@ function DraftEditorPanel({
                     }))
                   }
                 >
-                  {team.label}
+                  {team.nameFr}
                 </button>
               ))}
             </div>
@@ -253,7 +252,7 @@ function DraftEditorPanel({
 
           <div className="space-y-2">
             <p className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">
-              Duration (half-days)
+              {fr.draftsBoard.fields.duration}
             </p>
             <Input
               min={1}
@@ -266,15 +265,13 @@ function DraftEditorPanel({
                 }))
               }
             />
-            <p className="text-xs text-muted-foreground">
-              The scheduler will use this as the default duration on drop.
-            </p>
+            <p className="text-xs text-muted-foreground">{fr.draftsBoard.durationHint}</p>
           </div>
         </div>
 
         <div className="space-y-2">
           <p className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">
-            Target date hint
+            {fr.draftsBoard.fields.targetDate}
           </p>
           <Input
             type="date"
@@ -287,7 +284,7 @@ function DraftEditorPanel({
 
         <div className="space-y-2">
           <p className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">
-            Notes
+            {fr.draftsBoard.fields.notes}
           </p>
           <Textarea
             rows={4}
@@ -300,11 +297,11 @@ function DraftEditorPanel({
 
         <div className="space-y-2">
           <p className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">
-            Dependencies
+            {fr.draftsBoard.fields.dependencies}
           </p>
           <ScrollArea className="h-44 rounded-2xl border border-border/60 bg-muted/20 p-3">
             <div className="flex flex-wrap gap-2">
-              {allProjects
+              {state.projects
                 .filter((project) => project.id !== selectedProjectId)
                 .map((project) => {
                   const active = form.dependencyIds.includes(project.id);
@@ -339,11 +336,11 @@ function DraftEditorPanel({
           {selectedProject ? (
             <Button variant="destructive" className="sm:flex-1" onClick={onDelete}>
               <Trash2 className="size-4" />
-              Delete draft
+              {fr.draftsBoard.delete}
             </Button>
           ) : null}
           <Button className="sm:flex-1" onClick={() => onSave(form)}>
-            Save draft
+            {fr.draftsBoard.save}
           </Button>
         </div>
       </CardContent>

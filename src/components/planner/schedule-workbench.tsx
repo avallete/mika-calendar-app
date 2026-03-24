@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { addDays, format, parseISO } from "date-fns";
 import {
   DndContext,
@@ -13,16 +14,15 @@ import {
   type DragStartEvent,
 } from "@dnd-kit/core";
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
-import { CalendarPlus2, Sparkles, X } from "lucide-react";
+import { Settings2, Sparkles } from "lucide-react";
 
-import { ClosureSheet } from "@/components/planner/closure-sheet";
 import { DraftSidebar } from "@/components/planner/draft-sidebar";
 import { MetricBar } from "@/components/planner/metric-bar";
 import { usePlanner } from "@/components/planner/planner-provider";
 import { ProjectEditorSheet } from "@/components/planner/project-editor-sheet";
 import { TimelineCanvas } from "@/components/planner/timeline-canvas";
 import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
+import { Button, buttonVariants } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import {
   Dialog,
@@ -33,6 +33,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Separator } from "@/components/ui/separator";
+import { fr } from "@/lib/i18n/fr";
 import {
   SidebarInset,
   SidebarProvider,
@@ -300,15 +301,15 @@ function getDragLabel(activeDrag: DragProjectMeta | null) {
   }
 
   if (activeDrag.intent === "resize-start") {
-    return `Resize start: ${activeDrag.title}`;
+    return `Debut : ${activeDrag.title}`;
   }
 
   if (activeDrag.intent === "resize-end") {
-    return `Resize end: ${activeDrag.title}`;
+    return `Fin : ${activeDrag.title}`;
   }
 
   if (activeDrag.selectionProjectIds && activeDrag.selectionProjectIds.length > 1) {
-    return `${activeDrag.title} + ${activeDrag.selectionProjectIds.length - 1} more`;
+    return `${activeDrag.title} + ${activeDrag.selectionProjectIds.length - 1} autres`;
   }
 
   return activeDrag.title;
@@ -442,8 +443,6 @@ export function ScheduleWorkbench() {
     metrics,
     placeProject,
     placeProjects,
-    addClosure,
-    removeClosure,
     unscheduleProject,
     deleteProject,
   } = usePlanner();
@@ -454,7 +453,6 @@ export function ScheduleWorkbench() {
     useState<EarlierShiftPromptState | null>(null);
   const [pendingDependencyConflict, setPendingDependencyConflict] =
     useState<DependencyConflictPromptState | null>(null);
-  const [closureSheetOpen, setClosureSheetOpen] = useState(false);
   const [activeDrag, setActiveDrag] = useState<DragProjectMeta | null>(null);
   const handledDragIdRef = useRef<string | null>(null);
   const traceEnabled = useSyncExternalStore(
@@ -737,7 +735,11 @@ export function ScheduleWorkbench() {
           setActiveDrag(null);
         }}
       >
-        <DraftSidebar drafts={drafts} dependencies={state.dependencies} />
+        <DraftSidebar
+          drafts={drafts}
+          dependencies={state.dependencies}
+          teams={state.teams}
+        />
 
         <SidebarInset className="bg-transparent">
           <div className="flex flex-1 flex-col gap-5 px-4 py-5 sm:px-6">
@@ -746,28 +748,25 @@ export function ScheduleWorkbench() {
                 <div className="flex items-center gap-3">
                   <SidebarTrigger className="md:hidden" />
                   <p className="text-xs font-semibold uppercase tracking-[0.24em] text-muted-foreground">
-                    Scheduling cockpit
+                    {fr.schedule.eyebrow}
                   </p>
                 </div>
                 <h2 className="font-heading text-3xl font-semibold text-foreground">
-                  One stacked year view for the full delivery plan
+                  {fr.schedule.title}
                 </h2>
                 <p className="max-w-3xl text-sm leading-6 text-muted-foreground">
-                  Drag drafts into the year planner, resize live projects directly on the
-                  timeline, and use the trace toggle when weekend or dependency behavior
-                  needs debugging.
+                  {fr.schedule.description}
                 </p>
               </div>
 
               <Card className="border-border/60 bg-[linear-gradient(145deg,rgba(255,255,255,0.88),rgba(242,236,228,0.92))] shadow-[0_20px_44px_-30px_rgba(21,28,45,0.55)] xl:max-w-md">
                 <CardContent className="space-y-3 p-4">
                   <div className="flex items-center gap-2 text-sm font-medium text-foreground">
-                    <Sparkles className="size-4 text-[var(--team-b)]" />
-                    Year planner controls are live
+                    <Sparkles className="size-4 text-[oklch(0.68_0.13_55)]" />
+                    {fr.schedule.liveCardTitle}
                   </div>
                   <p className="text-sm leading-6 text-muted-foreground">
-                    Body drag moves, edge drag resizes, and same-team earlier shifts can
-                    optionally compact the queue behind the moved project.
+                    {fr.schedule.liveCardBody}
                   </p>
                 </CardContent>
               </Card>
@@ -779,16 +778,19 @@ export function ScheduleWorkbench() {
               <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
                 <div>
                   <p className="text-xs font-semibold uppercase tracking-[0.22em] text-muted-foreground">
-                    Company calendar
+                    {fr.schedule.calendarEyebrow}
                   </p>
                   <h3 className="mt-1 font-heading text-xl font-semibold text-foreground">
-                    Closures and holidays affecting every lane
+                    {fr.schedule.calendarTitle}
                   </h3>
                 </div>
-                <Button onClick={() => setClosureSheetOpen(true)}>
-                  <CalendarPlus2 className="size-4" />
-                  Add closure
-                </Button>
+                <Link
+                  href="/settings"
+                  className={buttonVariants({ variant: "default", size: "default" })}
+                >
+                  <Settings2 className="size-4" />
+                  {fr.schedule.manageCalendar}
+                </Link>
               </div>
 
               <Separator />
@@ -801,17 +803,14 @@ export function ScheduleWorkbench() {
                     className="gap-2 rounded-full px-3 py-1.5 text-sm"
                   >
                     {closure.title}
+                    <span className="rounded-full bg-muted px-2 py-0.5 text-[11px] uppercase tracking-[0.12em] text-muted-foreground">
+                      {closure.source === "fr-public-holiday"
+                        ? fr.schedule.sourceFrance
+                        : fr.schedule.sourceCustom}
+                    </span>
                     <span className="text-muted-foreground">
                       {closure.startDate} {"->"} {closure.endDate}
                     </span>
-                    <button
-                      type="button"
-                      className="rounded-full p-0.5 hover:bg-muted"
-                      onClick={() => removeClosure(closure.id)}
-                    >
-                      <X className="size-3" />
-                      <span className="sr-only">Remove closure</span>
-                    </button>
                   </Badge>
                 ))}
               </div>
@@ -824,6 +823,7 @@ export function ScheduleWorkbench() {
               pendingPlacement={pendingPlacement}
               selectedProjectIds={selectedProjectIds}
               traceEnabled={traceEnabled}
+              teams={state.teams}
               onTraceEnabledChange={updateTraceEnabled}
               onPendingPlacementChange={setPendingPlacement}
               onQuickPlacementCommit={(projectId, placement) => {
@@ -881,12 +881,6 @@ export function ScheduleWorkbench() {
               deleteProject(projectId, mode);
             }}
           />
-
-          <ClosureSheet
-            open={closureSheetOpen}
-            onOpenChange={setClosureSheetOpen}
-            onSave={addClosure}
-          />
         </SidebarInset>
 
         <DragOverlay>
@@ -908,10 +902,10 @@ export function ScheduleWorkbench() {
       >
         <DialogContent showCloseButton={false} className="max-w-lg">
           <DialogHeader>
-            <DialogTitle>Dependency conflict detected</DialogTitle>
+            <DialogTitle>{fr.schedule.dependencyConflictTitle}</DialogTitle>
             <DialogDescription>
               {pendingDependencyConflict
-                ? `${pendingDependencyConflict.primaryTitle} is being moved into a position that conflicts with current dependency links. You can keep those links and let the schedule stay dependency-safe, or break only the conflicting links and keep the dragged placement exactly.`
+                ? `${pendingDependencyConflict.primaryTitle} entre en conflit avec les dependances actuelles. Vous pouvez conserver les liens et laisser le moteur recalculer, ou casser uniquement les liens en conflit pour garder ce placement exact.`
                 : ""}
             </DialogDescription>
           </DialogHeader>
@@ -951,7 +945,7 @@ export function ScheduleWorkbench() {
                 setPendingDependencyConflict(null);
               }}
             >
-              Keep dependencies
+              {fr.schedule.keepDependencies}
             </Button>
             <Button
               onClick={() => {
@@ -976,7 +970,7 @@ export function ScheduleWorkbench() {
                 setPendingDependencyConflict(null);
               }}
             >
-              Break conflicting links
+              {fr.schedule.breakDependencies}
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -992,12 +986,13 @@ export function ScheduleWorkbench() {
       >
         <DialogContent showCloseButton={false} className="max-w-md">
           <DialogHeader>
-            <DialogTitle>Move later work earlier as well?</DialogTitle>
+            <DialogTitle>{fr.schedule.earlierShiftTitle}</DialogTitle>
             <DialogDescription>
               {pendingEarlierShift
-                ? `${pendingEarlierShift.title} is moving earlier on ${
-                    pendingEarlierShift.placement.teamId === "team-a" ? "Team A" : "Team B"
-                  }. The gap between ${pendingEarlierShift.previousStartSlot.slice(0, 10)} and the new start is empty, so the rest of that team queue can be compacted if you want.`
+                ? `${pendingEarlierShift.title} est avance sur ${
+                    state.teams.find((team) => team.id === pendingEarlierShift.placement.teamId)
+                      ?.nameFr ?? "l'equipe"
+                  }. L'intervalle entre ${pendingEarlierShift.previousStartSlot.slice(0, 10)} et la nouvelle date est libre, donc le reste de la file peut aussi etre compacte.`
                 : ""}
             </DialogDescription>
           </DialogHeader>
@@ -1016,7 +1011,7 @@ export function ScheduleWorkbench() {
                 setPendingEarlierShift(null);
               }}
             >
-              Keep only this project earlier
+              {fr.schedule.keepOnlyThisProject}
             </Button>
             <Button
               onClick={() => {
@@ -1031,7 +1026,7 @@ export function ScheduleWorkbench() {
                 setPendingEarlierShift(null);
               }}
             >
-              Pull same-team queue earlier
+              {fr.schedule.pullSameTeamEarlier}
             </Button>
           </DialogFooter>
         </DialogContent>

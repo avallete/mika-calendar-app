@@ -14,8 +14,52 @@ import {
 } from "@/lib/planner/scheduler";
 import type { PlannerState } from "@/lib/planner/types";
 
-function baseState(): PlannerState {
+const baseTeams = [
+  {
+    id: "team-a",
+    slug: "team-a",
+    nameFr: "Equipe A",
+    displayOrder: 0,
+    accentColor: "oklch(0.58 0.11 205)",
+    softColor: "oklch(0.95 0.03 205)",
+    isActive: true,
+  },
+  {
+    id: "team-b",
+    slug: "team-b",
+    nameFr: "Equipe B",
+    displayOrder: 1,
+    accentColor: "oklch(0.68 0.13 55)",
+    softColor: "oklch(0.96 0.04 55)",
+    isActive: true,
+  },
+] as const;
+
+const baseHolidaySources = [
+  {
+    id: "holiday-fr",
+    code: "FR",
+    labelFr: "Jours feries France",
+    enabled: true,
+  },
+] as const;
+
+function withPlannerShape(
+  state: Pick<PlannerState, "projects" | "dependencies" | "closures">
+): PlannerState {
   return {
+    teams: [...baseTeams],
+    holidaySources: [...baseHolidaySources],
+    history: {
+      canUndo: false,
+      canRedo: false,
+    },
+    ...state,
+  };
+}
+
+function baseState(): PlannerState {
+  return withPlannerShape({
     projects: [
       {
         id: "a-1",
@@ -60,7 +104,7 @@ function baseState(): PlannerState {
       },
     ],
     closures: [],
-  };
+  });
 }
 
 describe("scheduler", () => {
@@ -98,7 +142,7 @@ describe("scheduler", () => {
   });
 
   test("skips closure dates when recalculating project finishes", () => {
-    const nextState = rescheduleProjects({
+    const nextState = rescheduleProjects(withPlannerShape({
       ...baseState(),
       closures: [
         {
@@ -107,9 +151,11 @@ describe("scheduler", () => {
           type: "company_closure",
           startDate: "2026-03-25",
           endDate: "2026-03-26",
+          source: "custom",
+          editable: true,
         },
       ],
-    });
+    }));
 
     const downstream = nextState.projects.find((project) => project.id === "a-2");
     expect(downstream?.scheduledStartSlot).toBe(makeSlotKey("2026-03-27", "AM"));
@@ -325,7 +371,7 @@ describe("scheduler", () => {
   });
 
   test("detects dependency conflicts when a successor is dragged before its predecessor", () => {
-    const state: PlannerState = {
+    const state = withPlannerShape({
       projects: [
         {
           id: "build",
@@ -359,7 +405,7 @@ describe("scheduler", () => {
         },
       ],
       closures: [],
-    };
+    });
 
     const conflicts = detectDependencyConflicts(state, [
       {
@@ -376,7 +422,7 @@ describe("scheduler", () => {
   });
 
   test("breaking conflicting links keeps the dragged placement exact", () => {
-    const state: PlannerState = {
+    const state = withPlannerShape({
       projects: [
         {
           id: "build",
@@ -410,7 +456,7 @@ describe("scheduler", () => {
         },
       ],
       closures: [],
-    };
+    });
 
     const nextState = updateProjectPlacements(
       state,
@@ -438,7 +484,7 @@ describe("scheduler", () => {
   });
 
   test("preserving dependencies keeps a successor behind its predecessor without runaway drift", () => {
-    const state: PlannerState = {
+    const state = withPlannerShape({
       projects: [
         {
           id: "build",
@@ -472,7 +518,7 @@ describe("scheduler", () => {
         },
       ],
       closures: [],
-    };
+    });
 
     const nextState = updateProjectPlacements(state, [
       {
@@ -497,7 +543,7 @@ describe("scheduler", () => {
   });
 
   test("finds touching chains across a weekend gap with no working-time break", () => {
-    const state: PlannerState = {
+    const state = withPlannerShape({
       projects: [
         {
           id: "a-1",
@@ -535,7 +581,7 @@ describe("scheduler", () => {
       ],
       dependencies: [],
       closures: [],
-    };
+    });
 
     expect(getTouchingProjectChain(state, "a-1")).toEqual(["a-1", "a-2"]);
     expect(getTouchingProjectChain(state, "a-2")).toEqual(["a-1", "a-2"]);
