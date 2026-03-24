@@ -6,6 +6,8 @@ import Link from "next/link";
 import {
   DndContext,
   DragOverlay,
+  type CollisionDetection,
+  type DragMoveEvent,
   type DragOverEvent,
   KeyboardSensor,
   PointerSensor,
@@ -15,7 +17,7 @@ import {
   type DragEndEvent,
   type DragStartEvent,
 } from "@dnd-kit/core";
-import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ChevronDown, ChevronUp, Settings2, Sparkles } from "lucide-react";
 
 import { DraftSidebar } from "@/components/planner/draft-sidebar";
@@ -56,6 +58,8 @@ import {
   buildScheduledPlacement,
   normalizePlacementRequest,
 } from "@/lib/planner/drag-placements";
+import { buildCalendarBucketFromRowSurfacePointer } from "@/lib/planner/timeline-hover";
+import { buildTimelinePreviewDelta } from "@/lib/planner/timeline-preview";
 import {
   buildFranceHolidayStripSummary,
   getNextCustomClosureOccurrence,
@@ -83,34 +87,18 @@ import type {
   QuickPlacementState,
   SlotKey,
 } from "@/lib/planner/types";
-import { isScheduledProject } from "@/lib/planner/types";
+import {
+  isCalendarBucket,
+  isCalendarRowSurface,
+  isScheduledProject,
+} from "@/lib/planner/types";
+import {
+  arePlannerViewportPreferencesEqual,
+  readPlannerViewportPreferencesFromLocalStorage,
+  type PlannerViewportPreferences,
+  writePlannerViewportPreferences,
+} from "@/lib/planner/viewport-preferences";
 import { cn } from "@/lib/utils";
-
-const TRACE_STORAGE_KEY = "planner-trace-enabled";
-const TRACE_STORAGE_EVENT = "planner-trace-storage";
-
-function subscribeToTracePreference(callback: () => void) {
-  if (typeof window === "undefined") {
-    return () => {};
-  }
-
-  const handleChange = () => callback();
-  window.addEventListener("storage", handleChange);
-  window.addEventListener(TRACE_STORAGE_EVENT, handleChange);
-
-  return () => {
-    window.removeEventListener("storage", handleChange);
-    window.removeEventListener(TRACE_STORAGE_EVENT, handleChange);
-  };
-}
-
-function getTracePreferenceSnapshot() {
-  if (typeof window === "undefined") {
-    return false;
-  }
-
-  return window.localStorage.getItem(TRACE_STORAGE_KEY) === "true";
-}
 
 function stringifyTracePayload(payload: unknown) {
   try {
@@ -247,28 +235,25 @@ function asDisplayClosure(closure: CustomClosure): ClosurePeriod {
   };
 }
 
-function summarizePreviewChanges(currentProjects: Project[], previewProjects: Project[]) {
-  const currentById = new Map(currentProjects.map((project) => [project.id, project] as const));
+function extractHoveredBucket(
+  event: Pick<DragMoveEvent | DragOverEvent | DragEndEvent, "collisions" | "over">
+) {
+  for (const collision of event.collisions ?? []) {
+    const bucket = collision.data?.bucket;
+    if (isCalendarBucket(bucket)) {
+      return bucket;
+    }
+  }
 
-  return previewProjects
-    .filter(isScheduledProject)
-    .filter((project) => {
-      const current = currentById.get(project.id);
-      if (!current || !isScheduledProject(current)) {
-        return true;
-      }
-
-      return (
-        current.scheduledTeam !== project.scheduledTeam ||
-        current.scheduledStartSlot !== project.scheduledStartSlot ||
-        current.scheduledDurationHalfDays !== project.scheduledDurationHalfDays ||
-        current.sequenceOrder !== project.sequenceOrder
-      );
-    })
-    .map((project) => project.id);
+  const overData = event.over?.data.current;
+  return isCalendarBucket(overData) ? overData : null;
 }
 
-export function ScheduleWorkbench() {
+export function ScheduleWorkbench({
+  initialViewportPreferences,
+}: {
+  initialViewportPreferences: PlannerViewportPreferences;
+}) {
   const {
     state,
     metrics,
@@ -285,12 +270,13 @@ export function ScheduleWorkbench() {
   const [pendingDependencyConflict, setPendingDependencyConflict] =
     useState<DependencyConflictPromptState | null>(null);
   const [activeDrag, setActiveDrag] = useState<DragProjectMeta | null>(null);
-  const [hoveredBucketId, setHoveredBucketId] = useState<string | null>(null);
   const [hoveredBucket, setHoveredBucket] = useState<CalendarBucket | null>(null);
-  const [isHolidayListExpanded, setHolidayListExpanded] = useState(false);
-  const [timelineActiveDate, setTimelineActiveDate] = useState<string>(() =>
-    getTodayDateString()
-  );
+  const [viewportPreferences, setViewportPreferences] =
+    useState<PlannerViewportPreferences>(() =>
+      readPlannerViewportPreferencesFromLocalStorage(initialViewportPreferences)
+    );
+  const timelineActiveDate = viewportPreferences.activeDate;
+  const traceEnabled = viewportPreferences.traceEnabled;
   const [calendarFocus, setCalendarFocus] = useState<{
     id: string;
     startDate: string;
@@ -298,69 +284,32 @@ export function ScheduleWorkbench() {
   } | null>(null);
   const handledDragIdRef = useRef<string | null>(null);
   const hoveredBucketIdRef = useRef<string | null>(null);
+  const hoveredBucketRef = useRef<CalendarBucket | null>(null);
   const dragSessionRef = useRef<{ dragId: string; startedAt: number } | null>(null);
   const previewTraceRef = useRef<{ bucketId: string | null; startedAt: number } | null>(null);
-  const traceEnabled = useSyncExternalStore(
-    subscribeToTracePreference,
-    getTracePreferenceSnapshot,
-    () => false
-  );
   const todayDate = useMemo(() => getTodayDateString(), []);
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
     useSensor(KeyboardSensor)
-  );
-
-  const drafts = useMemo(
-    () => state.projects.filter((project) => project.status === "draft"),
-    [state.projects]
-  );
-  const selectedProject = useMemo(
-    () => state.projects.find((project) => project.id === selectedProjectId) ?? null,
-    [selectedProjectId, state.projects]
-  );
-  const franceHolidayStripSummary = useMemo(
-    () =>
-      buildFranceHolidayStripSummary({
-        holidaySources: state.holidaySources,
-        closures: state.closures,
-        todayDate,
-      }),
-    [state.closures, state.holidaySources, todayDate]
-  );
-  const holidayListExpanded = Boolean(
-    franceHolidayStripSummary && isHolidayListExpanded
-  );
-  const visibleCustomClosures = useMemo(
-    () =>
-      state.customClosures.filter((closure) =>
-        shouldShowCustomClosureInStrip({
-          closure,
-          closures: state.closures,
-          todayDate,
-        })
-      ),
-    [state.closures, state.customClosures, todayDate]
   );
   const previewState = useMemo(() => {
     if (!activeDrag || !hoveredBucket) {
       return null;
     }
 
-    if (activeDrag.type === "draft") {
-      const preview = updateProjectPlacement(state, activeDrag.projectId, {
-        teamId: hoveredBucket.teamId,
-        startSlot: hoveredBucket.startSlot,
-        durationHalfDays: activeDrag.durationHalfDays,
+    const toPreviewState = (previewProjects: Project[], primaryProjectId: string) => {
+      const previewDelta = buildTimelinePreviewDelta({
+        currentProjects: state.projects,
+        previewProjects,
+        closures: state.closures,
+        primaryProjectId,
       });
 
       return {
-        projects: preview.projects,
-        changedProjectIds: summarizePreviewChanges(state.projects, preview.projects),
-        primaryProjectId: activeDrag.projectId,
+        previewDelta,
         traceSummary: {
           dragType: activeDrag.type,
-          intent: "draft",
+          intent: activeDrag.type === "draft" ? "draft" : activeDrag.intent,
           hoveredBucketId: hoveredBucket.bucketId,
           hoveredStartSlot: hoveredBucket.startSlot,
           normalizedStartSlot: normalizeToWorkingSlot(
@@ -369,6 +318,16 @@ export function ScheduleWorkbench() {
           ),
         },
       };
+    };
+
+    if (activeDrag.type === "draft") {
+      const preview = updateProjectPlacement(state, activeDrag.projectId, {
+        teamId: hoveredBucket.teamId,
+        startSlot: hoveredBucket.startSlot,
+        durationHalfDays: activeDrag.durationHalfDays,
+      });
+
+      return toPreviewState(preview.projects, activeDrag.projectId);
     }
 
     const activeSelectionProjectIds =
@@ -400,21 +359,7 @@ export function ScheduleWorkbench() {
         dependencyResolution: "preserve-dependencies",
       });
 
-      return {
-        projects: preview.projects,
-        changedProjectIds: summarizePreviewChanges(state.projects, preview.projects),
-        primaryProjectId: activeDrag.projectId,
-        traceSummary: {
-          dragType: activeDrag.type,
-          intent: activeDrag.intent,
-          hoveredBucketId: hoveredBucket.bucketId,
-          hoveredStartSlot: hoveredBucket.startSlot,
-          normalizedStartSlot: normalizeToWorkingSlot(
-            hoveredBucket.startSlot,
-            state.closures
-          ),
-        },
-      };
+      return toPreviewState(preview.projects, activeDrag.projectId);
     }
 
     const nextPlacement = buildScheduledPlacement(
@@ -431,19 +376,44 @@ export function ScheduleWorkbench() {
       dependencyResolution: "preserve-dependencies",
     });
 
-    return {
-      projects: preview.projects,
-      changedProjectIds: summarizePreviewChanges(state.projects, preview.projects),
-      primaryProjectId: activeDrag.projectId,
-      traceSummary: {
-        dragType: activeDrag.type,
-        intent: activeDrag.intent,
-        hoveredBucketId: hoveredBucket.bucketId,
-        hoveredStartSlot: hoveredBucket.startSlot,
-        normalizedStartSlot: normalizeToWorkingSlot(hoveredBucket.startSlot, state.closures),
-      },
-    };
+    return toPreviewState(preview.projects, activeDrag.projectId);
   }, [activeDrag, hoveredBucket, selectedProjectIds, state]);
+
+  const drafts = useMemo(
+    () => state.projects.filter((project) => project.status === "draft"),
+    [state.projects]
+  );
+  const selectedProject = useMemo(
+    () => state.projects.find((project) => project.id === selectedProjectId) ?? null,
+    [selectedProjectId, state.projects]
+  );
+  const franceHolidayStripSummary = useMemo(
+    () =>
+      buildFranceHolidayStripSummary({
+        holidaySources: state.holidaySources,
+        closures: state.closures,
+        todayDate,
+      }),
+    [state.closures, state.holidaySources, todayDate]
+  );
+  const holidayListExpanded = Boolean(
+    franceHolidayStripSummary && viewportPreferences.holidayListExpanded
+  );
+  const visibleCustomClosures = useMemo(
+    () =>
+      state.customClosures.filter((closure) =>
+        shouldShowCustomClosureInStrip({
+          closure,
+          closures: state.closures,
+          todayDate,
+        })
+      ),
+    [state.closures, state.customClosures, todayDate]
+  );
+
+  useEffect(() => {
+    writePlannerViewportPreferences(viewportPreferences);
+  }, [viewportPreferences]);
 
   useEffect(() => {
     setSchedulerTraceEnabled(traceEnabled);
@@ -482,7 +452,9 @@ export function ScheduleWorkbench() {
         typeof performance !== "undefined"
           ? performance.now() - previewTraceRef.current.startedAt
           : null,
-      changedProjectCount: previewState.changedProjectIds.length,
+      changedProjectCount: previewState.previewDelta.changedProjectIds.length,
+      touchedSectionCount: previewState.previewDelta.touchedSectionIds.length,
+      touchedTeamCount: previewState.previewDelta.touchedTeamIds.length,
     });
   }, [activeDrag, hoveredBucket, previewState, traceEnabled]);
 
@@ -498,13 +470,20 @@ export function ScheduleWorkbench() {
     return () => window.clearTimeout(timer);
   }, [calendarFocus]);
 
-  const updateTraceEnabled = (enabled: boolean) => {
-    if (typeof window === "undefined") {
-      return;
-    }
+  const updateViewportPreferences = (
+    updater: (current: PlannerViewportPreferences) => PlannerViewportPreferences
+  ) => {
+    setViewportPreferences((current) => {
+      const next = updater(current);
+      return arePlannerViewportPreferencesEqual(current, next) ? current : next;
+    });
+  };
 
-    window.localStorage.setItem(TRACE_STORAGE_KEY, String(enabled));
-    window.dispatchEvent(new Event(TRACE_STORAGE_EVENT));
+  const updateTraceEnabled = (enabled: boolean) => {
+    updateViewportPreferences((current) => ({
+      ...current,
+      traceEnabled: enabled,
+    }));
   };
 
   const setTouchingSelection = (projectId: string) => {
@@ -545,8 +524,8 @@ export function ScheduleWorkbench() {
       startedAt: typeof performance === "undefined" ? 0 : performance.now(),
     };
     previewTraceRef.current = null;
+    hoveredBucketRef.current = null;
     setHoveredBucket(null);
-    setHoveredBucketId(null);
 
     const tracePayload = {
       dragId,
@@ -579,8 +558,7 @@ export function ScheduleWorkbench() {
     setActiveDrag(data ?? null);
   };
 
-  const handleDragOver = (event: DragOverEvent) => {
-    const bucket = (event.over?.data.current as CalendarBucket | undefined) ?? null;
+  const updateHoveredTarget = (bucket: CalendarBucket | null) => {
     const nextBucketId = bucket?.bucketId ?? null;
 
     if (hoveredBucketIdRef.current === nextBucketId) {
@@ -588,12 +566,12 @@ export function ScheduleWorkbench() {
     }
 
     hoveredBucketIdRef.current = nextBucketId;
+    hoveredBucketRef.current = bucket;
     previewTraceRef.current = {
       bucketId: nextBucketId,
       startedAt: typeof performance === "undefined" ? 0 : performance.now(),
     };
     setHoveredBucket(bucket);
-    setHoveredBucketId(nextBucketId);
 
     tracePlannerUi(traceEnabled, "drag.over.bucketChanged", {
       bucketId: nextBucketId,
@@ -605,9 +583,17 @@ export function ScheduleWorkbench() {
     });
   };
 
+  const handleDragMove = (event: DragMoveEvent) => {
+    updateHoveredTarget(extractHoveredBucket(event));
+  };
+
+  const handleDragOver = (event: DragOverEvent) => {
+    updateHoveredTarget(extractHoveredBucket(event));
+  };
+
   const handleDragEnd = (event: DragEndEvent) => {
     const active = event.active.data.current as DragProjectMeta | undefined;
-    const bucket = event.over?.data.current as CalendarBucket | undefined;
+    const bucket = hoveredBucketRef.current ?? extractHoveredBucket(event);
     const dragId = String(event.active.id);
     const dragDurationMs = dragSessionRef.current
       ? (typeof performance === "undefined" ? 0 : performance.now() - dragSessionRef.current.startedAt)
@@ -615,8 +601,8 @@ export function ScheduleWorkbench() {
 
     setActiveDrag(null);
     setHoveredBucket(null);
-    setHoveredBucketId(null);
     hoveredBucketIdRef.current = null;
+    hoveredBucketRef.current = null;
     dragSessionRef.current = null;
     previewTraceRef.current = null;
 
@@ -863,18 +849,83 @@ export function ScheduleWorkbench() {
     setPendingPlacement(null);
   };
 
+  const plannerCollisionDetection = useMemo<CollisionDetection>(
+    () => (args) => {
+      const bucketContainers = args.droppableContainers.filter((container) =>
+        isCalendarBucket(container.data.current)
+      );
+      const bucketCollisions = pointerWithin({
+        ...args,
+        droppableContainers: bucketContainers,
+      });
+
+      if (bucketCollisions.length) {
+        return bucketCollisions;
+      }
+
+      const pointerCoordinates = args.pointerCoordinates;
+      if (!pointerCoordinates) {
+        return [];
+      }
+
+      const rowSurfaceContainers = args.droppableContainers.filter((container) =>
+        isCalendarRowSurface(container.data.current)
+      );
+      const rowSurfaceCollisions = pointerWithin({
+        ...args,
+        droppableContainers: rowSurfaceContainers,
+      });
+
+      return rowSurfaceCollisions.flatMap((collision) => {
+        const container = rowSurfaceContainers.find(
+          (candidate) => candidate.id === collision.id
+        );
+        const surface = container?.data.current;
+        const rect = args.droppableRects.get(collision.id);
+
+        if (!surface || !rect || !isCalendarRowSurface(surface)) {
+          return [];
+        }
+
+        const bucket = buildCalendarBucketFromRowSurfacePointer({
+          surface,
+          pointerX: pointerCoordinates.x,
+          rectLeft: rect.left,
+          rectWidth: rect.width,
+        });
+
+        if (!bucket) {
+          return [];
+        }
+
+        return [
+          {
+            ...collision,
+            data: {
+              ...collision.data,
+              bucket,
+            },
+          },
+        ];
+      });
+    },
+    []
+  );
+
   return (
     <SidebarProvider>
       <DndContext
         id="planner-dnd"
         sensors={sensors}
-        collisionDetection={pointerWithin}
+        collisionDetection={plannerCollisionDetection}
         onDragStart={handleDragStart}
+        onDragMove={handleDragMove}
         onDragOver={handleDragOver}
         onDragEnd={handleDragEnd}
         onDragCancel={() => {
           handledDragIdRef.current = null;
           hoveredBucketIdRef.current = null;
+          hoveredBucketRef.current = null;
           dragSessionRef.current = null;
           previewTraceRef.current = null;
           tracePlannerUi(traceEnabled, "drag.end", {
@@ -883,7 +934,6 @@ export function ScheduleWorkbench() {
           });
           setActiveDrag(null);
           setHoveredBucket(null);
-          setHoveredBucketId(null);
         }}
       >
         <DraftSidebar
@@ -993,7 +1043,10 @@ export function ScheduleWorkbench() {
                           variant="outline"
                           className="rounded-full"
                           onClick={() =>
-                            setHolidayListExpanded((current) => !current)
+                            updateViewportPreferences((current) => ({
+                              ...current,
+                              holidayListExpanded: !current.holidayListExpanded,
+                            }))
                           }
                         >
                           {holidayListExpanded ? (
@@ -1164,20 +1217,31 @@ export function ScheduleWorkbench() {
 
             <TimelineCanvas
               projects={state.projects}
-              previewProjects={previewState?.projects ?? null}
-              previewChangedProjectIds={previewState?.changedProjectIds ?? []}
-              previewPrimaryProjectId={previewState?.primaryProjectId ?? null}
-              hoveredBucketId={hoveredBucketId}
+              previewDelta={previewState?.previewDelta ?? null}
+              hoveredBucket={hoveredBucket}
               dependencies={state.dependencies}
               customClosures={state.customClosures}
               closures={state.closures}
               pendingPlacement={pendingPlacement}
               selectedProjectIds={selectedProjectIds}
               traceEnabled={traceEnabled}
+              activeDate={viewportPreferences.activeDate}
+              viewMode={viewportPreferences.viewMode}
               teams={state.teams}
               focusEvent={calendarFocus}
               dragActive={Boolean(activeDrag)}
-              onActiveDateChange={setTimelineActiveDate}
+              onActiveDateChange={(activeDate) =>
+                updateViewportPreferences((current) => ({
+                  ...current,
+                  activeDate,
+                }))
+              }
+              onViewModeChange={(viewMode) =>
+                updateViewportPreferences((current) => ({
+                  ...current,
+                  viewMode,
+                }))
+              }
               onTraceEnabledChange={updateTraceEnabled}
               onPendingPlacementChange={setPendingPlacement}
               onQuickPlacementCommit={(projectId, placement) => {

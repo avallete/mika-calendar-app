@@ -164,6 +164,30 @@ export type CalendarBucket = {
   granularity: "slot" | "day";
 };
 
+export type CalendarRowSurface = {
+  surfaceId: string;
+  sectionId: string;
+  teamId: TeamId;
+  startDate: string;
+  dayCount: number;
+  granularity: "row-surface";
+};
+
+export type ScheduledTimelineProject = Project & {
+  scheduledTeam: TeamId;
+  scheduledStartSlot: SlotKey;
+  scheduledDurationHalfDays: number;
+  sequenceOrder: number;
+};
+
+export type TimelinePreviewDelta = {
+  projects: ScheduledTimelineProject[];
+  changedProjectIds: string[];
+  primaryProjectId: string | null;
+  touchedTeamIds: TeamId[];
+  touchedSectionIds: string[];
+};
+
 export type DragProjectMeta =
   | {
       type: "draft";
@@ -263,6 +287,31 @@ export function isScheduledProject(project: Project): project is Project & {
     Boolean(project.scheduledStartSlot) &&
     typeof project.scheduledDurationHalfDays === "number" &&
     typeof project.sequenceOrder === "number"
+  );
+}
+
+export function isCalendarBucket(value: unknown): value is CalendarBucket {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "bucketId" in value &&
+    "teamId" in value &&
+    "startSlot" in value &&
+    "granularity" in value &&
+    ((value as CalendarBucket).granularity === "slot" ||
+      (value as CalendarBucket).granularity === "day")
+  );
+}
+
+export function isCalendarRowSurface(value: unknown): value is CalendarRowSurface {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "surfaceId" in value &&
+    "teamId" in value &&
+    "startDate" in value &&
+    "dayCount" in value &&
+    (value as CalendarRowSurface).granularity === "row-surface"
   );
 }
 

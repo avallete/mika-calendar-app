@@ -44,6 +44,7 @@ type RescheduleOptions = {
   trace?: SchedulerTrace | null;
   action?: string;
   metadata?: Record<string, unknown>;
+  summaryOnly?: boolean;
 };
 
 type ScheduledProjectLike = Project & {
@@ -625,6 +626,7 @@ export function rescheduleProjects(
   options?: RescheduleOptions
 ): PlannerState {
   const preparedState = materializePlannerState(state);
+  const summaryOnly = options?.summaryOnly ?? false;
   const trace =
     options?.trace ??
     startSchedulerTrace(options?.action ?? "rescheduleProjects", options?.metadata);
@@ -636,14 +638,18 @@ export function rescheduleProjects(
     })),
     preparedState.dependencies,
     preparedState.teams,
-    trace
+    summaryOnly ? null : trace
   );
   const computations = new Map<string, ScheduledComputation>();
+  let iterationCount = 0;
 
-  traceLog(trace, "queues.before", summarizeTeamQueues(previousProjects, preparedState.teams));
+  if (!summaryOnly) {
+    traceLog(trace, "queues.before", summarizeTeamQueues(previousProjects, preparedState.teams));
+  }
 
   let stabilized = false;
   for (let iteration = 0; iteration < MAX_ITERATIONS; iteration += 1) {
+    iterationCount = iteration + 1;
     let changed = false;
 
     for (const team of getSortedTeams(preparedState.teams)) {
@@ -677,16 +683,18 @@ export function rescheduleProjects(
         const previous = computations.get(project.id);
 
         computations.set(project.id, computed);
-        traceLog(trace, `iteration.${iteration + 1}.${project.id}`, {
-          teamId: team.id,
-          previousReadySlot,
-          dependencyReady,
-          requestedStart,
-          computedStartSlot: computed.startSlot,
-          calendarEndSlot: computed.calendarEndSlot,
-          readySlot: computed.readySlot,
-          skippedDates: computed.skippedDates,
-        });
+        if (!summaryOnly) {
+          traceLog(trace, `iteration.${iteration + 1}.${project.id}`, {
+            teamId: team.id,
+            previousReadySlot,
+            dependencyReady,
+            requestedStart,
+            computedStartSlot: computed.startSlot,
+            calendarEndSlot: computed.calendarEndSlot,
+            readySlot: computed.readySlot,
+            skippedDates: computed.skippedDates,
+          });
+        }
 
         if (
           !previous ||
@@ -720,9 +728,18 @@ export function rescheduleProjects(
     ...preparedState,
     projects: nextProjects,
   });
+  const changes = listScheduledChanges(previousProjects, nextProjects);
 
-  traceLog(trace, "queues.after", summarizeTeamQueues(nextProjects, preparedState.teams));
-  traceLog(trace, "changes", listScheduledChanges(previousProjects, nextProjects));
+  if (summaryOnly) {
+    traceLog(trace, "summary", {
+      iterationCount,
+      changedProjectCount: changes.length,
+      teamCount: preparedState.teams.length,
+    });
+  } else {
+    traceLog(trace, "queues.after", summarizeTeamQueues(nextProjects, preparedState.teams));
+    traceLog(trace, "changes", changes);
+  }
 
   if (ownsTrace) {
     finishSchedulerTrace(trace);
@@ -816,6 +833,7 @@ export function updateProjectPlacements(
   const strategy = options?.strategy ?? "preserve";
   const dependencyResolution =
     options?.dependencyResolution ?? "preserve-dependencies";
+  const summaryOnly = options?.source === "preview";
   const nextDependencies =
     dependencyResolution === "break-conflicting-links"
       ? removeDependencies(state.dependencies, options?.removeDependencyIds)
@@ -833,8 +851,6 @@ export function updateProjectPlacements(
       ...options?.traceMetadata,
     }
   );
-
-  traceLog(trace, "queues.before", summarizeTeamQueues(anticipatedState.projects, anticipatedState.teams));
 
   const insertedProjects = applyPlacementRequests(anticipatedState.projects, normalizedRequests);
   const nextProjects =
@@ -865,6 +881,7 @@ export function updateProjectPlacements(
     },
     {
       trace,
+      summaryOnly,
     }
   );
 
