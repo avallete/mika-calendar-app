@@ -102,6 +102,19 @@ function normalizeTeamEditorState(
   };
 }
 
+function areTeamEditorStatesEqual(left: TeamEditorState, right: TeamEditorState) {
+  const normalizedLeft = normalizeTeamEditorState(left, true);
+  const normalizedRight = normalizeTeamEditorState(right, true);
+
+  return (
+    normalizedLeft.nameFr === normalizedRight.nameFr &&
+    normalizedLeft.slug === normalizedRight.slug &&
+    normalizedLeft.displayOrder === normalizedRight.displayOrder &&
+    normalizedLeft.accentColor === normalizedRight.accentColor &&
+    normalizedLeft.softColor === normalizedRight.softColor
+  );
+}
+
 function buildEmptyTeamState(displayOrder: number): TeamEditorState {
   return {
     nameFr: "",
@@ -140,15 +153,18 @@ function ColorField({
 function TeamEditorCard({
   teamId,
   initialState,
+  isPending,
   onSave,
   onDelete,
 }: {
   teamId: string;
   initialState: TeamEditorState;
+  isPending: boolean;
   onSave: (teamId: string, values: TeamEditorState) => void;
   onDelete: (teamId: string) => void;
 }) {
   const [form, setForm] = useState(() => normalizeTeamEditorState(initialState));
+  const isUnchanged = areTeamEditorStatesEqual(form, initialState);
 
   useEffect(() => {
     setForm(normalizeTeamEditorState(initialState, true));
@@ -204,12 +220,22 @@ function TeamEditorCard({
         </div>
 
         <div className="flex flex-wrap gap-2">
-          <Button onClick={() => onSave(teamId, form)}>
+          <Button
+            disabled={isPending || isUnchanged}
+            onClick={() => {
+              if (isPending || isUnchanged) {
+                return;
+              }
+
+              onSave(teamId, normalizeTeamEditorState(form, true));
+            }}
+          >
             <Save className="size-4" />
             {fr.settings.saveTeam}
           </Button>
           <Button
             variant="destructive"
+            disabled={isPending}
             onClick={() => {
               if (window.confirm(fr.settings.deleteTeamConfirm)) {
                 onDelete(teamId);
@@ -228,6 +254,7 @@ function TeamEditorCard({
 export function SettingsPanel() {
   const {
     state,
+    isPending,
     createTeam,
     updateTeam,
     deleteTeam,
@@ -276,7 +303,7 @@ export function SettingsPanel() {
           <div className="grid gap-4 lg:grid-cols-2">
             {teams.map((team) => (
               <TeamEditorCard
-                key={`${team.id}-${team.nameFr}-${team.displayOrder}-${team.accentColor}-${team.softColor}`}
+                key={team.id}
                 teamId={team.id}
                 initialState={{
                   nameFr: team.nameFr,
@@ -285,6 +312,7 @@ export function SettingsPanel() {
                   softColor: team.softColor,
                   displayOrder: team.displayOrder,
                 }}
+                isPending={isPending}
                 onSave={updateTeam}
                 onDelete={deleteTeam}
               />
