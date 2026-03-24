@@ -4,6 +4,18 @@ import { makeSlotKey } from "@/lib/planner/calendar";
 import { buildTimelinePreviewDelta } from "@/lib/planner/timeline-preview";
 import type { Project } from "@/lib/planner/types";
 
+function makeDraftProject(overrides: Partial<Project> = {}): Project {
+  return {
+    id: overrides.id ?? "draft-1",
+    title: overrides.title ?? "Brouillon",
+    status: "draft",
+    plannedTeam: overrides.plannedTeam ?? "team-a",
+    estimatedDurationHalfDays: overrides.estimatedDurationHalfDays ?? 4,
+    targetDateHint: overrides.targetDateHint,
+    notes: overrides.notes,
+  };
+}
+
 function makeScheduledProject(overrides: Partial<Project> = {}): Project {
   return {
     id: overrides.id ?? "project-1",
@@ -92,5 +104,38 @@ describe("timeline preview delta", () => {
 
     expect(delta.touchedTeamIds.sort()).toEqual(["team-a", "team-b"]);
     expect(delta.touchedSectionIds.sort()).toEqual(["2026-03", "2026-04", "2026-05"]);
+  });
+
+  test("includes drafts that become scheduled in preview", () => {
+    const currentProjects = [
+      makeDraftProject({
+        id: "draft-1",
+        plannedTeam: "team-b",
+        estimatedDurationHalfDays: 5,
+      }),
+    ];
+    const previewProjects = [
+      makeScheduledProject({
+        id: "draft-1",
+        plannedTeam: "team-b",
+        estimatedDurationHalfDays: 5,
+        scheduledTeam: "team-c",
+        scheduledStartSlot: makeSlotKey("2026-04-30", "PM"),
+        scheduledDurationHalfDays: 5,
+      }),
+    ];
+
+    const delta = buildTimelinePreviewDelta({
+      currentProjects,
+      previewProjects,
+      closures: [],
+      primaryProjectId: "draft-1",
+    });
+
+    expect(delta.projects.map((project) => project.id)).toEqual(["draft-1"]);
+    expect(delta.changedProjectIds).toEqual(["draft-1"]);
+    expect(delta.primaryProjectId).toBe("draft-1");
+    expect(delta.touchedTeamIds).toEqual(["team-c"]);
+    expect(delta.touchedSectionIds).toEqual(["2026-04", "2026-05"]);
   });
 });

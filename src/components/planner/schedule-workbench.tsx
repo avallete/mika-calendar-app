@@ -58,6 +58,12 @@ import {
   buildScheduledPlacement,
   normalizePlacementRequest,
 } from "@/lib/planner/drag-placements";
+import {
+  extractPlannerHoveredBucket,
+  resolvePlannerDraftDropBucket,
+  shouldEnablePlannerDragAutoScroll,
+  type PlannerPointerCoordinates,
+} from "@/lib/planner/drag-session";
 import { buildCalendarBucketFromRowSurfacePointer } from "@/lib/planner/timeline-hover";
 import { buildTimelinePreviewDelta } from "@/lib/planner/timeline-preview";
 import {
@@ -235,20 +241,6 @@ function asDisplayClosure(closure: CustomClosure): ClosurePeriod {
   };
 }
 
-function extractHoveredBucket(
-  event: Pick<DragMoveEvent | DragOverEvent | DragEndEvent, "collisions" | "over">
-) {
-  for (const collision of event.collisions ?? []) {
-    const bucket = collision.data?.bucket;
-    if (isCalendarBucket(bucket)) {
-      return bucket;
-    }
-  }
-
-  const overData = event.over?.data.current;
-  return isCalendarBucket(overData) ? overData : null;
-}
-
 export function ScheduleWorkbench({
   initialViewportPreferences,
 }: {
@@ -285,6 +277,8 @@ export function ScheduleWorkbench({
   const handledDragIdRef = useRef<string | null>(null);
   const hoveredBucketIdRef = useRef<string | null>(null);
   const hoveredBucketRef = useRef<CalendarBucket | null>(null);
+  const lastValidTimelineBucketRef = useRef<CalendarBucket | null>(null);
+  const lastPointerCoordinatesRef = useRef<PlannerPointerCoordinates | null>(null);
   const dragSessionRef = useRef<{ dragId: string; startedAt: number } | null>(null);
   const previewTraceRef = useRef<{ bucketId: string | null; startedAt: number } | null>(null);
   const todayDate = useMemo(() => getTodayDateString(), []);
@@ -316,16 +310,27 @@ export function ScheduleWorkbench({
             hoveredBucket.startSlot,
             state.closures
           ),
+          containsPrimaryProjectPreview: previewDelta.changedProjectIds.includes(
+            primaryProjectId
+          ),
         },
       };
     };
 
     if (activeDrag.type === "draft") {
-      const preview = updateProjectPlacement(state, activeDrag.projectId, {
-        teamId: hoveredBucket.teamId,
-        startSlot: hoveredBucket.startSlot,
-        durationHalfDays: activeDrag.durationHalfDays,
-      });
+      const preview = updateProjectPlacement(
+        state,
+        activeDrag.projectId,
+        {
+          teamId: hoveredBucket.teamId,
+          startSlot: hoveredBucket.startSlot,
+          durationHalfDays: activeDrag.durationHalfDays,
+        },
+        {
+          source: "preview",
+          dependencyResolution: "preserve-dependencies",
+        }
+      );
 
       return toPreviewState(preview.projects, activeDrag.projectId);
     }
@@ -525,6 +530,8 @@ export function ScheduleWorkbench({
     };
     previewTraceRef.current = null;
     hoveredBucketRef.current = null;
+    lastValidTimelineBucketRef.current = null;
+    lastPointerCoordinatesRef.current = null;
     setHoveredBucket(null);
 
     const tracePayload = {
@@ -567,6 +574,9 @@ export function ScheduleWorkbench({
 
     hoveredBucketIdRef.current = nextBucketId;
     hoveredBucketRef.current = bucket;
+    if (bucket) {
+      lastValidTimelineBucketRef.current = bucket;
+    }
     previewTraceRef.current = {
       bucketId: nextBucketId,
       startedAt: typeof performance === "undefined" ? 0 : performance.now(),
@@ -584,16 +594,31 @@ export function ScheduleWorkbench({
   };
 
   const handleDragMove = (event: DragMoveEvent) => {
-    updateHoveredTarget(extractHoveredBucket(event));
+    updateHoveredTarget(extractPlannerHoveredBucket(event));
   };
 
   const handleDragOver = (event: DragOverEvent) => {
-    updateHoveredTarget(extractHoveredBucket(event));
+    updateHoveredTarget(extractPlannerHoveredBucket(event));
   };
 
   const handleDragEnd = (event: DragEndEvent) => {
     const active = event.active.data.current as DragProjectMeta | undefined;
-    const bucket = hoveredBucketRef.current ?? extractHoveredBucket(event);
+    const currentHoveredBucket = hoveredBucketRef.current;
+    const eventBucket = extractPlannerHoveredBucket(event);
+    const resolvedDraftDrop =
+      active?.type === "draft"
+        ? resolvePlannerDraftDropBucket({
+            currentHoveredBucket,
+            eventBucket,
+            lastValidBucket: lastValidTimelineBucketRef.current,
+            documentLike: typeof document === "undefined" ? null : document,
+            pointerCoordinates: lastPointerCoordinatesRef.current,
+          })
+        : null;
+    const bucket =
+      active?.type === "draft"
+        ? (resolvedDraftDrop?.bucket ?? null)
+        : currentHoveredBucket ?? eventBucket;
     const dragId = String(event.active.id);
     const dragDurationMs = dragSessionRef.current
       ? (typeof performance === "undefined" ? 0 : performance.now() - dragSessionRef.current.startedAt)
@@ -603,6 +628,8 @@ export function ScheduleWorkbench({
     setHoveredBucket(null);
     hoveredBucketIdRef.current = null;
     hoveredBucketRef.current = null;
+    lastValidTimelineBucketRef.current = null;
+    lastPointerCoordinatesRef.current = null;
     dragSessionRef.current = null;
     previewTraceRef.current = null;
 
@@ -622,6 +649,7 @@ export function ScheduleWorkbench({
         dragId,
         outcome: "no-target",
         durationMs: dragDurationMs,
+        targetResolution: resolvedDraftDrop?.source ?? "no-target",
       });
       return;
     }
@@ -633,6 +661,7 @@ export function ScheduleWorkbench({
         durationMs: dragDurationMs,
         hoveredStartSlot: bucket.startSlot,
         normalizedStartSlot: normalizeToWorkingSlot(bucket.startSlot, state.closures),
+        targetResolution: resolvedDraftDrop?.source ?? "no-target",
       });
       setPendingPlacement({
         projectId: active.projectId,
@@ -851,6 +880,10 @@ export function ScheduleWorkbench({
 
   const plannerCollisionDetection = useMemo<CollisionDetection>(
     () => (args) => {
+      if (args.pointerCoordinates) {
+        lastPointerCoordinatesRef.current = args.pointerCoordinates;
+      }
+
       const bucketContainers = args.droppableContainers.filter((container) =>
         isCalendarBucket(container.data.current)
       );
@@ -917,6 +950,7 @@ export function ScheduleWorkbench({
       <DndContext
         id="planner-dnd"
         sensors={sensors}
+        autoScroll={shouldEnablePlannerDragAutoScroll(activeDrag)}
         collisionDetection={plannerCollisionDetection}
         onDragStart={handleDragStart}
         onDragMove={handleDragMove}
@@ -926,6 +960,8 @@ export function ScheduleWorkbench({
           handledDragIdRef.current = null;
           hoveredBucketIdRef.current = null;
           hoveredBucketRef.current = null;
+          lastValidTimelineBucketRef.current = null;
+          lastPointerCoordinatesRef.current = null;
           dragSessionRef.current = null;
           previewTraceRef.current = null;
           tracePlannerUi(traceEnabled, "drag.end", {

@@ -35,6 +35,7 @@ import {
   PopoverDescription,
   PopoverHeader,
   PopoverTitle,
+  PopoverTrigger,
 } from "@/components/ui/popover";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import {
@@ -1300,8 +1301,12 @@ const SharedTimelineTeamRow = memo(function SharedTimelineTeamRow({
           ) : null}
 
           {pendingBounds ? (
-            <div
+            <PopoverTrigger
               id={pendingBucketInRow!.bucketId}
+              nativeButton={false}
+              render={<div />}
+              aria-hidden="true"
+              tabIndex={-1}
               className="pointer-events-none absolute inset-y-0 z-[6] rounded-lg bg-primary/10 ring-2 ring-inset ring-primary/55 shadow-[0_0_0_1px_rgba(37,99,235,0.16)]"
               style={pendingBounds}
             />
@@ -1703,6 +1708,21 @@ export function TimelineCanvas({
   const timelineNow = useMemo(() => new Date(), []);
   const todayDate = useMemo(() => getTodayDateString(timelineNow), [timelineNow]);
   const [scrollRequest, setScrollRequest] = useState<TimelineScrollRequest | null>(null);
+
+  useEffect(() => {
+    if (!pendingPlacement) {
+      return;
+    }
+
+    traceTimelineUi(traceEnabled, "quickPlacement.open", {
+      projectId: pendingPlacement.projectId,
+      triggerId: pendingPlacement.triggerId,
+      teamId: pendingPlacement.placement.teamId,
+      startSlot: pendingPlacement.placement.startSlot,
+      durationHalfDays: pendingPlacement.placement.durationHalfDays,
+    });
+  }, [pendingPlacement, traceEnabled]);
+
   const emitActiveDateChange = useEffectEvent((date: string) => {
     onActiveDateChange(date);
   });
@@ -1925,8 +1945,13 @@ export function TimelineCanvas({
     <Popover
       open={Boolean(pendingPlacement)}
       triggerId={pendingPlacement?.triggerId ?? null}
-      onOpenChange={(open) => {
+      onOpenChange={(open, details) => {
         if (!open) {
+          traceTimelineUi(traceEnabled, "quickPlacement.close", {
+            projectId: pendingPlacement?.projectId ?? null,
+            triggerId: pendingPlacement?.triggerId ?? null,
+            reason: details.reason,
+          });
           onPendingPlacementChange(null);
         }
       }}
