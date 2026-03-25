@@ -3,6 +3,7 @@ import { getTimelineMonthId } from "@/lib/planner/timeline-folding";
 import type {
   ClosurePeriod,
   Project,
+  ProjectPlacementRequest,
   ScheduledTimelineProject,
   TimelinePreviewDelta,
 } from "@/lib/planner/types";
@@ -55,20 +56,32 @@ function didScheduledProjectChange(
   );
 }
 
-export function buildTimelinePreviewDelta(args: {
+function buildTimelinePreviewDeltaFromScheduledProjects(args: {
   currentProjects: Project[];
-  previewProjects: Project[];
+  previewProjects: ScheduledTimelineProject[];
+  changedProjectIds?: string[] | null;
   closures: ClosurePeriod[];
   primaryProjectId: string | null;
 }): TimelinePreviewDelta {
-  const { currentProjects, previewProjects, closures, primaryProjectId } = args;
+  const {
+    currentProjects,
+    previewProjects,
+    changedProjectIds,
+    closures,
+    primaryProjectId,
+  } = args;
   const currentById = new Map(
     currentProjects.filter(isScheduledProject).map((project) => [project.id, project] as const)
   );
-
-  const changedProjects = previewProjects
-    .filter(isScheduledProject)
-    .filter((project) => didScheduledProjectChange(currentById.get(project.id), project));
+  const previewById = new Map(previewProjects.map((project) => [project.id, project] as const));
+  const changedProjects =
+    changedProjectIds && changedProjectIds.length
+      ? changedProjectIds
+          .map((projectId) => previewById.get(projectId) ?? null)
+          .filter(Boolean) as ScheduledTimelineProject[]
+      : previewProjects.filter((project) =>
+          didScheduledProjectChange(currentById.get(project.id), project)
+        );
   const touchedTeamIds = new Set<string>();
   const touchedSectionIds = new Set<string>();
 
@@ -94,4 +107,77 @@ export function buildTimelinePreviewDelta(args: {
     touchedTeamIds: [...touchedTeamIds],
     touchedSectionIds: [...touchedSectionIds],
   };
+}
+
+export function buildTimelinePreviewDelta(args: {
+  currentProjects: Project[];
+  previewProjects: Project[];
+  closures: ClosurePeriod[];
+  primaryProjectId: string | null;
+}): TimelinePreviewDelta {
+  return buildTimelinePreviewDeltaFromScheduledProjects({
+    ...args,
+    previewProjects: args.previewProjects.filter(isScheduledProject),
+  });
+}
+
+export function buildTimelinePreviewDeltaFromChangedProjectIds(args: {
+  currentProjects: Project[];
+  previewProjects: Project[];
+  changedProjectIds: string[];
+  closures: ClosurePeriod[];
+  primaryProjectId: string | null;
+}) {
+  return buildTimelinePreviewDeltaFromScheduledProjects({
+    currentProjects: args.currentProjects,
+    previewProjects: args.previewProjects.filter(isScheduledProject),
+    changedProjectIds: args.changedProjectIds,
+    closures: args.closures,
+    primaryProjectId: args.primaryProjectId,
+  });
+}
+
+export function buildTimelinePreviewDeltaFromPlacementRequests(args: {
+  currentProjects: Project[];
+  placementRequests: ProjectPlacementRequest[];
+  closures: ClosurePeriod[];
+  primaryProjectId: string | null;
+}) {
+  const { currentProjects, placementRequests, closures, primaryProjectId } = args;
+  const currentById = new Map(currentProjects.map((project) => [project.id, project] as const));
+  const previewProjects: ScheduledTimelineProject[] = [];
+  const changedProjectIds: string[] = [];
+
+  for (const request of placementRequests) {
+    const currentProject = currentById.get(request.projectId);
+    if (!currentProject) {
+      continue;
+    }
+
+    const previewProject = {
+      ...currentProject,
+      status: "scheduled" as const,
+      scheduledTeam: request.placement.teamId,
+      scheduledStartSlot: request.placement.startSlot,
+      scheduledDurationHalfDays: request.placement.durationHalfDays,
+      sequenceOrder:
+        typeof currentProject.sequenceOrder === "number" ? currentProject.sequenceOrder : 0,
+    } satisfies ScheduledTimelineProject;
+
+    if (
+      !isScheduledProject(currentProject) ||
+      didScheduledProjectChange(currentProject, previewProject)
+    ) {
+      changedProjectIds.push(previewProject.id);
+      previewProjects.push(previewProject);
+    }
+  }
+
+  return buildTimelinePreviewDeltaFromScheduledProjects({
+    currentProjects,
+    previewProjects,
+    changedProjectIds,
+    closures,
+    primaryProjectId,
+  });
 }

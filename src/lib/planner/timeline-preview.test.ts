@@ -1,7 +1,11 @@
 import { describe, expect, test } from "bun:test";
 
 import { makeSlotKey } from "@/lib/planner/calendar";
-import { buildTimelinePreviewDelta } from "@/lib/planner/timeline-preview";
+import {
+  buildTimelinePreviewDelta,
+  buildTimelinePreviewDeltaFromChangedProjectIds,
+  buildTimelinePreviewDeltaFromPlacementRequests,
+} from "@/lib/planner/timeline-preview";
 import type { Project } from "@/lib/planner/types";
 
 function makeDraftProject(overrides: Partial<Project> = {}): Project {
@@ -137,5 +141,77 @@ describe("timeline preview delta", () => {
     expect(delta.primaryProjectId).toBe("draft-1");
     expect(delta.touchedTeamIds).toEqual(["team-c"]);
     expect(delta.touchedSectionIds).toEqual(["2026-04", "2026-05"]);
+  });
+
+  test("builds a preview delta directly from normalized placement requests", () => {
+    const currentProjects = [
+      makeScheduledProject({
+        id: "active",
+        scheduledTeam: "team-a",
+        scheduledStartSlot: makeSlotKey("2026-03-31", "PM"),
+        scheduledDurationHalfDays: 4,
+      }),
+      makeScheduledProject({
+        id: "stable",
+        scheduledTeam: "team-b",
+        scheduledStartSlot: makeSlotKey("2026-04-15", "AM"),
+      }),
+    ];
+
+    const delta = buildTimelinePreviewDeltaFromPlacementRequests({
+      currentProjects,
+      placementRequests: [
+        {
+          projectId: "active",
+          placement: {
+            teamId: "team-b",
+            startSlot: makeSlotKey("2026-04-30", "PM"),
+            durationHalfDays: 4,
+          },
+        },
+      ],
+      closures: [],
+      primaryProjectId: "active",
+    });
+
+    expect(delta.changedProjectIds).toEqual(["active"]);
+    expect(delta.projects.map((project) => project.id)).toEqual(["active"]);
+    expect(delta.touchedTeamIds.sort()).toEqual(["team-a", "team-b"]);
+    expect(delta.touchedSectionIds.sort()).toEqual(["2026-03", "2026-04", "2026-05"]);
+  });
+
+  test("uses explicit changed ids to avoid scanning unchanged preview projects", () => {
+    const currentProjects = [
+      makeScheduledProject({
+        id: "active",
+        scheduledStartSlot: makeSlotKey("2026-03-27", "AM"),
+      }),
+      makeScheduledProject({
+        id: "stable",
+        scheduledStartSlot: makeSlotKey("2026-04-03", "AM"),
+      }),
+    ];
+    const previewProjects = [
+      makeScheduledProject({
+        id: "active",
+        scheduledStartSlot: makeSlotKey("2026-03-30", "AM"),
+      }),
+      makeScheduledProject({
+        id: "stable",
+        scheduledStartSlot: makeSlotKey("2026-04-03", "AM"),
+      }),
+    ];
+
+    const delta = buildTimelinePreviewDeltaFromChangedProjectIds({
+      currentProjects,
+      previewProjects,
+      changedProjectIds: ["active"],
+      closures: [],
+      primaryProjectId: "active",
+    });
+
+    expect(delta.changedProjectIds).toEqual(["active"]);
+    expect(delta.projects.map((project) => project.id)).toEqual(["active"]);
+    expect(delta.primaryProjectId).toBe("active");
   });
 });

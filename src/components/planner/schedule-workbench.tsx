@@ -54,10 +54,33 @@ import {
 } from "@/lib/planner/day-markers";
 import {
   arePlacementRequestsNoop,
-  buildMovePlacementRequests,
+  buildMovePlacementRequestsFromLookup,
+  buildPlacementRequestsSignature,
+  buildProjectsById,
   buildScheduledPlacement,
   normalizePlacementRequest,
 } from "@/lib/planner/drag-placements";
+import {
+  buildExactPlannerDragPreview,
+  buildPlannerDragPreviewData,
+} from "@/lib/planner/drag-preview";
+import {
+  clearPlannerActiveDragPreview,
+  publishPlannerDragPreviewHover,
+  publishPlannerExactDragPreview,
+  publishPlannerExactPreviewPending,
+  publishPlannerFastDragPreview,
+  resetPlannerDragPreviewSession,
+  startPlannerDragPreviewSession,
+} from "@/lib/planner/drag-preview-store";
+import {
+  incrementPlannerPerformanceCounter,
+  measurePlannerPerformance,
+  schedulePlannerPerformanceSummary,
+  setActivePlannerPerformanceSession,
+  startPlannerPerformanceSession,
+  type PlannerPerformanceSession,
+} from "@/lib/planner/drag-performance";
 import {
   extractPlannerHoveredBucket,
   resolvePlannerDraftDropBucket,
@@ -65,7 +88,7 @@ import {
   type PlannerPointerCoordinates,
 } from "@/lib/planner/drag-session";
 import { buildCalendarBucketFromRowSurfacePointer } from "@/lib/planner/timeline-hover";
-import { buildTimelinePreviewDelta } from "@/lib/planner/timeline-preview";
+import { buildTimelinePreviewDeltaFromPlacementRequests } from "@/lib/planner/timeline-preview";
 import {
   buildFranceHolidayStripSummary,
   getNextCustomClosureOccurrence,
@@ -76,9 +99,8 @@ import {
   detectDependencyConflicts,
   getEarlierShiftPrompt,
   getTouchingProjectChain,
+  previewProjectPlacements,
   setSchedulerTraceEnabled,
-  updateProjectPlacement,
-  updateProjectPlacements,
 } from "@/lib/planner/scheduler";
 import { getTodayDateString } from "@/lib/planner/timeline-range";
 import type {
@@ -122,6 +144,157 @@ function tracePlannerUi(enabled: boolean, label: string, payload: unknown) {
   }
 
   console.log(`[planner ui trace] ${label} ${stringifyTracePayload(payload)}`);
+}
+
+type DragPreviewCandidate = {
+  signature: string;
+  requests: ProjectPlacementRequest[];
+  primaryProjectId: string;
+  traceSummary: {
+    dragType: DragProjectMeta["type"];
+    intent: "draft" | "move" | "resize-start" | "resize-end";
+    hoveredBucketId: string;
+    hoveredStartSlot: SlotKey;
+    normalizedStartSlot: SlotKey;
+  };
+};
+
+type DragSessionState = {
+  dragId: string;
+  startedAt: number;
+  performanceSession: PlannerPerformanceSession | null;
+};
+
+const EXACT_PREVIEW_DEBOUNCE_MS = 250;
+
+function getActiveSelectionProjectIds(
+  drag: Extract<DragProjectMeta, { type: "scheduled" }>,
+  selectedProjectIdSet: ReadonlySet<string>,
+  selectedProjectIds: string[]
+) {
+  return drag.intent === "move" && selectedProjectIdSet.has(drag.projectId)
+    ? selectedProjectIds
+    : [drag.projectId];
+}
+
+function buildDragPreviewCandidate(args: {
+  activeDrag: DragProjectMeta;
+  hoveredBucket: CalendarBucket;
+  selectedProjectIdSet: ReadonlySet<string>;
+  selectedProjectIds: string[];
+  projectsById: ReadonlyMap<string, Project>;
+  closures: ClosurePeriod[];
+}) {
+  const {
+    activeDrag,
+    hoveredBucket,
+    selectedProjectIdSet,
+    selectedProjectIds,
+    projectsById,
+    closures,
+  } = args;
+  const buildCandidate = (
+    requests: ProjectPlacementRequest[],
+    primaryProjectId: string
+  ) => {
+    const primaryRequest =
+      requests.find((request) => request.projectId === primaryProjectId) ?? requests[0];
+
+    return {
+      signature: buildPlacementRequestsSignature(requests),
+      requests,
+      primaryProjectId,
+      traceSummary: {
+        dragType: activeDrag.type,
+        intent: activeDrag.type === "draft" ? "draft" : activeDrag.intent,
+        hoveredBucketId: hoveredBucket.bucketId,
+        hoveredStartSlot: hoveredBucket.startSlot,
+        normalizedStartSlot:
+          primaryRequest?.placement.startSlot ??
+          normalizeToWorkingSlot(hoveredBucket.startSlot, closures),
+      },
+    } satisfies DragPreviewCandidate;
+  };
+
+  if (activeDrag.type === "draft") {
+    return buildCandidate(
+      [
+        normalizePlacementRequest(
+          {
+            projectId: activeDrag.projectId,
+            placement: {
+              teamId: hoveredBucket.teamId,
+              startSlot: hoveredBucket.startSlot,
+              durationHalfDays: activeDrag.durationHalfDays,
+            },
+          },
+          closures
+        ),
+      ],
+      activeDrag.projectId
+    );
+  }
+
+  const activeSelectionProjectIds = getActiveSelectionProjectIds(
+    activeDrag,
+    selectedProjectIdSet,
+    selectedProjectIds
+  );
+  const activeWithSelection =
+    activeDrag.intent === "move"
+      ? {
+          ...activeDrag,
+          selectionProjectIds: activeSelectionProjectIds,
+        }
+      : activeDrag;
+
+  if (activeDrag.intent === "move") {
+    const movePlan = measurePlannerPerformance(
+      "drag.preview.buildMovePlan",
+      () =>
+        buildMovePlacementRequestsFromLookup(
+          activeWithSelection,
+          hoveredBucket,
+          projectsById,
+          closures
+        ),
+      {
+        hoveredBucketId: hoveredBucket.bucketId,
+        selectionSize: activeSelectionProjectIds.length,
+      }
+    );
+
+    if (!movePlan || !movePlan.snappedRequests.length) {
+      return null;
+    }
+
+    return buildCandidate(movePlan.normalizedRequests, activeDrag.projectId);
+  }
+
+  const nextPlacement = measurePlannerPerformance(
+    "drag.preview.buildPlacement",
+    () => buildScheduledPlacement(activeWithSelection, hoveredBucket, closures),
+    {
+      hoveredBucketId: hoveredBucket.bucketId,
+      intent: activeDrag.intent,
+    }
+  );
+  if (!nextPlacement) {
+    return null;
+  }
+
+  return buildCandidate(
+    [
+      normalizePlacementRequest(
+        {
+          projectId: activeDrag.projectId,
+          placement: nextPlacement,
+        },
+        closures
+      ),
+    ],
+    activeDrag.projectId
+  );
 }
 
 function getDragLabel(activeDrag: DragProjectMeta | null) {
@@ -262,7 +435,6 @@ export function ScheduleWorkbench({
   const [pendingDependencyConflict, setPendingDependencyConflict] =
     useState<DependencyConflictPromptState | null>(null);
   const [activeDrag, setActiveDrag] = useState<DragProjectMeta | null>(null);
-  const [hoveredBucket, setHoveredBucket] = useState<CalendarBucket | null>(null);
   const [viewportPreferences, setViewportPreferences] =
     useState<PlannerViewportPreferences>(() =>
       readPlannerViewportPreferencesFromLocalStorage(initialViewportPreferences)
@@ -279,118 +451,38 @@ export function ScheduleWorkbench({
   const hoveredBucketRef = useRef<CalendarBucket | null>(null);
   const lastValidTimelineBucketRef = useRef<CalendarBucket | null>(null);
   const lastPointerCoordinatesRef = useRef<PlannerPointerCoordinates | null>(null);
-  const dragSessionRef = useRef<{ dragId: string; startedAt: number } | null>(null);
-  const previewTraceRef = useRef<{ bucketId: string | null; startedAt: number } | null>(null);
+  const dragSessionRef = useRef<DragSessionState | null>(null);
+  const hoverFrameRef = useRef<number | null>(null);
+  const queuedHoveredBucketRef = useRef<CalendarBucket | null>(null);
+  const activeDragRef = useRef<DragProjectMeta | null>(null);
+  const stateRef = useRef(state);
+  const projectsByIdRef = useRef<ReadonlyMap<string, Project>>(new Map());
+  const selectedProjectIdsRef = useRef(selectedProjectIds);
+  const selectedProjectIdSetRef = useRef<ReadonlySet<string>>(new Set<string>());
+  const exactPreviewTimerRef = useRef<number | null>(null);
+  const exactPreviewSignatureRef = useRef<string | null>(null);
+  const exactPreviewGenerationRef = useRef(0);
+  const lastPreviewSignatureRef = useRef<{
+    bucketId: string | null;
+    signature: string | null;
+  } | null>(null);
   const todayDate = useMemo(() => getTodayDateString(), []);
+  const projectsById = useMemo(() => buildProjectsById(state.projects), [state.projects]);
+  const selectedProjectIdSet = useMemo(
+    () => new Set(selectedProjectIds),
+    [selectedProjectIds]
+  );
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
     useSensor(KeyboardSensor)
   );
-  const previewState = useMemo(() => {
-    if (!activeDrag || !hoveredBucket) {
-      return null;
-    }
-
-    const toPreviewState = (previewProjects: Project[], primaryProjectId: string) => {
-      const previewDelta = buildTimelinePreviewDelta({
-        currentProjects: state.projects,
-        previewProjects,
-        closures: state.closures,
-        primaryProjectId,
-      });
-
-      return {
-        previewDelta,
-        traceSummary: {
-          dragType: activeDrag.type,
-          intent: activeDrag.type === "draft" ? "draft" : activeDrag.intent,
-          hoveredBucketId: hoveredBucket.bucketId,
-          hoveredStartSlot: hoveredBucket.startSlot,
-          normalizedStartSlot: normalizeToWorkingSlot(
-            hoveredBucket.startSlot,
-            state.closures
-          ),
-          containsPrimaryProjectPreview: previewDelta.changedProjectIds.includes(
-            primaryProjectId
-          ),
-        },
-      };
-    };
-
-    if (activeDrag.type === "draft") {
-      const preview = updateProjectPlacement(
-        state,
-        activeDrag.projectId,
-        {
-          teamId: hoveredBucket.teamId,
-          startSlot: hoveredBucket.startSlot,
-          durationHalfDays: activeDrag.durationHalfDays,
-        },
-        {
-          source: "preview",
-          dependencyResolution: "preserve-dependencies",
-        }
-      );
-
-      return toPreviewState(preview.projects, activeDrag.projectId);
-    }
-
-    const activeSelectionProjectIds =
-      activeDrag.intent === "move" && selectedProjectIds.includes(activeDrag.projectId)
-        ? selectedProjectIds
-        : [activeDrag.projectId];
-    const activeWithSelection =
-      activeDrag.intent === "move"
-        ? {
-            ...activeDrag,
-            selectionProjectIds: activeSelectionProjectIds,
-          }
-        : activeDrag;
-
-    if (activeDrag.intent === "move") {
-      const movePlan = buildMovePlacementRequests(
-        activeWithSelection,
-        hoveredBucket,
-        state.projects,
-        state.closures
-      );
-
-      if (!movePlan || !movePlan.snappedRequests.length) {
-        return null;
-      }
-
-      const preview = updateProjectPlacements(state, movePlan.snappedRequests, {
-        source: "preview",
-        dependencyResolution: "preserve-dependencies",
-      });
-
-      return toPreviewState(preview.projects, activeDrag.projectId);
-    }
-
-    const nextPlacement = buildScheduledPlacement(
-      activeWithSelection,
-      hoveredBucket,
-      state.closures
-    );
-    if (!nextPlacement) {
-      return null;
-    }
-
-    const preview = updateProjectPlacement(state, activeDrag.projectId, nextPlacement, {
-      source: "preview",
-      dependencyResolution: "preserve-dependencies",
-    });
-
-    return toPreviewState(preview.projects, activeDrag.projectId);
-  }, [activeDrag, hoveredBucket, selectedProjectIds, state]);
-
   const drafts = useMemo(
     () => state.projects.filter((project) => project.status === "draft"),
     [state.projects]
   );
   const selectedProject = useMemo(
-    () => state.projects.find((project) => project.id === selectedProjectId) ?? null,
-    [selectedProjectId, state.projects]
+    () => (selectedProjectId ? projectsById.get(selectedProjectId) ?? null : null),
+    [projectsById, selectedProjectId]
   );
   const franceHolidayStripSummary = useMemo(
     () =>
@@ -425,43 +517,15 @@ export function ScheduleWorkbench({
   }, [traceEnabled]);
 
   useEffect(() => {
-    if (!traceEnabled || !activeDrag) {
-      return;
-    }
+    stateRef.current = state;
+    projectsByIdRef.current = projectsById;
+    selectedProjectIdsRef.current = selectedProjectIds;
+    selectedProjectIdSetRef.current = selectedProjectIdSet;
+  }, [projectsById, selectedProjectIdSet, selectedProjectIds, state]);
 
-    if (!hoveredBucket) {
-      tracePlannerUi(traceEnabled, "preview.skip", {
-        reason: "no-hovered-bucket",
-        dragType: activeDrag.type,
-        intent: activeDrag.type === "draft" ? "draft" : activeDrag.intent,
-      });
-      return;
-    }
-
-    if (!previewState) {
-      tracePlannerUi(traceEnabled, "preview.skip", {
-        reason: "no-preview-state",
-        dragType: activeDrag.type,
-        intent: activeDrag.type === "draft" ? "draft" : activeDrag.intent,
-        hoveredBucketId: hoveredBucket.bucketId,
-        hoveredStartSlot: hoveredBucket.startSlot,
-      });
-      return;
-    }
-
-    tracePlannerUi(traceEnabled, "preview.compute", {
-      ...previewState.traceSummary,
-      durationMs:
-        previewTraceRef.current &&
-        previewTraceRef.current.bucketId === hoveredBucket.bucketId &&
-        typeof performance !== "undefined"
-          ? performance.now() - previewTraceRef.current.startedAt
-          : null,
-      changedProjectCount: previewState.previewDelta.changedProjectIds.length,
-      touchedSectionCount: previewState.previewDelta.touchedSectionIds.length,
-      touchedTeamCount: previewState.previewDelta.touchedTeamIds.length,
-    });
-  }, [activeDrag, hoveredBucket, previewState, traceEnabled]);
+  useEffect(() => {
+    activeDragRef.current = activeDrag;
+  }, [activeDrag]);
 
   useEffect(() => {
     if (!calendarFocus) {
@@ -519,53 +583,37 @@ export function ScheduleWorkbench({
     placeProjects(placementRequests, options);
   };
 
-  const handleDragStart = (event: DragStartEvent) => {
-    const data = event.active.data.current as DragProjectMeta | undefined;
-    const dragId = String(event.active.id);
-    handledDragIdRef.current = null;
-    hoveredBucketIdRef.current = null;
-    dragSessionRef.current = {
-      dragId,
-      startedAt: typeof performance === "undefined" ? 0 : performance.now(),
-    };
-    previewTraceRef.current = null;
-    hoveredBucketRef.current = null;
-    lastValidTimelineBucketRef.current = null;
-    lastPointerCoordinatesRef.current = null;
-    setHoveredBucket(null);
-
-    const tracePayload = {
-      dragId,
-      dragType: data?.type ?? null,
-      intent: data?.type === "scheduled" ? data.intent : "draft",
-      projectId: data?.projectId ?? null,
-      selectionSize:
-        data?.type === "scheduled" &&
-        data.intent === "move" &&
-        selectedProjectIds.includes(data.projectId)
-          ? selectedProjectIds.length
-          : 1,
-      startSlot: data?.type === "scheduled" ? data.startSlot : null,
-    };
-
+  const cancelQueuedHoverUpdate = () => {
     if (
-      data?.type === "scheduled" &&
-      data.intent === "move" &&
-      selectedProjectIds.includes(data.projectId)
+      hoverFrameRef.current !== null &&
+      typeof window !== "undefined" &&
+      typeof window.cancelAnimationFrame === "function"
     ) {
-      tracePlannerUi(traceEnabled, "drag.start", tracePayload);
-      setActiveDrag({
-        ...data,
-        selectionProjectIds: selectedProjectIds,
-      });
-      return;
+      window.cancelAnimationFrame(hoverFrameRef.current);
     }
 
-    tracePlannerUi(traceEnabled, "drag.start", tracePayload);
-    setActiveDrag(data ?? null);
+    hoverFrameRef.current = null;
+    queuedHoveredBucketRef.current = null;
   };
 
-  const updateHoveredTarget = (bucket: CalendarBucket | null) => {
+  const resetExactPreviewWorker = (countCancelled: boolean) => {
+    if (
+      exactPreviewTimerRef.current !== null &&
+      typeof window !== "undefined" &&
+      typeof window.clearTimeout === "function"
+    ) {
+      window.clearTimeout(exactPreviewTimerRef.current);
+      if (countCancelled) {
+        incrementPlannerPerformanceCounter("drag.preview.exact.cancelled");
+      }
+    }
+
+    exactPreviewTimerRef.current = null;
+    exactPreviewSignatureRef.current = null;
+    exactPreviewGenerationRef.current += 1;
+  };
+
+  const applyHoveredTarget = (bucket: CalendarBucket | null) => {
     const nextBucketId = bucket?.bucketId ?? null;
 
     if (hoveredBucketIdRef.current === nextBucketId) {
@@ -577,61 +625,314 @@ export function ScheduleWorkbench({
     if (bucket) {
       lastValidTimelineBucketRef.current = bucket;
     }
-    previewTraceRef.current = {
-      bucketId: nextBucketId,
-      startedAt: typeof performance === "undefined" ? 0 : performance.now(),
-    };
-    setHoveredBucket(bucket);
+    const dragSession = dragSessionRef.current;
+    const currentActiveDrag = activeDragRef.current;
+    const previous = lastPreviewSignatureRef.current;
 
-    tracePlannerUi(traceEnabled, "drag.over.bucketChanged", {
+    if (!dragSession || !currentActiveDrag) {
+      lastPreviewSignatureRef.current = {
+        bucketId: nextBucketId,
+        signature: null,
+      };
+      return;
+    }
+
+    const previewCandidate = bucket
+      ? buildDragPreviewCandidate({
+          activeDrag: currentActiveDrag,
+          hoveredBucket: bucket,
+          selectedProjectIdSet: selectedProjectIdSetRef.current,
+          selectedProjectIds: selectedProjectIdsRef.current,
+          projectsById: projectsByIdRef.current,
+          closures: stateRef.current.closures,
+        })
+      : null;
+    const nextSignature = previewCandidate?.signature ?? null;
+
+    if (
+      previous &&
+      previous.bucketId !== nextBucketId &&
+      previous.signature !== null &&
+      previous.signature === nextSignature
+    ) {
+      incrementPlannerPerformanceCounter("drag.preview.skipped.same-signature");
+    }
+
+    lastPreviewSignatureRef.current = {
       bucketId: nextBucketId,
-      hoveredStartSlot: bucket?.startSlot ?? null,
-      normalizedStartSlot: bucket
-        ? normalizeToWorkingSlot(bucket.startSlot, state.closures)
-        : null,
-      teamId: bucket?.teamId ?? null,
+      signature: nextSignature,
+    };
+
+    if (!previewCandidate) {
+      resetExactPreviewWorker(exactPreviewTimerRef.current !== null);
+      clearPlannerActiveDragPreview(dragSession.dragId, bucket);
+      return;
+    }
+
+    if (!bucket) {
+      clearPlannerActiveDragPreview(dragSession.dragId, null);
+      return;
+    }
+
+    if (previous?.signature === previewCandidate.signature) {
+      publishPlannerDragPreviewHover(dragSession.dragId, bucket);
+      return;
+    }
+
+    const fastPreview = measurePlannerPerformance(
+      "drag.preview.fast",
+      () => {
+        const delta = measurePlannerPerformance(
+          "drag.preview.fast.delta",
+          () =>
+            buildTimelinePreviewDeltaFromPlacementRequests({
+              currentProjects: stateRef.current.projects,
+              placementRequests: previewCandidate.requests,
+              closures: stateRef.current.closures,
+              primaryProjectId: previewCandidate.primaryProjectId,
+            }),
+          {
+            hoveredBucketId: bucket.bucketId,
+            selectionSize: previewCandidate.requests.length,
+          }
+        );
+
+        return buildPlannerDragPreviewData(
+          previewCandidate.signature,
+          delta,
+          stateRef.current.closures
+        );
+      },
+      {
+        hoveredBucketId: bucket.bucketId,
+        selectionSize: previewCandidate.requests.length,
+      }
+    );
+
+    publishPlannerFastDragPreview({
+      activeDragId: dragSession.dragId,
+      hoveredBucket: bucket,
+      signature: previewCandidate.signature,
+      preview: fastPreview,
+      exactPending: true,
+    });
+    publishPlannerExactPreviewPending(dragSession.dragId, previewCandidate.signature);
+
+    resetExactPreviewWorker(exactPreviewTimerRef.current !== null);
+    exactPreviewSignatureRef.current = previewCandidate.signature;
+    const generation = exactPreviewGenerationRef.current;
+
+    if (typeof window === "undefined" || typeof window.setTimeout !== "function") {
+      return;
+    }
+
+    exactPreviewTimerRef.current = window.setTimeout(() => {
+      exactPreviewTimerRef.current = null;
+
+      const exactResult = previewProjectPlacements(
+        stateRef.current,
+        previewCandidate.requests,
+        {
+          dependencyResolution: "preserve-dependencies",
+        }
+      );
+      const exactPreview = measurePlannerPerformance(
+        "drag.preview.exact.delta",
+        () =>
+          buildExactPlannerDragPreview({
+            signature: previewCandidate.signature,
+            currentProjects: stateRef.current.projects,
+            previewProjects: exactResult.nextState.projects,
+            changedProjectIds: exactResult.changedProjectIds,
+            closures: stateRef.current.closures,
+            primaryProjectId: previewCandidate.primaryProjectId,
+          }),
+        {
+          hoveredBucketId: bucket.bucketId,
+          selectionSize: previewCandidate.requests.length,
+        }
+      );
+
+      if (
+        exactPreviewGenerationRef.current !== generation ||
+        exactPreviewSignatureRef.current !== previewCandidate.signature ||
+        dragSessionRef.current?.dragId !== dragSession.dragId ||
+        activeDragRef.current === null ||
+        lastPreviewSignatureRef.current?.signature !== previewCandidate.signature
+      ) {
+        incrementPlannerPerformanceCounter("drag.preview.exact.stale-drop");
+        return;
+      }
+
+      publishPlannerExactDragPreview({
+        activeDragId: dragSession.dragId,
+        signature: previewCandidate.signature,
+        preview: exactPreview,
+      });
+    }, EXACT_PREVIEW_DEBOUNCE_MS);
+  };
+
+  const queueHoveredTargetUpdate = (bucket: CalendarBucket | null) => {
+    queuedHoveredBucketRef.current = bucket;
+
+    if (typeof window === "undefined" || typeof window.requestAnimationFrame !== "function") {
+      measurePlannerPerformance("drag.hover.bucketUpdate", () => {
+        applyHoveredTarget(bucket);
+      });
+      return;
+    }
+
+    if (hoverFrameRef.current !== null) {
+      return;
+    }
+
+    hoverFrameRef.current = window.requestAnimationFrame(() => {
+      hoverFrameRef.current = null;
+      const nextBucket = queuedHoveredBucketRef.current ?? null;
+      queuedHoveredBucketRef.current = null;
+
+      measurePlannerPerformance("drag.hover.bucketUpdate", () => {
+        applyHoveredTarget(nextBucket);
+      });
     });
   };
 
+  const handleDragStart = (event: DragStartEvent) => {
+    cancelQueuedHoverUpdate();
+
+    const data = event.active.data.current as DragProjectMeta | undefined;
+    const dragId = String(event.active.id);
+    const selectionSize =
+      data?.type === "scheduled" &&
+      data.intent === "move" &&
+      selectedProjectIdSet.has(data.projectId)
+        ? selectedProjectIds.length
+        : 1;
+    const performanceSession = traceEnabled
+      ? startPlannerPerformanceSession(
+          `drag:${data?.type ?? "unknown"}:${data?.type === "scheduled" ? data.intent : "draft"}`,
+          {
+            dragId,
+            dragType: data?.type ?? null,
+            intent: data?.type === "scheduled" ? data.intent : "draft",
+            projectId: data?.projectId ?? null,
+            selectionSize,
+            startSlot: data?.type === "scheduled" ? data.startSlot : null,
+          }
+        )
+      : null;
+
+    handledDragIdRef.current = null;
+    hoveredBucketIdRef.current = null;
+    hoveredBucketRef.current = null;
+    lastValidTimelineBucketRef.current = null;
+    lastPointerCoordinatesRef.current = null;
+    lastPreviewSignatureRef.current = null;
+    resetExactPreviewWorker(false);
+    startPlannerDragPreviewSession(dragId);
+    setActivePlannerPerformanceSession(performanceSession);
+    dragSessionRef.current = {
+      dragId,
+      startedAt: typeof performance === "undefined" ? 0 : performance.now(),
+      performanceSession,
+    };
+
+    const tracePayload = {
+      dragId,
+      dragType: data?.type ?? null,
+      intent: data?.type === "scheduled" ? data.intent : "draft",
+      projectId: data?.projectId ?? null,
+      selectionSize,
+      startSlot: data?.type === "scheduled" ? data.startSlot : null,
+    };
+
+    tracePlannerUi(traceEnabled, "drag.start", tracePayload);
+
+    if (
+      data?.type === "scheduled" &&
+      data.intent === "move" &&
+      selectedProjectIdSet.has(data.projectId)
+    ) {
+      const nextActiveDrag = {
+        ...data,
+        selectionProjectIds: selectedProjectIds,
+      };
+      activeDragRef.current = nextActiveDrag;
+      setActiveDrag(nextActiveDrag);
+      return;
+    }
+
+    activeDragRef.current = data ?? null;
+    setActiveDrag(data ?? null);
+  };
+
   const handleDragMove = (event: DragMoveEvent) => {
-    updateHoveredTarget(extractPlannerHoveredBucket(event));
+    const bucket = measurePlannerPerformance("drag.hover.extract", () =>
+      extractPlannerHoveredBucket(event)
+    );
+    queueHoveredTargetUpdate(bucket);
   };
 
   const handleDragOver = (event: DragOverEvent) => {
-    updateHoveredTarget(extractPlannerHoveredBucket(event));
+    const bucket = measurePlannerPerformance("drag.hover.extract", () =>
+      extractPlannerHoveredBucket(event)
+    );
+    queueHoveredTargetUpdate(bucket);
   };
 
   const handleDragEnd = (event: DragEndEvent) => {
+    cancelQueuedHoverUpdate();
+
     const active = event.active.data.current as DragProjectMeta | undefined;
     const currentHoveredBucket = hoveredBucketRef.current;
-    const eventBucket = extractPlannerHoveredBucket(event);
+    const eventBucket = measurePlannerPerformance("drag.hover.extract", () =>
+      extractPlannerHoveredBucket(event)
+    );
     const resolvedDraftDrop =
       active?.type === "draft"
-        ? resolvePlannerDraftDropBucket({
-            currentHoveredBucket,
-            eventBucket,
-            lastValidBucket: lastValidTimelineBucketRef.current,
-            documentLike: typeof document === "undefined" ? null : document,
-            pointerCoordinates: lastPointerCoordinatesRef.current,
-          })
+        ? measurePlannerPerformance("drag.end.resolveDrop", () =>
+            resolvePlannerDraftDropBucket({
+              currentHoveredBucket,
+              eventBucket,
+              lastValidBucket: lastValidTimelineBucketRef.current,
+              documentLike: typeof document === "undefined" ? null : document,
+              pointerCoordinates: lastPointerCoordinatesRef.current,
+            })
+          )
         : null;
     const bucket =
       active?.type === "draft"
         ? (resolvedDraftDrop?.bucket ?? null)
         : currentHoveredBucket ?? eventBucket;
+    const dragSession = dragSessionRef.current;
     const dragId = String(event.active.id);
-    const dragDurationMs = dragSessionRef.current
-      ? (typeof performance === "undefined" ? 0 : performance.now() - dragSessionRef.current.startedAt)
+    const dragDurationMs = dragSession
+      ? typeof performance === "undefined"
+        ? 0
+        : performance.now() - dragSession.startedAt
       : 0;
+    const finalizeDragSession = (
+      outcome: string,
+      payload: Record<string, unknown> = {}
+    ) => {
+      schedulePlannerPerformanceSummary(dragSession?.performanceSession ?? null, {
+        dragId,
+        durationMs: dragDurationMs,
+        outcome,
+        ...payload,
+      });
+    };
 
     setActiveDrag(null);
-    setHoveredBucket(null);
+    activeDragRef.current = null;
     hoveredBucketIdRef.current = null;
     hoveredBucketRef.current = null;
     lastValidTimelineBucketRef.current = null;
     lastPointerCoordinatesRef.current = null;
     dragSessionRef.current = null;
-    previewTraceRef.current = null;
+    lastPreviewSignatureRef.current = null;
+    resetExactPreviewWorker(false);
+    resetPlannerDragPreviewSession();
 
     if (handledDragIdRef.current === dragId) {
       tracePlannerUi(traceEnabled, "drag.end", {
@@ -639,6 +940,7 @@ export function ScheduleWorkbench({
         outcome: "ignored-duplicate",
         durationMs: dragDurationMs,
       });
+      finalizeDragSession("ignored-duplicate");
       return;
     }
 
@@ -649,6 +951,9 @@ export function ScheduleWorkbench({
         dragId,
         outcome: "no-target",
         durationMs: dragDurationMs,
+        targetResolution: resolvedDraftDrop?.source ?? "no-target",
+      });
+      finalizeDragSession("no-target", {
         targetResolution: resolvedDraftDrop?.source ?? "no-target",
       });
       return;
@@ -673,13 +978,17 @@ export function ScheduleWorkbench({
           durationHalfDays: active.durationHalfDays,
         },
       });
+      finalizeDragSession("draft-pending-placement", {
+        targetResolution: resolvedDraftDrop?.source ?? "no-target",
+      });
       return;
     }
 
-    const activeSelectionProjectIds =
-      active.intent === "move" && selectedProjectIds.includes(active.projectId)
-        ? selectedProjectIds
-        : [active.projectId];
+    const activeSelectionProjectIds = getActiveSelectionProjectIds(
+      active,
+      selectedProjectIdSet,
+      selectedProjectIds
+    );
     const activeWithSelection =
       active.intent === "move"
         ? {
@@ -689,11 +998,19 @@ export function ScheduleWorkbench({
         : active;
 
     if (active.intent === "move") {
-      const movePlan = buildMovePlacementRequests(
-        activeWithSelection,
-        bucket,
-        state.projects,
-        state.closures
+      const movePlan = measurePlannerPerformance(
+        "drag.end.buildPlacement",
+        () =>
+          buildMovePlacementRequestsFromLookup(
+            activeWithSelection,
+            bucket,
+            projectsById,
+            state.closures
+          ),
+        {
+          hoveredBucketId: bucket.bucketId,
+          selectionSize: activeSelectionProjectIds.length,
+        }
       );
 
       if (!movePlan || !movePlan.snappedRequests.length) {
@@ -701,6 +1018,9 @@ export function ScheduleWorkbench({
           dragId,
           outcome: "no-move-plan",
           durationMs: dragDurationMs,
+          hoveredStartSlot: bucket.startSlot,
+        });
+        finalizeDragSession("no-move-plan", {
           hoveredStartSlot: bucket.startSlot,
         });
         return;
@@ -715,10 +1035,19 @@ export function ScheduleWorkbench({
           normalizedPlacements: movePlan.normalizedRequests,
           snappedPlacements: movePlan.snappedRequests,
         });
+        finalizeDragSession("noop", {
+          projectIds: movePlan.projectIds,
+        });
         return;
       }
 
-      const conflicts = detectDependencyConflicts(state, movePlan.snappedRequests);
+      const conflicts = measurePlannerPerformance(
+        "drag.end.detectConflicts",
+        () => detectDependencyConflicts(state, movePlan.snappedRequests),
+        {
+          placementCount: movePlan.snappedRequests.length,
+        }
+      );
       const traceMetadata = {
         selectedProjectIds: movePlan.projectIds,
         rawPlacements: movePlan.rawRequests,
@@ -745,6 +1074,9 @@ export function ScheduleWorkbench({
           source: `drag-${active.intent}`,
           traceMetadata,
         });
+        finalizeDragSession("dependency-conflict", {
+          projectIds: movePlan.projectIds,
+        });
         return;
       }
 
@@ -766,6 +1098,9 @@ export function ScheduleWorkbench({
           projectIds: movePlan.projectIds,
         });
         setPendingEarlierShift(earliestShiftPrompt);
+        finalizeDragSession("earlier-shift-prompt", {
+          projectIds: movePlan.projectIds,
+        });
         return;
       }
 
@@ -776,17 +1111,38 @@ export function ScheduleWorkbench({
         projectIds: movePlan.projectIds,
         normalizedPlacements: movePlan.normalizedRequests,
       });
-      commitPlacementRequests(movePlan.snappedRequests, {
-        source: "drag-move",
-        dependencyResolution: "preserve-dependencies",
-        traceMetadata,
+      measurePlannerPerformance("drag.end.commitDispatch", () => {
+        commitPlacementRequests(movePlan.snappedRequests, {
+          source: "drag-move",
+          dependencyResolution: "preserve-dependencies",
+          traceMetadata,
+        });
       });
       setPendingPlacement(null);
+      finalizeDragSession("committed", {
+        projectIds: movePlan.projectIds,
+      });
       return;
     }
 
-    const nextPlacement = buildScheduledPlacement(activeWithSelection, bucket, state.closures);
+    const nextPlacement = measurePlannerPerformance(
+      "drag.end.buildPlacement",
+      () => buildScheduledPlacement(activeWithSelection, bucket, state.closures),
+      {
+        hoveredBucketId: bucket.bucketId,
+        intent: active.intent,
+      }
+    );
     if (!nextPlacement) {
+      tracePlannerUi(traceEnabled, "drag.end", {
+        dragId,
+        outcome: "invalid-placement",
+        durationMs: dragDurationMs,
+        projectIds: [active.projectId],
+      });
+      finalizeDragSession("invalid-placement", {
+        projectIds: [active.projectId],
+      });
       return;
     }
 
@@ -806,10 +1162,19 @@ export function ScheduleWorkbench({
         projectIds: [active.projectId],
         normalizedPlacements: [normalizedPlacementRequest],
       });
+      finalizeDragSession("noop", {
+        projectIds: [active.projectId],
+      });
       return;
     }
 
-    const conflicts = detectDependencyConflicts(state, [normalizedPlacementRequest]);
+    const conflicts = measurePlannerPerformance(
+      "drag.end.detectConflicts",
+      () => detectDependencyConflicts(state, [normalizedPlacementRequest]),
+      {
+        placementCount: 1,
+      }
+    );
     const traceMetadata = {
       selectedProjectIds: [active.projectId],
       rawPlacements: [
@@ -840,6 +1205,9 @@ export function ScheduleWorkbench({
         source: `drag-${active.intent}`,
         traceMetadata,
       });
+      finalizeDragSession("dependency-conflict", {
+        projectIds: [active.projectId],
+      });
       return;
     }
 
@@ -859,6 +1227,9 @@ export function ScheduleWorkbench({
           projectIds: [active.projectId],
         });
         setPendingEarlierShift(prompt);
+        finalizeDragSession("earlier-shift-prompt", {
+          projectIds: [active.projectId],
+        });
         return;
       }
     }
@@ -870,12 +1241,17 @@ export function ScheduleWorkbench({
       projectIds: [active.projectId],
       normalizedPlacements: [normalizedPlacementRequest],
     });
-    placeProject(active.projectId, normalizedPlacementRequest.placement, {
-      source: `drag-${active.intent}`,
-      dependencyResolution: "preserve-dependencies",
-      traceMetadata,
+    measurePlannerPerformance("drag.end.commitDispatch", () => {
+      placeProject(active.projectId, normalizedPlacementRequest.placement, {
+        source: `drag-${active.intent}`,
+        dependencyResolution: "preserve-dependencies",
+        traceMetadata,
+      });
     });
     setPendingPlacement(null);
+    finalizeDragSession("committed", {
+      projectIds: [active.projectId],
+    });
   };
 
   const plannerCollisionDetection = useMemo<CollisionDetection>(
@@ -957,19 +1333,27 @@ export function ScheduleWorkbench({
         onDragOver={handleDragOver}
         onDragEnd={handleDragEnd}
         onDragCancel={() => {
+          const dragSession = dragSessionRef.current;
+          cancelQueuedHoverUpdate();
           handledDragIdRef.current = null;
           hoveredBucketIdRef.current = null;
           hoveredBucketRef.current = null;
           lastValidTimelineBucketRef.current = null;
           lastPointerCoordinatesRef.current = null;
           dragSessionRef.current = null;
-          previewTraceRef.current = null;
+          lastPreviewSignatureRef.current = null;
+          activeDragRef.current = null;
+          resetExactPreviewWorker(false);
+          resetPlannerDragPreviewSession();
           tracePlannerUi(traceEnabled, "drag.end", {
             dragId: null,
             outcome: "cancelled",
           });
+          schedulePlannerPerformanceSummary(dragSession?.performanceSession ?? null, {
+            dragId: dragSession?.dragId ?? null,
+            outcome: "cancelled",
+          });
           setActiveDrag(null);
-          setHoveredBucket(null);
         }}
       >
         <DraftSidebar
@@ -1253,8 +1637,6 @@ export function ScheduleWorkbench({
 
             <TimelineCanvas
               projects={state.projects}
-              previewDelta={previewState?.previewDelta ?? null}
-              hoveredBucket={hoveredBucket}
               dependencies={state.dependencies}
               customClosures={state.customClosures}
               closures={state.closures}
@@ -1292,7 +1674,7 @@ export function ScheduleWorkbench({
                   return;
                 }
 
-                if (!selectedProjectIds.includes(projectId)) {
+                if (!selectedProjectIdSet.has(projectId)) {
                   setSelectedProjectIds([]);
                 }
               }}

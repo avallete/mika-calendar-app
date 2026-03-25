@@ -20,6 +20,10 @@ import type {
 } from "@/lib/planner/types";
 import { isScheduledProject } from "@/lib/planner/types";
 
+export function buildProjectsById(projects: Project[]) {
+  return new Map(projects.map((project) => [project.id, project] as const));
+}
+
 export function normalizePlacementRequest(
   request: ProjectPlacementRequest,
   closures: ClosurePeriod[]
@@ -32,6 +36,24 @@ export function normalizePlacementRequest(
       durationHalfDays: Math.max(1, request.placement.durationHalfDays),
     },
   };
+}
+
+export function buildPlacementRequestsSignature(
+  placementRequests: ProjectPlacementRequest[]
+) {
+  return [...placementRequests]
+    .map((request) => ({
+      projectId: request.projectId,
+      teamId: request.placement.teamId,
+      startSlot: request.placement.startSlot,
+      durationHalfDays: request.placement.durationHalfDays,
+    }))
+    .sort((left, right) => left.projectId.localeCompare(right.projectId))
+    .map(
+      (request) =>
+        `${request.projectId}:${request.teamId}:${request.startSlot}:${request.durationHalfDays}`
+    )
+    .join("|");
 }
 
 function getLatestAllowedResizeStartSlot(
@@ -97,6 +119,20 @@ export function buildMovePlacementRequests(
   projects: Project[],
   closures: ClosurePeriod[]
 ) {
+  return buildMovePlacementRequestsFromLookup(
+    active,
+    bucket,
+    buildProjectsById(projects),
+    closures
+  );
+}
+
+export function buildMovePlacementRequestsFromLookup(
+  active: Extract<DragProjectMeta, { type: "scheduled" }>,
+  bucket: CalendarBucket,
+  projectsById: ReadonlyMap<string, Project>,
+  closures: ClosurePeriod[]
+) {
   const selectionProjectIds =
     active.selectionProjectIds && active.selectionProjectIds.length
       ? active.selectionProjectIds
@@ -108,7 +144,7 @@ export function buildMovePlacementRequests(
 
   const rawRequests = selectionProjectIds
     .map((projectId) => {
-      const project = projects.find((candidate) => candidate.id === projectId);
+      const project = projectsById.get(projectId);
       if (!project || !isScheduledProject(project)) {
         return null;
       }

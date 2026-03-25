@@ -1,7 +1,12 @@
 import { describe, expect, test } from "bun:test";
 
 import { makeSlotKey } from "@/lib/planner/calendar";
-import { buildMovePlacementRequests } from "@/lib/planner/drag-placements";
+import {
+  buildMovePlacementRequests,
+  buildMovePlacementRequestsFromLookup,
+  buildPlacementRequestsSignature,
+  buildProjectsById,
+} from "@/lib/planner/drag-placements";
 import type { CalendarBucket, DragProjectMeta, Project } from "@/lib/planner/types";
 
 function makeScheduledProject(overrides: Partial<Project> = {}): Project {
@@ -122,5 +127,63 @@ describe("drag placements", () => {
 
     expect(movePlan?.normalizedRequests[0].placement.startSlot).toBe(makeSlotKey("2026-03-30", "AM"));
     expect(movePlan?.snappedRequests[0].placement.startSlot).toBe(makeSlotKey("2026-03-30", "AM"));
+  });
+
+  test("builds the same move plan from a project lookup map", () => {
+    const projects = [
+      makeScheduledProject({
+        id: "active",
+        title: "Active",
+        scheduledStartSlot: makeSlotKey("2026-03-27", "AM"),
+        sequenceOrder: 0,
+      }),
+      makeScheduledProject({
+        id: "follower",
+        title: "Follower",
+        scheduledStartSlot: makeSlotKey("2026-03-27", "PM"),
+        sequenceOrder: 1,
+      }),
+    ];
+
+    const movePlan = buildMovePlacementRequestsFromLookup(
+      makeActiveDrag({
+        selectionProjectIds: ["active", "follower"],
+      }),
+      makeBucket(makeSlotKey("2026-03-31", "AM")),
+      buildProjectsById(projects),
+      []
+    );
+
+    expect(movePlan?.snappedRequests.map((request) => request.placement.startSlot)).toEqual([
+      makeSlotKey("2026-03-31", "AM"),
+      makeSlotKey("2026-03-31", "PM"),
+    ]);
+  });
+
+  test("produces the same signature for raw hover buckets that normalize to the same placement", () => {
+    const projects = [
+      makeScheduledProject({
+        id: "active",
+        title: "Active",
+        scheduledStartSlot: makeSlotKey("2026-03-27", "AM"),
+      }),
+    ];
+
+    const weekendMovePlan = buildMovePlacementRequests(
+      makeActiveDrag(),
+      makeBucket(makeSlotKey("2026-03-28", "AM")),
+      projects,
+      []
+    );
+    const mondayMovePlan = buildMovePlacementRequests(
+      makeActiveDrag(),
+      makeBucket(makeSlotKey("2026-03-30", "AM")),
+      projects,
+      []
+    );
+
+    expect(
+      buildPlacementRequestsSignature(weekendMovePlan?.normalizedRequests ?? [])
+    ).toBe(buildPlacementRequestsSignature(mondayMovePlan?.normalizedRequests ?? []));
   });
 });

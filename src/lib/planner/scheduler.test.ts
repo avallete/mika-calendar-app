@@ -6,6 +6,7 @@ import {
   deleteProjectFromState,
   getEarlierShiftPrompt,
   getTouchingProjectChain,
+  previewProjectPlacements,
   rescheduleProjects,
   setSchedulerTraceEnabled,
   updateProjectPlacement,
@@ -409,6 +410,74 @@ describe("scheduler", () => {
     expect(calls.some((entry) => entry.includes("updateProjectPlacement"))).toBe(true);
     expect(calls.some((entry) => entry.includes("queues.before"))).toBe(true);
     expect(calls.some((entry) => entry === "end")).toBe(true);
+  });
+
+  test("keeps preview tracing summary-only when scheduler tracing is enabled", () => {
+    const originalGroupCollapsed = console.groupCollapsed;
+    const originalLog = console.log;
+    const originalGroupEnd = console.groupEnd;
+    const calls: string[] = [];
+
+    console.groupCollapsed = ((...args: unknown[]) => {
+      calls.push(`group:${String(args[0])}`);
+    }) as typeof console.groupCollapsed;
+    console.log = ((...args: unknown[]) => {
+      calls.push(`log:${String(args[0])}`);
+    }) as typeof console.log;
+    console.groupEnd = (() => {
+      calls.push("end");
+    }) as typeof console.groupEnd;
+
+    try {
+      setSchedulerTraceEnabled(true);
+      updateProjectPlacement(
+        baseState(),
+        "a-2",
+        {
+          teamId: "team-a",
+          startSlot: makeSlotKey("2026-03-27", "AM"),
+          durationHalfDays: 2,
+        },
+        {
+          source: "preview",
+        }
+      );
+    } finally {
+      setSchedulerTraceEnabled(false);
+      console.groupCollapsed = originalGroupCollapsed;
+      console.log = originalLog;
+      console.groupEnd = originalGroupEnd;
+    }
+
+    expect(calls.some((entry) => entry.includes("updateProjectPlacement"))).toBe(true);
+    expect(calls.some((entry) => entry.includes("summary"))).toBe(true);
+    expect(calls.some((entry) => entry.includes("queues.before"))).toBe(false);
+    expect(calls.some((entry) => entry.includes("changes"))).toBe(false);
+    expect(calls.some((entry) => entry === "end")).toBe(true);
+  });
+
+  test("returns changed project ids for exact preview scheduling", () => {
+    const result = previewProjectPlacements(
+      baseState(),
+      [
+        {
+          projectId: "a-1",
+          placement: {
+            teamId: "team-a",
+            startSlot: makeSlotKey("2026-03-24", "AM"),
+            durationHalfDays: 6,
+          },
+        },
+      ],
+      {
+        dependencyResolution: "preserve-dependencies",
+      }
+    );
+
+    expect(result.changedProjectIds.sort()).toEqual(["a-1", "a-2", "b-1"]);
+    expect(
+      result.nextState.projects.find((project) => project.id === "b-1")?.scheduledStartSlot
+    ).toBe(makeSlotKey("2026-03-27", "AM"));
   });
 
   test("detects dependency conflicts when a successor is dragged before its predecessor", () => {

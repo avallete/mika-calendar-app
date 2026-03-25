@@ -32,6 +32,7 @@ import {
   collectTimelineRelevantDates,
   getTodayDateString,
 } from "@/lib/planner/timeline-range";
+import { measurePlannerPerformance } from "@/lib/planner/drag-performance";
 
 type ScheduledComputation = ReturnType<typeof advanceWorkingDuration>;
 
@@ -52,6 +53,11 @@ type ScheduledProjectLike = Project & {
   scheduledStartSlot: SlotKey;
   scheduledDurationHalfDays: number;
   sequenceOrder: number;
+};
+
+type PlacementUpdateResult = {
+  nextState: PlannerState;
+  changedProjectIds: string[];
 };
 
 const MAX_ITERATIONS = 12;
@@ -822,7 +828,26 @@ export function updateProjectPlacements(
   state: PlannerState,
   placementRequests: ProjectPlacementRequest[],
   options?: ProjectPlacementOptions
+): PlannerState {
+  return updateProjectPlacementsWithResult(state, placementRequests, options).nextState;
+}
+
+export function previewProjectPlacements(
+  state: PlannerState,
+  placementRequests: ProjectPlacementRequest[],
+  options?: Omit<ProjectPlacementOptions, "source">
 ) {
+  return updateProjectPlacementsWithResult(state, placementRequests, {
+    ...options,
+    source: "preview",
+  });
+}
+
+function updateProjectPlacementsWithResult(
+  state: PlannerState,
+  placementRequests: ProjectPlacementRequest[],
+  options?: ProjectPlacementOptions
+): PlacementUpdateResult {
   const anticipatedState = materializePlannerState({
     ...state,
     projects: applyPlacementRequests(state.projects, placementRequests),
@@ -838,18 +863,28 @@ export function updateProjectPlacements(
     dependencyResolution === "break-conflicting-links"
       ? removeDependencies(state.dependencies, options?.removeDependencyIds)
       : anticipatedState.dependencies;
+  const traceMetadata = summaryOnly
+    ? {
+        projectIds: normalizedRequests.map((request) => request.projectId),
+        source: options?.source ?? "unknown",
+        strategy,
+        dependencyResolution,
+        selectionSize: normalizedRequests.length,
+        placementCount: normalizedRequests.length,
+      }
+    : {
+        projectIds: normalizedRequests.map((request) => request.projectId),
+        source: options?.source ?? "unknown",
+        strategy,
+        dependencyResolution,
+        rawPlacements: placementRequests,
+        normalizedPlacements: normalizedRequests,
+        brokenDependencyIds: options?.removeDependencyIds ?? [],
+        ...options?.traceMetadata,
+      };
   const trace = startSchedulerTrace(
     normalizedRequests.length === 1 ? "updateProjectPlacement" : "updateProjectPlacements",
-    {
-      projectIds: normalizedRequests.map((request) => request.projectId),
-      source: options?.source ?? "unknown",
-      strategy,
-      dependencyResolution,
-      rawPlacements: placementRequests,
-      normalizedPlacements: normalizedRequests,
-      brokenDependencyIds: options?.removeDependencyIds ?? [],
-      ...options?.traceMetadata,
-    }
+    traceMetadata
   );
 
   const insertedProjects = applyPlacementRequests(anticipatedState.projects, normalizedRequests);
@@ -873,20 +908,46 @@ export function updateProjectPlacements(
     traceLog(trace, "dependencies.broken", options.removeDependencyIds);
   }
 
-  const nextState = rescheduleProjects(
-    {
-      ...anticipatedState,
-      dependencies: nextDependencies,
-      projects: nextProjects,
-    },
-    {
-      trace,
-      summaryOnly,
-    }
-  );
+  const nextState = summaryOnly
+    ? measurePlannerPerformance(
+        "drag.preview.exact.scheduler",
+        () =>
+          rescheduleProjects(
+            {
+              ...anticipatedState,
+              dependencies: nextDependencies,
+              projects: nextProjects,
+            },
+            {
+              trace,
+              summaryOnly,
+            }
+          ),
+        {
+          strategy,
+          dependencyResolution,
+          selectionSize: normalizedRequests.length,
+        }
+      )
+    : rescheduleProjects(
+        {
+          ...anticipatedState,
+          dependencies: nextDependencies,
+          projects: nextProjects,
+        },
+        {
+          trace,
+          summaryOnly,
+        }
+      );
 
   finishSchedulerTrace(trace);
-  return nextState;
+  return {
+    nextState,
+    changedProjectIds: listScheduledChanges(state.projects, nextState.projects).map(
+      (change) => change.id
+    ),
+  };
 }
 
 export function updateProjectPlacement(

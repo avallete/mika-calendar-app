@@ -3,7 +3,7 @@
 import { useDraggable, useDroppable } from "@dnd-kit/core";
 import { useWindowVirtualizer } from "@tanstack/react-virtual";
 import { CSS } from "@dnd-kit/utilities";
-import { addDays, endOfMonth, format, getDate, getMonth, parseISO } from "date-fns";
+import { endOfMonth, format, getDate, getMonth, parseISO } from "date-fns";
 import { fr as localeFr } from "date-fns/locale";
 import {
   ArrowRightLeft,
@@ -16,6 +16,7 @@ import {
 } from "lucide-react";
 import {
   memo,
+  Profiler,
   useEffect,
   useLayoutEffect,
   useEffectEvent,
@@ -23,6 +24,7 @@ import {
   useRef,
   useState,
   useTransition,
+  type ProfilerOnRenderCallback,
 } from "react";
 
 import { Badge } from "@/components/ui/badge";
@@ -39,23 +41,36 @@ import {
 } from "@/components/ui/popover";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import {
-  advanceWorkingDuration,
-  compareSlotKeys,
-  makeSlotKey,
   parseSlotKey,
 } from "@/lib/planner/calendar";
 import {
   getClosureImpactLabelFr,
   getClosureTypeLabelFr,
 } from "@/lib/planner/day-markers";
+import { getActivePlannerDragPreview } from "@/lib/planner/drag-preview";
+import { usePlannerDragPreviewSnapshot } from "@/lib/planner/drag-preview-store";
+import {
+  measurePlannerPerformance,
+  recordPlannerProfilerRender,
+} from "@/lib/planner/drag-performance";
 import { fr } from "@/lib/i18n/fr";
+import {
+  buildDependencyCountByProjectId,
+  buildSectionTeamProjectMap,
+  buildTimelineSectionOverlayViews,
+  buildTimelineSectionRowViews,
+  EMPTY_SECTION_TEAM_PROJECTS,
+  EMPTY_STRING_SET,
+  slotBelongsToSection,
+  type SectionTeamProjectMap,
+  type TimelineTeamOverlayView,
+  type TimelineTeamRowView,
+} from "@/lib/planner/timeline-render";
 import {
   buildTimelineYearSummaries,
   getTimelineMonthId,
   shiftTimelineDate,
 } from "@/lib/planner/timeline-folding";
-import { makeCalendarRowSurfaceId } from "@/lib/planner/timeline-hover";
-import { getTimelineSectionIdsForScheduledProject } from "@/lib/planner/timeline-preview";
 import {
   getTimelineScrollTop,
   shouldTriggerTimelineScroll,
@@ -72,7 +87,6 @@ import {
   getVirtualizedMonthTranslateY,
 } from "@/lib/planner/timeline-year-view";
 import type {
-  CalendarBucket,
   CalendarDayMarkerTone,
   CalendarDayState,
   ClosurePeriod,
@@ -81,11 +95,9 @@ import type {
   ProjectDependency,
   ProjectPlacement,
   QuickPlacementState,
-  ScheduledTimelineProject,
   SlotKey,
   Team,
   TeamId,
-  TimelinePreviewDelta,
   TimelineViewMode,
   YearMonthSection,
 } from "@/lib/planner/types";
@@ -98,40 +110,14 @@ type CalendarFocusEvent = {
   endDate: string;
 } | null;
 
-function getMonthSegmentBounds(
-  startSlot: SlotKey,
-  endSlotExclusive: SlotKey,
-  section: YearMonthSection
-) {
-  const monthStartSlot = makeSlotKey(section.startDate, "AM");
-  const monthEndExclusive = makeSlotKey(
-    format(addDays(parseISO(section.endDate), 1), "yyyy-MM-dd"),
-    "AM"
-  );
-
-  const boundedStart =
-    compareSlotKeys(startSlot, monthStartSlot) < 0 ? monthStartSlot : startSlot;
-  const boundedEnd =
-    compareSlotKeys(endSlotExclusive, monthEndExclusive) > 0
-      ? monthEndExclusive
-      : endSlotExclusive;
-
-  if (compareSlotKeys(boundedEnd, boundedStart) <= 0) {
-    return null;
-  }
-
-  const toOffset = (slotKey: SlotKey) => {
-    const { date, part } = parseSlotKey(slotKey);
-    const dayOffset =
-      (parseISO(date).getTime() - parseISO(section.startDate).getTime()) / (1000 * 60 * 60 * 24);
-    return dayOffset + (part === "PM" ? 0.5 : 0);
-  };
-
-  return {
-    startOffset: toOffset(boundedStart),
-    endOffset: toOffset(boundedEnd),
-  };
-}
+const handlePlannerProfilerRender: ProfilerOnRenderCallback = (
+  id,
+  phase,
+  actualDuration,
+  baseDuration
+) => {
+  recordPlannerProfilerRender(id, phase, actualDuration, baseDuration);
+};
 
 function formatFocusRange(startDate: string, endDate: string) {
   if (startDate === endDate) {
@@ -240,7 +226,7 @@ function ScheduledProjectCard({
   dependencyCount,
   team,
   selected,
-  dimmed,
+  dimmed = false,
   onSelect,
   onPointerDown,
 }: {
@@ -255,7 +241,7 @@ function ScheduledProjectCard({
   dependencyCount: number;
   team: Team | null;
   selected: boolean;
-  dimmed: boolean;
+  dimmed?: boolean;
   onSelect: (projectId: string, shiftKey: boolean) => void;
   onPointerDown: (projectId: string, shiftKey: boolean) => void;
 }) {
@@ -654,19 +640,8 @@ function DayHeaderCell({
   );
 }
 
-const EMPTY_SCHEDULED_PROJECTS: ScheduledTimelineProject[] = [];
-const EMPTY_SECTION_TEAM_PROJECTS: SectionTeamProjectMap = new Map();
-const EMPTY_PREVIEW_DELTA: TimelinePreviewDelta = {
-  projects: [],
-  changedProjectIds: [],
-  primaryProjectId: null,
-  touchedSectionIds: [],
-  touchedTeamIds: [],
-};
 const YEAR_MONTH_ESTIMATE_BASE_PX = 180;
 const YEAR_ROW_ESTIMATE_PX = 132;
-
-type SectionTeamProjectMap = Map<string, Map<TeamId, ScheduledTimelineProject[]>>;
 
 type TimelineScrollRequest = {
   token: number;
@@ -690,89 +665,6 @@ function traceTimelineUi(enabled: boolean, label: string, payload: unknown) {
   }
 
   console.log(`[planner ui trace] ${label} ${stringifyTracePayload(payload)}`);
-}
-
-function buildSectionTeamProjectMap(
-  projects: ScheduledTimelineProject[],
-  closures: ClosurePeriod[]
-): SectionTeamProjectMap {
-  const projectsBySection = new Map<string, Map<TeamId, ScheduledTimelineProject[]>>();
-
-  for (const project of projects) {
-    for (const sectionId of getTimelineSectionIdsForScheduledProject(project, closures)) {
-      const sectionProjects =
-        projectsBySection.get(sectionId) ?? new Map<TeamId, ScheduledTimelineProject[]>();
-      const teamProjects = sectionProjects.get(project.scheduledTeam) ?? [];
-      teamProjects.push(project);
-      sectionProjects.set(project.scheduledTeam, teamProjects);
-      projectsBySection.set(sectionId, sectionProjects);
-    }
-  }
-
-  for (const sectionProjects of projectsBySection.values()) {
-    for (const teamProjects of sectionProjects.values()) {
-      teamProjects.sort((left, right) => {
-        const startComparison = compareSlotKeys(
-          left.scheduledStartSlot,
-          right.scheduledStartSlot
-        );
-
-        if (startComparison !== 0) {
-          return startComparison;
-        }
-
-        if (left.sequenceOrder !== right.sequenceOrder) {
-          return left.sequenceOrder - right.sequenceOrder;
-        }
-
-        return left.id.localeCompare(right.id);
-      });
-    }
-  }
-
-  return projectsBySection;
-}
-
-function buildDependencyCountByProjectId(dependencies: ProjectDependency[]) {
-  const counts = new Map<string, number>();
-
-  for (const dependency of dependencies) {
-    counts.set(
-      dependency.successorProjectId,
-      (counts.get(dependency.successorProjectId) ?? 0) + 1
-    );
-  }
-
-  return counts;
-}
-
-function getSectionTeamProjects(
-  projectsBySection: SectionTeamProjectMap,
-  sectionId: string,
-  teamId: TeamId
-) {
-  return projectsBySection.get(sectionId)?.get(teamId) ?? EMPTY_SCHEDULED_PROJECTS;
-}
-
-function slotBelongsToSection(slotKey: SlotKey, section: YearMonthSection) {
-  const { date } = parseSlotKey(slotKey);
-  return date >= section.startDate && date <= section.endDate;
-}
-
-function getSlotBoundsInSection(slotKey: SlotKey, section: YearMonthSection) {
-  if (!slotBelongsToSection(slotKey, section)) {
-    return null;
-  }
-
-  const { date, part } = parseSlotKey(slotKey);
-  const dayOffset =
-    (parseISO(date).getTime() - parseISO(section.startDate).getTime()) / (1000 * 60 * 60 * 24);
-  const startOffset = dayOffset + (part === "PM" ? 0.5 : 0);
-
-  return {
-    left: `${(startOffset / section.dayCount) * 100}%`,
-    width: `${(0.5 / section.dayCount) * 100}%`,
-  };
 }
 
 const SharedMonthHeader = memo(function SharedMonthHeader({
@@ -901,17 +793,13 @@ const SharedExpandedMonthSection = memo(function SharedExpandedMonthSection({
   dayStates,
   teams,
   committedProjectsBySection,
-  previewProjectsBySection,
-  previewChangedProjectIds,
-  previewPrimaryProjectId,
   dependencyCountByProjectId,
   closures,
   pendingPlacement,
-  hoveredBucket,
   dragActive,
   todayDate,
   focusedRange,
-  selectedProjectIds,
+  selectedProjectIdSet,
   onSelectProject,
   onProjectPointerDown,
 }: {
@@ -920,83 +808,91 @@ const SharedExpandedMonthSection = memo(function SharedExpandedMonthSection({
   dayStates: Record<string, CalendarDayState>;
   teams: Team[];
   committedProjectsBySection: SectionTeamProjectMap;
-  previewProjectsBySection: SectionTeamProjectMap;
-  previewChangedProjectIds: string[];
-  previewPrimaryProjectId: string | null;
   dependencyCountByProjectId: Map<string, number>;
   closures: ClosurePeriod[];
   pendingPlacement: QuickPlacementState | null;
-  hoveredBucket: CalendarBucket | null;
   dragActive: boolean;
   todayDate: string;
   focusedRange: CalendarFocusEvent;
-  selectedProjectIds: string[];
+  selectedProjectIdSet: ReadonlySet<string>;
   onSelectProject: (projectId: string, shiftKey: boolean) => void;
   onProjectPointerDown: (projectId: string, shiftKey: boolean) => void;
 }) {
+  const rowViews = useMemo(
+    () =>
+      measurePlannerPerformance("timeline.static.render", () =>
+        buildTimelineSectionRowViews({
+          teams,
+          section,
+          closures,
+          committedProjectsBySection,
+          dependencyCountByProjectId,
+          selectedProjectIdSet,
+        })
+      ),
+    [
+      closures,
+      committedProjectsBySection,
+      dependencyCountByProjectId,
+      section,
+      selectedProjectIdSet,
+      teams,
+    ]
+  );
+
   return (
-    <section
-      data-section-anchor={section.id}
-      className="rounded-[28px] border border-border/70 bg-card/95 p-4 shadow-[0_24px_50px_-42px_rgba(15,23,42,0.55)] [contain:layout_paint]"
+    <Profiler
+      id={`SharedExpandedMonthSection:${section.id}`}
+      onRender={handlePlannerProfilerRender}
     >
-      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-        <div>
-          <p className="text-xs font-semibold uppercase tracking-[0.22em] text-muted-foreground">
-            {fr.schedule.monthOverview}
-          </p>
-          <h4 className="mt-1 font-heading text-xl font-semibold text-foreground">
-            {section.label}
-          </h4>
+      <section
+        data-section-anchor={section.id}
+        className="rounded-[28px] border border-border/70 bg-card/95 p-4 shadow-[0_24px_50px_-42px_rgba(15,23,42,0.55)] [contain:layout_paint]"
+      >
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <p className="text-xs font-semibold uppercase tracking-[0.22em] text-muted-foreground">
+              {fr.schedule.monthOverview}
+            </p>
+            <h4 className="mt-1 font-heading text-xl font-semibold text-foreground">
+              {section.label}
+            </h4>
+          </div>
+          <Badge variant="outline" className="rounded-full px-3 py-1 text-xs">
+            {section.dayCount} {fr.schedule.daysSuffix}
+          </Badge>
         </div>
-        <Badge variant="outline" className="rounded-full px-3 py-1 text-xs">
-          {section.dayCount} {fr.schedule.daysSuffix}
-        </Badge>
-      </div>
 
-      <div className="mt-4 overflow-hidden rounded-2xl border border-border/60 bg-card/70">
-        <SharedMonthHeader
-          section={section}
-          days={days}
-          dayStates={dayStates}
-          todayDate={todayDate}
-          focusedRange={focusedRange}
-          dragActive={dragActive}
-          focusAnchorsEnabled
-        />
+        <div className="mt-4 overflow-hidden rounded-2xl border border-border/60 bg-card/70">
+          <SharedMonthHeader
+            section={section}
+            days={days}
+            dayStates={dayStates}
+            todayDate={todayDate}
+            focusedRange={focusedRange}
+            dragActive={dragActive}
+            focusAnchorsEnabled
+          />
 
-        <div className="space-y-4 p-3">
-          {teams.map((team) => (
-            <SharedTimelineTeamRow
-              key={`${section.id}-${team.id}`}
-              team={team}
-              section={section}
-              days={days}
-              dayStates={dayStates}
-              closures={closures}
-              projects={getSectionTeamProjects(
-                committedProjectsBySection,
-                section.id,
-                team.id
-              )}
-              previewProjects={getSectionTeamProjects(
-                previewProjectsBySection,
-                section.id,
-                team.id
-              )}
-              previewChangedProjectIds={previewChangedProjectIds}
-              previewPrimaryProjectId={previewPrimaryProjectId}
-              dependencyCountByProjectId={dependencyCountByProjectId}
-              pendingPlacement={pendingPlacement}
-              hoveredBucket={hoveredBucket}
-              selectedProjectIds={selectedProjectIds}
-              focusedRange={focusedRange}
-              onSelectProject={onSelectProject}
-              onProjectPointerDown={onProjectPointerDown}
-            />
-          ))}
+          <div className="space-y-4 p-3">
+            {rowViews.map((rowView) => (
+              <SharedTimelineTeamRow
+                key={`${section.id}-${rowView.team.id}`}
+                rowView={rowView}
+                section={section}
+                days={days}
+                dayStates={dayStates}
+                closures={closures}
+                pendingPlacement={pendingPlacement}
+                focusedRange={focusedRange}
+                onSelectProject={onSelectProject}
+                onProjectPointerDown={onProjectPointerDown}
+              />
+            ))}
+          </div>
         </div>
-      </div>
-    </section>
+      </section>
+    </Profiler>
   );
 });
 
@@ -1057,17 +953,13 @@ function FoldedYearCard({
 function MonthModeView({
   summaries,
   committedProjectsBySection,
-  previewProjectsBySection,
-  previewChangedProjectIds,
-  previewPrimaryProjectId,
   dependencyCountByProjectId,
   closures,
   pendingPlacement,
-  hoveredBucket,
   dragActive,
   todayDate,
   focusedRange,
-  selectedProjectIds,
+  selectedProjectIdSet,
   teams,
   onOpenMonth,
   onOpenYear,
@@ -1076,17 +968,13 @@ function MonthModeView({
 }: {
   summaries: ReturnType<typeof buildTimelineYearSummaries>;
   committedProjectsBySection: SectionTeamProjectMap;
-  previewProjectsBySection: SectionTeamProjectMap;
-  previewChangedProjectIds: string[];
-  previewPrimaryProjectId: string | null;
   dependencyCountByProjectId: Map<string, number>;
   closures: ClosurePeriod[];
   pendingPlacement: QuickPlacementState | null;
-  hoveredBucket: CalendarBucket | null;
   dragActive: boolean;
   todayDate: string;
   focusedRange: CalendarFocusEvent;
-  selectedProjectIds: string[];
+  selectedProjectIdSet: ReadonlySet<string>;
   teams: Team[];
   onOpenMonth: (date: string) => void;
   onOpenYear: (year: number) => void;
@@ -1095,178 +983,134 @@ function MonthModeView({
 }) {
   const sectionRenderDataById = useMemo(
     () =>
-      new Map(
-        buildYearSectionRenderData(
-          summaries
-            .filter((yearSummary) => yearSummary.isActive)
-            .flatMap((yearSummary) => yearSummary.months.map((monthSummary) => monthSummary.section)),
-          closures
-        ).map((sectionData) => [sectionData.section.id, sectionData] as const)
+      measurePlannerPerformance("timeline.monthRenderData", () =>
+        new Map(
+          buildYearSectionRenderData(
+            summaries
+              .filter((yearSummary) => yearSummary.isActive)
+              .flatMap((yearSummary) =>
+                yearSummary.months.map((monthSummary) => monthSummary.section)
+              ),
+            closures
+          ).map((sectionData) => [sectionData.section.id, sectionData] as const)
+        )
       ),
     [closures, summaries]
   );
 
   return (
-    <div className="space-y-8">
-      {summaries.map((yearSummary) =>
-        yearSummary.isActive ? (
-          <section
-            key={yearSummary.year}
-            data-year-anchor={yearSummary.year}
-            className="space-y-4 scroll-mt-6"
-          >
-            <div className="rounded-[24px] border border-border/70 bg-background/90 px-4 py-3 shadow-[0_18px_40px_-34px_rgba(15,23,42,0.4)]">
-              <p className="text-xs font-semibold uppercase tracking-[0.22em] text-muted-foreground">
-                {fr.schedule.yearOverview}
-              </p>
-              <h3 className="mt-1 font-heading text-2xl font-semibold text-foreground">
-                {yearSummary.year}
-              </h3>
-            </div>
+    <Profiler id="MonthModeView" onRender={handlePlannerProfilerRender}>
+      <div className="space-y-8">
+        {summaries.map((yearSummary) =>
+          yearSummary.isActive ? (
+            <section
+              key={yearSummary.year}
+              data-year-anchor={yearSummary.year}
+              className="space-y-4 scroll-mt-6"
+            >
+              <div className="rounded-[24px] border border-border/70 bg-background/90 px-4 py-3 shadow-[0_18px_40px_-34px_rgba(15,23,42,0.4)]">
+                <p className="text-xs font-semibold uppercase tracking-[0.22em] text-muted-foreground">
+                  {fr.schedule.yearOverview}
+                </p>
+                <h3 className="mt-1 font-heading text-2xl font-semibold text-foreground">
+                  {yearSummary.year}
+                </h3>
+              </div>
 
-            <div className="space-y-4">
-              {yearSummary.months.map((monthSummary) => {
-                if (!monthSummary.isActive) {
+              <div className="space-y-4">
+                {yearSummary.months.map((monthSummary) => {
+                  if (!monthSummary.isActive) {
+                    return (
+                      <FoldedMonthCard
+                        key={monthSummary.section.id}
+                        summary={monthSummary}
+                        onOpen={() => onOpenMonth(monthSummary.section.startDate)}
+                      />
+                    );
+                  }
+
+                  const sectionData = sectionRenderDataById.get(monthSummary.section.id);
+                  if (!sectionData) {
+                    return null;
+                  }
+
                   return (
-                    <FoldedMonthCard
+                    <SharedExpandedMonthSection
                       key={monthSummary.section.id}
-                      summary={monthSummary}
-                      onOpen={() => onOpenMonth(monthSummary.section.startDate)}
+                      section={sectionData.section}
+                      days={sectionData.days}
+                      dayStates={sectionData.dayStates}
+                      teams={teams}
+                      committedProjectsBySection={committedProjectsBySection}
+                      dependencyCountByProjectId={dependencyCountByProjectId}
+                      closures={closures}
+                      pendingPlacement={pendingPlacement}
+                      dragActive={dragActive}
+                      todayDate={todayDate}
+                      focusedRange={focusedRange}
+                      selectedProjectIdSet={selectedProjectIdSet}
+                      onSelectProject={onSelectProject}
+                      onProjectPointerDown={onProjectPointerDown}
                     />
                   );
-                }
-
-                const sectionData = sectionRenderDataById.get(monthSummary.section.id);
-                if (!sectionData) {
-                  return null;
-                }
-
-                return (
-                  <SharedExpandedMonthSection
-                    key={monthSummary.section.id}
-                    section={sectionData.section}
-                    days={sectionData.days}
-                    dayStates={sectionData.dayStates}
-                    teams={teams}
-                    committedProjectsBySection={committedProjectsBySection}
-                    previewProjectsBySection={previewProjectsBySection}
-                    previewChangedProjectIds={previewChangedProjectIds}
-                    previewPrimaryProjectId={previewPrimaryProjectId}
-                    dependencyCountByProjectId={dependencyCountByProjectId}
-                    closures={closures}
-                    pendingPlacement={pendingPlacement}
-                    hoveredBucket={hoveredBucket}
-                    dragActive={dragActive}
-                    todayDate={todayDate}
-                    focusedRange={focusedRange}
-                    selectedProjectIds={selectedProjectIds}
-                    onSelectProject={onSelectProject}
-                    onProjectPointerDown={onProjectPointerDown}
-                  />
-                );
-              })}
-            </div>
-          </section>
-        ) : (
-          <FoldedYearCard
-            key={yearSummary.year}
-            summary={yearSummary}
-            onOpen={() => onOpenYear(yearSummary.year)}
-          />
-        )
-      )}
-    </div>
+                })}
+              </div>
+            </section>
+          ) : (
+            <FoldedYearCard
+              key={yearSummary.year}
+              summary={yearSummary}
+              onOpen={() => onOpenYear(yearSummary.year)}
+            />
+          )
+        )}
+      </div>
+    </Profiler>
   );
 }
 
 const SharedTimelineTeamRow = memo(function SharedTimelineTeamRow({
-  team,
+  rowView,
   section,
   days,
   dayStates,
   closures,
-  projects,
-  previewProjects,
-  previewChangedProjectIds,
-  previewPrimaryProjectId,
-  dependencyCountByProjectId,
   pendingPlacement,
-  hoveredBucket,
-  selectedProjectIds,
   focusedRange,
   onSelectProject,
   onProjectPointerDown,
 }: {
-  team: Team;
+  rowView: TimelineTeamRowView;
   section: YearMonthSection;
   days: string[];
   dayStates: Record<string, CalendarDayState>;
   closures: ClosurePeriod[];
-  projects: ScheduledTimelineProject[];
-  previewProjects: ScheduledTimelineProject[];
-  previewChangedProjectIds: string[];
-  previewPrimaryProjectId: string | null;
-  dependencyCountByProjectId: Map<string, number>;
   pendingPlacement: QuickPlacementState | null;
-  hoveredBucket: CalendarBucket | null;
-  selectedProjectIds: string[];
   focusedRange: CalendarFocusEvent;
   onSelectProject: (projectId: string, shiftKey: boolean) => void;
   onProjectPointerDown: (projectId: string, shiftKey: boolean) => void;
 }) {
-  const surface = useMemo(
-    () => ({
-      surfaceId: makeCalendarRowSurfaceId(section.id, team.id),
-      sectionId: section.id,
-      teamId: team.id,
-      startDate: section.startDate,
-      dayCount: section.dayCount,
-      granularity: "row-surface" as const,
-    }),
-    [section.dayCount, section.id, section.startDate, team.id]
-  );
   const { setNodeRef } = useDroppable({
-    id: surface.surfaceId,
-    data: surface,
+    id: rowView.surface.surfaceId,
+    data: rowView.surface,
   });
-  const hoveredBucketInRow =
-    hoveredBucket &&
-    hoveredBucket.teamId === team.id &&
-    slotBelongsToSection(hoveredBucket.startSlot, section)
-      ? hoveredBucket
-      : null;
-  const hoveredBounds = hoveredBucketInRow
-    ? getSlotBoundsInSection(hoveredBucketInRow.startSlot, section)
-    : null;
-  const pendingBucketInRow =
-    pendingPlacement &&
-    pendingPlacement.placement.teamId === team.id &&
-    slotBelongsToSection(pendingPlacement.placement.startSlot, section)
-      ? {
-          bucketId: pendingPlacement.triggerId,
-          startSlot: pendingPlacement.placement.startSlot,
-        }
-      : null;
-  const pendingBounds = pendingBucketInRow
-    ? getSlotBoundsInSection(pendingBucketInRow.startSlot, section)
-    : null;
 
   return (
     <div className="space-y-2">
       <div className="flex items-center justify-between">
-        <p className="text-sm font-medium text-foreground">{team.nameFr}</p>
+        <p className="text-sm font-medium text-foreground">{rowView.team.nameFr}</p>
         <Badge
           className="rounded-full border-0 px-3 py-1 text-xs text-foreground"
-          style={{ background: team.softColor ?? "rgba(255,255,255,0.8)" }}
+          style={{ background: rowView.team.softColor ?? "rgba(255,255,255,0.8)" }}
         >
-          {projects.length} {fr.schedule.scheduledCountSuffix}
+          {rowView.scheduledCount} {fr.schedule.scheduledCountSuffix}
         </Badge>
       </div>
 
       <div className="overflow-hidden rounded-2xl border border-border/60 bg-card/70">
         <div
           ref={setNodeRef}
-          data-timeline-row-surface={surface.surfaceId}
+          data-timeline-row-surface={rowView.surface.surfaceId}
           className="relative h-[104px]"
         >
           <div
@@ -1278,7 +1122,7 @@ const SharedTimelineTeamRow = memo(function SharedTimelineTeamRow({
 
               return (
                 <div
-                  key={`${surface.surfaceId}-${date}`}
+                  key={`${rowView.surface.surfaceId}-${date}`}
                   className={cn(
                     "relative min-w-0 border-r border-border/35 last:border-r-0",
                     tone.cell,
@@ -1292,91 +1136,142 @@ const SharedTimelineTeamRow = memo(function SharedTimelineTeamRow({
             })}
           </div>
 
-          {hoveredBounds ? (
-            <div
-              id={hoveredBucketInRow!.bucketId}
-              className="pointer-events-none absolute inset-y-0 z-[5] rounded-lg bg-primary/12 ring-1 ring-inset ring-primary/35"
-              style={hoveredBounds}
+          {rowView.scheduledCards.map((card) => (
+            <ScheduledProjectCard
+              key={`${section.id}-${card.project.id}`}
+              project={card.project}
+              calendarEndSlot={card.calendarEndSlot}
+              left={card.bounds.left}
+              width={card.bounds.width}
+              dependencyCount={card.dependencyCount}
+              team={rowView.team}
+              selected={card.selected}
+              onSelect={onSelectProject}
+              onPointerDown={onProjectPointerDown}
             />
-          ) : null}
-
-          {pendingBounds ? (
-            <PopoverTrigger
-              id={pendingBucketInRow!.bucketId}
-              nativeButton={false}
-              render={<div />}
-              aria-hidden="true"
-              tabIndex={-1}
-              className="pointer-events-none absolute inset-y-0 z-[6] rounded-lg bg-primary/10 ring-2 ring-inset ring-primary/55 shadow-[0_0_0_1px_rgba(37,99,235,0.16)]"
-              style={pendingBounds}
-            />
-          ) : null}
-
-          {projects.map((project) => {
-            const computed = advanceWorkingDuration(
-              project.scheduledStartSlot,
-              project.scheduledDurationHalfDays,
-              closures
-            );
-            const bounds = getMonthSegmentBounds(
-              project.scheduledStartSlot,
-              computed.calendarEndSlot,
-              section
-            );
-
-            if (!bounds) {
-              return null;
-            }
-
-            return (
-              <ScheduledProjectCard
-                key={`${section.id}-${project.id}`}
-                project={project}
-                calendarEndSlot={computed.calendarEndSlot}
-                left={`${(bounds.startOffset / section.dayCount) * 100}%`}
-                width={`${(Math.max(bounds.endOffset - bounds.startOffset, 0.48) / section.dayCount) * 100}%`}
-                dependencyCount={dependencyCountByProjectId.get(project.id) ?? 0}
-                team={team}
-                selected={selectedProjectIds.includes(project.id)}
-                dimmed={previewChangedProjectIds.includes(project.id)}
-                onSelect={onSelectProject}
-                onPointerDown={onProjectPointerDown}
-              />
-            );
-          })}
-
-          {previewProjects
-            .filter((project) => previewChangedProjectIds.includes(project.id))
-            .map((project) => {
-              const computed = advanceWorkingDuration(
-                project.scheduledStartSlot,
-                project.scheduledDurationHalfDays,
-                closures
-              );
-              const bounds = getMonthSegmentBounds(
-                project.scheduledStartSlot,
-                computed.calendarEndSlot,
-                section
-              );
-
-              if (!bounds) {
-                return null;
-              }
-
-              return (
-                <PreviewProjectCard
-                  key={`preview-${section.id}-${project.id}`}
-                  project={project}
-                  left={`${(bounds.startOffset / section.dayCount) * 100}%`}
-                  width={`${(Math.max(bounds.endOffset - bounds.startOffset, 0.48) / section.dayCount) * 100}%`}
-                  team={team}
-                  primary={project.id === previewPrimaryProjectId}
-                />
-              );
-            })}
+          ))}
+          <TimelineTeamRowOverlay
+            rowView={rowView}
+            section={section}
+            closures={closures}
+            pendingPlacement={pendingPlacement}
+          />
         </div>
       </div>
     </div>
+  );
+});
+
+const TimelineTeamRowOverlay = memo(function TimelineTeamRowOverlay({
+  rowView,
+  section,
+  closures,
+  pendingPlacement,
+}: {
+  rowView: TimelineTeamRowView;
+  section: YearMonthSection;
+  closures: ClosurePeriod[];
+  pendingPlacement: QuickPlacementState | null;
+}) {
+  const snapshot = usePlannerDragPreviewSnapshot();
+  const activePreview = getActivePlannerDragPreview(snapshot);
+  const hoveredInSection =
+    snapshot.hoveredBucket &&
+    snapshot.hoveredBucket.teamId === rowView.team.id &&
+    slotBelongsToSection(snapshot.hoveredBucket.startSlot, section);
+  const pendingInSection =
+    pendingPlacement &&
+    pendingPlacement.placement.teamId === rowView.team.id &&
+    slotBelongsToSection(pendingPlacement.placement.startSlot, section);
+  const previewTouchesRow =
+    activePreview?.touchedSectionIdSet.has(section.id) === true &&
+    activePreview.touchedTeamIdSet.has(rowView.team.id);
+  const overlayView = useMemo<TimelineTeamOverlayView | null>(() => {
+    if (!hoveredInSection && !pendingInSection && !previewTouchesRow) {
+      return null;
+    }
+
+    return (
+      measurePlannerPerformance(
+        "timeline.overlay.render",
+        () =>
+          buildTimelineSectionOverlayViews({
+            rowViews: [rowView],
+            section,
+            closures,
+            previewProjectsBySection: activePreview?.projectsBySection ?? EMPTY_SECTION_TEAM_PROJECTS,
+            previewChangedProjectIdSet:
+              activePreview?.changedProjectIdSet ?? EMPTY_STRING_SET,
+            previewPrimaryProjectId: activePreview?.delta.primaryProjectId ?? null,
+            pendingPlacement,
+            hoveredBucket: snapshot.hoveredBucket,
+          })[0] ?? null,
+        {
+          sectionId: section.id,
+          teamId: rowView.team.id,
+        }
+      ) ?? null
+    );
+  }, [
+    activePreview,
+    closures,
+    hoveredInSection,
+    pendingInSection,
+    pendingPlacement,
+    previewTouchesRow,
+    rowView,
+    section,
+    snapshot.hoveredBucket,
+  ]);
+
+  if (!overlayView) {
+    return null;
+  }
+
+  return (
+    <>
+      {overlayView.hoveredBounds ? (
+        <div
+          id={overlayView.hoveredBucket?.bucketId}
+          className="pointer-events-none absolute inset-y-0 z-[5] rounded-lg bg-primary/12 ring-1 ring-inset ring-primary/35"
+          style={overlayView.hoveredBounds}
+        />
+      ) : null}
+
+      {overlayView.pendingBounds ? (
+        <PopoverTrigger
+          id={overlayView.pendingBucket?.bucketId ?? undefined}
+          nativeButton={false}
+          render={<div />}
+          aria-hidden="true"
+          tabIndex={-1}
+          className="pointer-events-none absolute inset-y-0 z-[6] rounded-lg bg-primary/10 ring-2 ring-inset ring-primary/55 shadow-[0_0_0_1px_rgba(37,99,235,0.16)]"
+          style={overlayView.pendingBounds}
+        />
+      ) : null}
+
+      {overlayView.dimmedCards.map((card) => (
+        <div
+          key={`dimmed-${section.id}-${card.projectId}`}
+          className="pointer-events-none absolute top-3 z-[12] h-[92px] rounded-2xl bg-white/55 saturate-50 backdrop-blur-[1px]"
+          style={{
+            left: card.bounds.left,
+            width: card.bounds.width,
+          }}
+        />
+      ))}
+
+      {overlayView.previewCards.map((card) => (
+        <PreviewProjectCard
+          key={`preview-${section.id}-${card.project.id}`}
+          project={card.project}
+          left={card.bounds.left}
+          width={card.bounds.width}
+          team={rowView.team}
+          primary={card.primary}
+        />
+      ))}
+    </>
   );
 });
 
@@ -1385,21 +1280,15 @@ const VirtualizedYearSection = memo(function VirtualizedYearSection({
   teams,
   closures,
   committedProjectsBySection,
-  previewProjectsBySection,
-  previewChangedProjectIds,
-  previewPrimaryProjectId,
-  previewTouchedSectionIds,
   dependencyCountByProjectId,
   pendingPlacement,
-  hoveredBucket,
   dragActive,
   todayDate,
   focusedRange,
-  selectedProjectIds,
+  selectedProjectIdSet,
   scrollTargetSectionId,
   scrollRequestToken,
   scrollBehavior,
-  traceEnabled,
   onSelectProject,
   onProjectPointerDown,
 }: {
@@ -1407,35 +1296,27 @@ const VirtualizedYearSection = memo(function VirtualizedYearSection({
   teams: Team[];
   closures: ClosurePeriod[];
   committedProjectsBySection: SectionTeamProjectMap;
-  previewProjectsBySection: SectionTeamProjectMap;
-  previewChangedProjectIds: string[];
-  previewPrimaryProjectId: string | null;
-  previewTouchedSectionIds: string[];
   dependencyCountByProjectId: Map<string, number>;
   pendingPlacement: QuickPlacementState | null;
-  hoveredBucket: CalendarBucket | null;
   dragActive: boolean;
   todayDate: string;
   focusedRange: CalendarFocusEvent;
-  selectedProjectIds: string[];
+  selectedProjectIdSet: ReadonlySet<string>;
   scrollTargetSectionId: string;
   scrollRequestToken: number;
   scrollBehavior: ScrollBehavior;
-  traceEnabled: boolean;
   onSelectProject: (projectId: string, shiftKey: boolean) => void;
   onProjectPointerDown: (projectId: string, shiftKey: boolean) => void;
 }) {
   const yearRef = useRef<HTMLElement | null>(null);
   const [scrollMargin, setScrollMargin] = useState<number | null>(null);
-  const previewTouchedSectionIdSet = useMemo(
-    () => new Set(previewTouchedSectionIds),
-    [previewTouchedSectionIds]
-  );
   const sectionRenderData = useMemo(
     () =>
-      buildYearSectionRenderData(
-        yearSummary.months.map((month) => month.section),
-        closures
+      measurePlannerPerformance("timeline.monthRenderData", () =>
+        buildYearSectionRenderData(
+          yearSummary.months.map((month) => month.section),
+          closures
+        )
       ),
     [closures, yearSummary.months]
   );
@@ -1482,21 +1363,6 @@ const VirtualizedYearSection = memo(function VirtualizedYearSection({
     yearSummary.months,
   ]);
 
-  useEffect(() => {
-    traceTimelineUi(traceEnabled, "year.virtualized", {
-      year: yearSummary.year,
-      mountedMonthCount: virtualItems.length,
-      mountedRowCount: virtualItems.length * teams.length,
-      previewTouchedSectionCount: previewTouchedSectionIds.length,
-    });
-  }, [
-    previewTouchedSectionIds.length,
-    teams.length,
-    traceEnabled,
-    virtualItems.length,
-    yearSummary.year,
-  ]);
-
   return (
     <section
       ref={yearRef}
@@ -1520,7 +1386,6 @@ const VirtualizedYearSection = memo(function VirtualizedYearSection({
           }
 
           const { section, days, dayStates } = sectionData;
-          const sectionTouched = previewTouchedSectionIdSet.has(section.id);
 
           return (
             <div
@@ -1541,23 +1406,13 @@ const VirtualizedYearSection = memo(function VirtualizedYearSection({
                 dayStates={dayStates}
                 teams={teams}
                 committedProjectsBySection={committedProjectsBySection}
-                previewProjectsBySection={
-                  sectionTouched ? previewProjectsBySection : EMPTY_SECTION_TEAM_PROJECTS
-                }
-                previewChangedProjectIds={
-                  sectionTouched
-                    ? previewChangedProjectIds
-                    : EMPTY_PREVIEW_DELTA.changedProjectIds
-                }
-                previewPrimaryProjectId={sectionTouched ? previewPrimaryProjectId : null}
                 dependencyCountByProjectId={dependencyCountByProjectId}
                 closures={closures}
                 pendingPlacement={pendingPlacement}
-                hoveredBucket={sectionTouched ? hoveredBucket : null}
                 dragActive={dragActive}
                 todayDate={todayDate}
                 focusedRange={focusedRange}
-                selectedProjectIds={selectedProjectIds}
+                selectedProjectIdSet={selectedProjectIdSet}
                 onSelectProject={onSelectProject}
                 onProjectPointerDown={onProjectPointerDown}
               />
@@ -1574,21 +1429,15 @@ function YearModeView({
   teams,
   closures,
   committedProjectsBySection,
-  previewProjectsBySection,
-  previewChangedProjectIds,
-  previewPrimaryProjectId,
-  previewTouchedSectionIds,
   dependencyCountByProjectId,
   pendingPlacement,
-  hoveredBucket,
   dragActive,
   todayDate,
   focusedRange,
-  selectedProjectIds,
+  selectedProjectIdSet,
   scrollTargetSectionId,
   scrollRequestToken,
   scrollBehavior,
-  traceEnabled,
   onOpenYear,
   onSelectProject,
   onProjectPointerDown,
@@ -1597,69 +1446,57 @@ function YearModeView({
   teams: Team[];
   closures: ClosurePeriod[];
   committedProjectsBySection: SectionTeamProjectMap;
-  previewProjectsBySection: SectionTeamProjectMap;
-  previewChangedProjectIds: string[];
-  previewPrimaryProjectId: string | null;
-  previewTouchedSectionIds: string[];
   dependencyCountByProjectId: Map<string, number>;
   pendingPlacement: QuickPlacementState | null;
-  hoveredBucket: CalendarBucket | null;
   dragActive: boolean;
   todayDate: string;
   focusedRange: CalendarFocusEvent;
-  selectedProjectIds: string[];
+  selectedProjectIdSet: ReadonlySet<string>;
   scrollTargetSectionId: string;
   scrollRequestToken: number;
   scrollBehavior: ScrollBehavior;
-  traceEnabled: boolean;
   onOpenYear: (year: number) => void;
   onSelectProject: (projectId: string, shiftKey: boolean) => void;
   onProjectPointerDown: (projectId: string, shiftKey: boolean) => void;
 }) {
   return (
-    <div className="space-y-8">
-      {summaries.map((yearSummary) =>
-        yearSummary.isActive ? (
-          <VirtualizedYearSection
-            key={yearSummary.year}
-            yearSummary={yearSummary}
-            teams={teams}
-            closures={closures}
-            committedProjectsBySection={committedProjectsBySection}
-            previewProjectsBySection={previewProjectsBySection}
-            previewChangedProjectIds={previewChangedProjectIds}
-            previewPrimaryProjectId={previewPrimaryProjectId}
-            previewTouchedSectionIds={previewTouchedSectionIds}
-            dependencyCountByProjectId={dependencyCountByProjectId}
-            pendingPlacement={pendingPlacement}
-            hoveredBucket={hoveredBucket}
-            dragActive={dragActive}
-            todayDate={todayDate}
-            focusedRange={focusedRange}
-            selectedProjectIds={selectedProjectIds}
-            scrollTargetSectionId={scrollTargetSectionId}
-            scrollRequestToken={scrollRequestToken}
-            scrollBehavior={scrollBehavior}
-            traceEnabled={traceEnabled}
-            onSelectProject={onSelectProject}
-            onProjectPointerDown={onProjectPointerDown}
-          />
-        ) : (
-          <FoldedYearCard
-            key={yearSummary.year}
-            summary={yearSummary}
-            onOpen={() => onOpenYear(yearSummary.year)}
-          />
-        )
-      )}
-    </div>
+    <Profiler id="YearModeView" onRender={handlePlannerProfilerRender}>
+      <div className="space-y-8">
+        {summaries.map((yearSummary) =>
+          yearSummary.isActive ? (
+            <VirtualizedYearSection
+              key={yearSummary.year}
+              yearSummary={yearSummary}
+              teams={teams}
+              closures={closures}
+              committedProjectsBySection={committedProjectsBySection}
+              dependencyCountByProjectId={dependencyCountByProjectId}
+              pendingPlacement={pendingPlacement}
+              dragActive={dragActive}
+              todayDate={todayDate}
+              focusedRange={focusedRange}
+              selectedProjectIdSet={selectedProjectIdSet}
+              scrollTargetSectionId={scrollTargetSectionId}
+              scrollRequestToken={scrollRequestToken}
+              scrollBehavior={scrollBehavior}
+              onSelectProject={onSelectProject}
+              onProjectPointerDown={onProjectPointerDown}
+            />
+          ) : (
+            <FoldedYearCard
+              key={yearSummary.year}
+              summary={yearSummary}
+              onOpen={() => onOpenYear(yearSummary.year)}
+            />
+          )
+        )}
+      </div>
+    </Profiler>
   );
 }
 
 export function TimelineCanvas({
   projects,
-  previewDelta,
-  hoveredBucket,
   dependencies,
   customClosures,
   closures,
@@ -1680,8 +1517,6 @@ export function TimelineCanvas({
   onProjectPointerDown,
 }: {
   projects: Project[];
-  previewDelta: TimelinePreviewDelta | null;
-  hoveredBucket: CalendarBucket | null;
   dependencies: ProjectDependency[];
   customClosures: CustomClosure[];
   closures: ClosurePeriod[];
@@ -1726,9 +1561,10 @@ export function TimelineCanvas({
   const emitActiveDateChange = useEffectEvent((date: string) => {
     onActiveDateChange(date);
   });
-  const previewDeltaState = previewDelta ?? EMPTY_PREVIEW_DELTA;
-  const previewChangedProjectIds = previewDeltaState.changedProjectIds;
-  const previewPrimaryProjectId = previewDeltaState.primaryProjectId;
+  const selectedProjectIdSet = useMemo(
+    () => (selectedProjectIds.length ? new Set(selectedProjectIds) : EMPTY_STRING_SET),
+    [selectedProjectIds]
+  );
   const sortedTeams = useMemo(() => getSortedTeams(teams), [teams]);
   const scrollBehavior: ScrollBehavior =
     scrollRequest?.intent === "initial" ? "auto" : "smooth";
@@ -1743,10 +1579,6 @@ export function TimelineCanvas({
   const committedProjectsBySection = useMemo(
     () => buildSectionTeamProjectMap(committedScheduledProjects, closures),
     [closures, committedScheduledProjects]
-  );
-  const previewProjectsBySection = useMemo(
-    () => buildSectionTeamProjectMap(previewDeltaState.projects, closures),
-    [closures, previewDeltaState.projects]
   );
   const dependencyCountByProjectId = useMemo(
     () => buildDependencyCountByProjectId(dependencies),
@@ -1942,23 +1774,24 @@ export function TimelineCanvas({
   };
 
   return (
-    <Popover
-      open={Boolean(pendingPlacement)}
-      triggerId={pendingPlacement?.triggerId ?? null}
-      onOpenChange={(open, details) => {
-        if (!open) {
-          traceTimelineUi(traceEnabled, "quickPlacement.close", {
-            projectId: pendingPlacement?.projectId ?? null,
-            triggerId: pendingPlacement?.triggerId ?? null,
-            reason: details.reason,
-          });
-          onPendingPlacementChange(null);
-        }
-      }}
-    >
-      <Card className="overflow-hidden border-border/60 bg-card/95 shadow-[0_26px_55px_-44px_rgba(18,25,38,0.55)]">
-        <CardContent className="space-y-5 p-4 sm:p-5">
-          <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+    <Profiler id="TimelineCanvas" onRender={handlePlannerProfilerRender}>
+      <Popover
+        open={Boolean(pendingPlacement)}
+        triggerId={pendingPlacement?.triggerId ?? null}
+        onOpenChange={(open, details) => {
+          if (!open) {
+            traceTimelineUi(traceEnabled, "quickPlacement.close", {
+              projectId: pendingPlacement?.projectId ?? null,
+              triggerId: pendingPlacement?.triggerId ?? null,
+              reason: details.reason,
+            });
+            onPendingPlacementChange(null);
+          }
+        }}
+      >
+        <Card className="overflow-hidden border-border/60 bg-card/95 shadow-[0_26px_55px_-44px_rgba(18,25,38,0.55)]">
+          <CardContent className="space-y-5 p-4 sm:p-5">
+            <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
             <div>
               <p className="text-xs font-semibold uppercase tracking-[0.24em] text-muted-foreground">
                 {fr.schedule.canvasEyebrow}
@@ -2027,98 +1860,89 @@ export function TimelineCanvas({
             </div>
           </div>
 
-          {viewMode === "month" ? (
-            <MonthModeView
-              summaries={summaries}
-              committedProjectsBySection={committedProjectsBySection}
-              previewProjectsBySection={previewProjectsBySection}
-              previewChangedProjectIds={previewChangedProjectIds}
-              previewPrimaryProjectId={previewPrimaryProjectId}
-              dependencyCountByProjectId={dependencyCountByProjectId}
-              closures={closures}
-              pendingPlacement={pendingPlacement}
-              hoveredBucket={hoveredBucket}
-              dragActive={dragActive}
-              todayDate={todayDate}
-              focusedRange={focusEvent}
-              selectedProjectIds={selectedProjectIds}
-              teams={sortedTeams}
-              onOpenMonth={(date) =>
-                startNavigationTransition(() => {
-                  onActiveDateChange(date);
-                  setScrollRequest({
-                    token: (scrollRequestSequenceRef.current += 1),
-                    intent: "open-month",
-                    targetDate: date,
-                  });
-                })
-              }
-              onOpenYear={(year) =>
-                startNavigationTransition(() => {
-                  const nextDate = replaceYearInDate(activeDate, year);
-                  onActiveDateChange(nextDate);
-                  setScrollRequest({
-                    token: (scrollRequestSequenceRef.current += 1),
-                    intent: "open-year",
-                    targetDate: nextDate,
-                  });
-                })
-              }
-              onSelectProject={onSelectProject}
-              onProjectPointerDown={onProjectPointerDown}
-            />
-          ) : (
-            <YearModeView
-              summaries={summaries}
-              teams={sortedTeams}
-              closures={closures}
-              committedProjectsBySection={committedProjectsBySection}
-              previewProjectsBySection={previewProjectsBySection}
-              previewChangedProjectIds={previewChangedProjectIds}
-              previewPrimaryProjectId={previewPrimaryProjectId}
-              previewTouchedSectionIds={previewDeltaState.touchedSectionIds}
-              dependencyCountByProjectId={dependencyCountByProjectId}
-              pendingPlacement={pendingPlacement}
-              hoveredBucket={hoveredBucket}
-              dragActive={dragActive}
-              todayDate={todayDate}
-              focusedRange={focusEvent}
-              selectedProjectIds={selectedProjectIds}
-              scrollTargetSectionId={getTimelineMonthId(
-                scrollRequest?.targetDate ?? activeDate
-              )}
-              scrollRequestToken={scrollRequest?.token ?? 0}
-              scrollBehavior={scrollBehavior}
-              traceEnabled={traceEnabled}
-              onOpenYear={(year) =>
-                startNavigationTransition(() => {
-                  const nextDate = replaceYearInDate(activeDate, year);
-                  onActiveDateChange(nextDate);
-                  setScrollRequest({
-                    token: (scrollRequestSequenceRef.current += 1),
-                    intent: "open-year",
-                    targetDate: nextDate,
-                  });
-                })
-              }
-              onSelectProject={onSelectProject}
-              onProjectPointerDown={onProjectPointerDown}
-            />
-          )}
-        </CardContent>
-      </Card>
+            {viewMode === "month" ? (
+              <MonthModeView
+                summaries={summaries}
+                committedProjectsBySection={committedProjectsBySection}
+                dependencyCountByProjectId={dependencyCountByProjectId}
+                closures={closures}
+                pendingPlacement={pendingPlacement}
+                dragActive={dragActive}
+                todayDate={todayDate}
+                focusedRange={focusEvent}
+                selectedProjectIdSet={selectedProjectIdSet}
+                teams={sortedTeams}
+                onOpenMonth={(date) =>
+                  startNavigationTransition(() => {
+                    onActiveDateChange(date);
+                    setScrollRequest({
+                      token: (scrollRequestSequenceRef.current += 1),
+                      intent: "open-month",
+                      targetDate: date,
+                    });
+                  })
+                }
+                onOpenYear={(year) =>
+                  startNavigationTransition(() => {
+                    const nextDate = replaceYearInDate(activeDate, year);
+                    onActiveDateChange(nextDate);
+                    setScrollRequest({
+                      token: (scrollRequestSequenceRef.current += 1),
+                      intent: "open-year",
+                      targetDate: nextDate,
+                    });
+                  })
+                }
+                onSelectProject={onSelectProject}
+                onProjectPointerDown={onProjectPointerDown}
+              />
+            ) : (
+              <YearModeView
+                summaries={summaries}
+                teams={sortedTeams}
+                closures={closures}
+                committedProjectsBySection={committedProjectsBySection}
+                dependencyCountByProjectId={dependencyCountByProjectId}
+                pendingPlacement={pendingPlacement}
+                dragActive={dragActive}
+                todayDate={todayDate}
+                focusedRange={focusEvent}
+                selectedProjectIdSet={selectedProjectIdSet}
+                scrollTargetSectionId={getTimelineMonthId(
+                  scrollRequest?.targetDate ?? activeDate
+                )}
+                scrollRequestToken={scrollRequest?.token ?? 0}
+                scrollBehavior={scrollBehavior}
+                onOpenYear={(year) =>
+                  startNavigationTransition(() => {
+                    const nextDate = replaceYearInDate(activeDate, year);
+                    onActiveDateChange(nextDate);
+                    setScrollRequest({
+                      token: (scrollRequestSequenceRef.current += 1),
+                      intent: "open-year",
+                      targetDate: nextDate,
+                    });
+                  })
+                }
+                onSelectProject={onSelectProject}
+                onProjectPointerDown={onProjectPointerDown}
+              />
+            )}
+          </CardContent>
+        </Card>
 
-      {pendingPlacement ? (
-        <PopoverContent align="start" sideOffset={10} className="w-80">
-          <QuickPlacementForm
-            key={pendingPlacement.triggerId}
-            pendingPlacement={pendingPlacement}
-            teams={teams}
-            onCancel={() => onPendingPlacementChange(null)}
-            onCommit={onQuickPlacementCommit}
-          />
-        </PopoverContent>
-      ) : null}
-    </Popover>
+        {pendingPlacement ? (
+          <PopoverContent align="start" sideOffset={10} className="w-80">
+            <QuickPlacementForm
+              key={pendingPlacement.triggerId}
+              pendingPlacement={pendingPlacement}
+              teams={teams}
+              onCancel={() => onPendingPlacementChange(null)}
+              onCommit={onQuickPlacementCommit}
+            />
+          </PopoverContent>
+        ) : null}
+      </Popover>
+    </Profiler>
   );
 }

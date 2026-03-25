@@ -26,6 +26,10 @@ import {
   updateTeamAction,
 } from "@/lib/planner/actions";
 import { buildPlannerMetrics } from "@/lib/planner/scheduler";
+import {
+  placeProjectInState,
+  placeProjectsInState,
+} from "@/lib/planner/state-mutations";
 import type {
   ClosureFormState,
   PlannerState,
@@ -185,6 +189,34 @@ export function PlannerProvider({
     });
   };
 
+  const runOptimisticPlacementMutation = (
+    optimisticMutator: (current: PlannerState) => PlannerState,
+    mutator: (session: string) => Promise<PlannerState>
+  ) => {
+    if (!sessionId) {
+      return;
+    }
+
+    let previousState: PlannerState | null = null;
+    setState((current) => {
+      previousState = current;
+      return optimisticMutator(current);
+    });
+
+    startTransition(() => {
+      void mutator(sessionId)
+        .then((snapshot) => {
+          setState(snapshot);
+        })
+        .catch((error) => {
+          if (previousState) {
+            setState(previousState);
+          }
+          window.alert(getErrorMessage(error));
+        });
+    });
+  };
+
   const value: PlannerContextValue = {
     state,
     metrics: buildPlannerMetrics(state),
@@ -193,12 +225,16 @@ export function PlannerProvider({
       runMutation((session) => saveProjectAction(session, values, projectId));
     },
     placeProject(projectId, placement, options) {
-      runMutation((session) =>
-        placeProjectAction(session, projectId, placement, options)
+      runOptimisticPlacementMutation(
+        (current) => placeProjectInState(current, projectId, placement, options),
+        (session) => placeProjectAction(session, projectId, placement, options)
       );
     },
     placeProjects(placements, options) {
-      runMutation((session) => placeProjectsAction(session, placements, options));
+      runOptimisticPlacementMutation(
+        (current) => placeProjectsInState(current, placements, options),
+        (session) => placeProjectsAction(session, placements, options)
+      );
     },
     unscheduleProject(projectId) {
       runMutation((session) => unscheduleProjectAction(session, projectId));
