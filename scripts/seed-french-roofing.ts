@@ -15,13 +15,24 @@ async function main() {
     });
 
     console.log(`Seeded french roofing dataset into ${backend} (${target}).`);
+    const scheduledCount = initialPlannerState.projects.filter(
+      (project) => project.status === "scheduled"
+    ).length;
+    const draftCount = initialPlannerState.projects.filter(
+      (project) => project.status === "draft"
+    ).length;
+    const customClosureCount = initialPlannerState.closures.filter(
+      (closure) => closure.source === "custom"
+    ).length;
     console.log(
       [
         `teams=${initialPlannerState.teams.length}`,
         `holidaySources=${initialPlannerState.holidaySources.length}`,
+        `scheduled=${scheduledCount}`,
+        `drafts=${draftCount}`,
         `projects=${initialPlannerState.projects.length}`,
         `dependencies=${initialPlannerState.dependencies.length}`,
-        `closures=${initialPlannerState.closures.filter((closure) => closure.source === "custom").length}`,
+        `customClosures=${customClosureCount}`,
       ].join(" ")
     );
   } finally {

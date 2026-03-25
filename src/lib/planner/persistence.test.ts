@@ -29,6 +29,12 @@ describe("planner persistence seed", () => {
   test("resets current planner data and seeds the french roofing dataset", async () => {
     const client = new PGlite(tempDir);
     const db = drizzle({ client });
+    const expectedScheduledProject =
+      initialPlannerState.projects.find((project) => project.status === "scheduled") ?? null;
+    const expectedAdvisoryClosure =
+      initialPlannerState.customClosures.find((closure) => closure.impact === "advisory") ?? null;
+    expect(expectedScheduledProject).not.toBeNull();
+    expect(expectedAdvisoryClosure).not.toBeNull();
 
     try {
       await client.waitReady;
@@ -69,6 +75,14 @@ describe("planner persistence seed", () => {
         .select({ count: sql<number>`count(*)` })
         .from(holidaySources);
       const [projectCount] = await db.select({ count: sql<number>`count(*)` }).from(projects);
+      const [scheduledProjectCount] = await db
+        .select({ count: sql<number>`count(*)` })
+        .from(projects)
+        .where(eq(projects.status, "scheduled"));
+      const [draftProjectCount] = await db
+        .select({ count: sql<number>`count(*)` })
+        .from(projects)
+        .where(eq(projects.status, "draft"));
       const [dependencyCount] = await db
         .select({ count: sql<number>`count(*)` })
         .from(projectDependencies);
@@ -84,6 +98,12 @@ describe("planner persistence seed", () => {
         initialPlannerState.holidaySources.length
       );
       expect(Number(projectCount?.count ?? 0)).toBe(initialPlannerState.projects.length);
+      expect(Number(scheduledProjectCount?.count ?? 0)).toBe(
+        initialPlannerState.projects.filter((project) => project.status === "scheduled").length
+      );
+      expect(Number(draftProjectCount?.count ?? 0)).toBe(
+        initialPlannerState.projects.filter((project) => project.status === "draft").length
+      );
       expect(Number(dependencyCount?.count ?? 0)).toBe(
         initialPlannerState.dependencies.length
       );
@@ -104,24 +124,30 @@ describe("planner persistence seed", () => {
         .where(eq(teams.slug, "couverture"));
       expect(knownTeam[0]?.nameFr).toBe("Equipe Couverture");
 
+      const addedTeam = await db
+        .select()
+        .from(teams)
+        .where(eq(teams.slug, "charpente"));
+      expect(addedTeam[0]?.nameFr).toBe("Equipe Charpente");
+
       const knownProject = await db
         .select()
         .from(projects)
-        .where(eq(projects.title, "Demoussage villa Martin"));
+        .where(eq(projects.title, expectedScheduledProject?.title ?? ""));
       expect(knownProject[0]?.status).toBe("scheduled");
 
       const knownDependency = await db
         .select()
         .from(projectDependencies)
-        .where(eq(projectDependencies.id, "bbbbbbb1-bbbb-4bbb-8bbb-bbbbbbbbbbb1"));
+        .where(eq(projectDependencies.id, initialPlannerState.dependencies[0]?.id ?? ""));
       expect(knownDependency).toHaveLength(1);
 
       const knownClosure = await db
         .select()
         .from(closurePeriods)
-        .where(eq(closurePeriods.title, "Pluie continue secteur nord"));
+        .where(eq(closurePeriods.title, expectedAdvisoryClosure?.title ?? ""));
       expect(knownClosure[0]?.impact).toBe("advisory");
-      expect(knownClosure[0]?.repeatsAnnually).toBe(false);
+      expect(knownClosure[0]?.repeatsAnnually).toBe(expectedAdvisoryClosure!.repeatsAnnually);
     } finally {
       await client.close();
     }

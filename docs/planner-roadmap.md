@@ -176,7 +176,7 @@ Use this file as the source of truth for roadmap progress:
 
 ### P1/P2 Scale And Performance
 
-- [ ] **P1/P2: Expand the demo dataset to at least 200 scheduled projects and 500 drafts.**
+- [x] **P1/P2: Expand the demo dataset to at least 200 scheduled projects and 500 drafts.**
   - Acceptance criteria:
     - Seed/demo data creates a realistic heavy-load dataset.
     - The seeded data includes multiple teams, durations, dependencies, and enough variety to stress list and timeline behavior.
