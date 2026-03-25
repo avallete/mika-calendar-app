@@ -65,6 +65,16 @@ import {
   buildPlannerDragPreviewData,
 } from "@/lib/planner/drag-preview";
 import {
+  createPlannerExactPreviewRunnerState,
+  finishPlannerExactPreviewRunnerWork,
+  isPlannerExactPreviewResultStale,
+  queuePlannerExactPreviewRunnerWork,
+  resetPlannerExactPreviewRunnerState,
+  settlePlannerExactPreviewRunnerAfterPaint,
+  startPlannerExactPreviewRunnerWork,
+  type PlannerExactPreviewRunnerState,
+} from "@/lib/planner/drag-preview-runner";
+import {
   clearPlannerActiveDragPreview,
   publishPlannerDragPreviewHover,
   publishPlannerExactDragPreview,
@@ -165,7 +175,16 @@ type DragSessionState = {
   performanceSession: PlannerPerformanceSession | null;
 };
 
+type ExactPreviewWorkItem = DragPreviewCandidate & {
+  dragId: string;
+  dueAt: number;
+};
+
 const EXACT_PREVIEW_DEBOUNCE_MS = 250;
+
+function getPlannerNow() {
+  return typeof performance === "undefined" ? Date.now() : performance.now();
+}
 
 function getActiveSelectionProjectIds(
   drag: Extract<DragProjectMeta, { type: "scheduled" }>,
@@ -460,7 +479,10 @@ export function ScheduleWorkbench({
   const selectedProjectIdsRef = useRef(selectedProjectIds);
   const selectedProjectIdSetRef = useRef<ReadonlySet<string>>(new Set<string>());
   const exactPreviewTimerRef = useRef<number | null>(null);
-  const exactPreviewSignatureRef = useRef<string | null>(null);
+  const exactPreviewAfterPaintFrameRef = useRef<number | null>(null);
+  const exactPreviewRunnerStateRef = useRef<
+    PlannerExactPreviewRunnerState<ExactPreviewWorkItem>
+  >(createPlannerExactPreviewRunnerState<ExactPreviewWorkItem>());
   const exactPreviewGenerationRef = useRef(0);
   const lastPreviewSignatureRef = useRef<{
     bucketId: string | null;
@@ -596,21 +618,141 @@ export function ScheduleWorkbench({
     queuedHoveredBucketRef.current = null;
   };
 
-  const resetExactPreviewWorker = (countCancelled: boolean) => {
+  const clearExactPreviewTimer = () => {
     if (
       exactPreviewTimerRef.current !== null &&
       typeof window !== "undefined" &&
       typeof window.clearTimeout === "function"
     ) {
       window.clearTimeout(exactPreviewTimerRef.current);
-      if (countCancelled) {
-        incrementPlannerPerformanceCounter("drag.preview.exact.cancelled");
-      }
     }
 
     exactPreviewTimerRef.current = null;
-    exactPreviewSignatureRef.current = null;
+  };
+
+  const clearExactPreviewAfterPaintFrame = () => {
+    if (
+      exactPreviewAfterPaintFrameRef.current !== null &&
+      typeof window !== "undefined" &&
+      typeof window.cancelAnimationFrame === "function"
+    ) {
+      window.cancelAnimationFrame(exactPreviewAfterPaintFrameRef.current);
+    }
+
+    exactPreviewAfterPaintFrameRef.current = null;
+  };
+
+  const armScheduledExactPreviewTimer = (delayMs: number | null) => {
+    clearExactPreviewTimer();
+
+    if (
+      delayMs === null ||
+      typeof window === "undefined" ||
+      typeof window.setTimeout !== "function"
+    ) {
+      return;
+    }
+
+    exactPreviewTimerRef.current = window.setTimeout(() => {
+      exactPreviewTimerRef.current = null;
+
+      const { nextState, work } = startPlannerExactPreviewRunnerWork(
+        exactPreviewRunnerStateRef.current
+      );
+      exactPreviewRunnerStateRef.current = nextState;
+      if (!work) {
+        return;
+      }
+
+      const runGeneration = exactPreviewGenerationRef.current;
+      const exactResult = previewProjectPlacements(stateRef.current, work.requests, {
+        dependencyResolution: "preserve-dependencies",
+      });
+      const exactPreview = measurePlannerPerformance(
+        "drag.preview.exact.delta",
+        () =>
+          buildExactPlannerDragPreview({
+            signature: work.signature,
+            currentProjects: stateRef.current.projects,
+            previewProjects: exactResult.nextState.projects,
+            changedProjectIds: exactResult.changedProjectIds,
+            closures: stateRef.current.closures,
+            primaryProjectId: work.primaryProjectId,
+          }),
+        {
+          hoveredBucketId: work.traceSummary.hoveredBucketId,
+          selectionSize: work.requests.length,
+        }
+      );
+
+      const staleAfterRun = isPlannerExactPreviewResultStale({
+        expectedDragId: work.dragId,
+        expectedSignature: work.signature,
+        runGeneration,
+        currentDragId: dragSessionRef.current?.dragId ?? null,
+        currentSignature: lastPreviewSignatureRef.current?.signature ?? null,
+        currentGeneration: exactPreviewGenerationRef.current,
+      });
+
+      if (staleAfterRun || activeDragRef.current === null) {
+        incrementPlannerPerformanceCounter("drag.preview.exact.stale-after-run");
+      } else {
+        publishPlannerExactDragPreview({
+          activeDragId: work.dragId,
+          signature: work.signature,
+          preview: exactPreview,
+        });
+      }
+
+      exactPreviewRunnerStateRef.current = finishPlannerExactPreviewRunnerWork(
+        exactPreviewRunnerStateRef.current
+      );
+      if (exactPreviewRunnerStateRef.current.phase !== "post-publish-paint") {
+        return;
+      }
+
+      const settleAfterPaint = () => {
+        exactPreviewAfterPaintFrameRef.current = null;
+        incrementPlannerPerformanceCounter("drag.preview.exact.after-paint");
+        const nextTransition = settlePlannerExactPreviewRunnerAfterPaint(
+          exactPreviewRunnerStateRef.current,
+          getPlannerNow()
+        );
+        exactPreviewRunnerStateRef.current = nextTransition.nextState;
+        armScheduledExactPreviewTimer(nextTransition.delayMs);
+      };
+
+      if (
+        typeof window === "undefined" ||
+        typeof window.requestAnimationFrame !== "function"
+      ) {
+        settleAfterPaint();
+        return;
+      }
+
+      clearExactPreviewAfterPaintFrame();
+      exactPreviewAfterPaintFrameRef.current = window.requestAnimationFrame(
+        settleAfterPaint
+      );
+    }, delayMs);
+  };
+
+  const resetExactPreviewWorker = (countCancelled: boolean) => {
+    const hadPendingWork =
+      exactPreviewTimerRef.current !== null ||
+      exactPreviewAfterPaintFrameRef.current !== null ||
+      exactPreviewRunnerStateRef.current.scheduledWork !== null ||
+      exactPreviewRunnerStateRef.current.queuedWork !== null;
+
+    clearExactPreviewTimer();
+    clearExactPreviewAfterPaintFrame();
+    exactPreviewRunnerStateRef.current =
+      resetPlannerExactPreviewRunnerState<ExactPreviewWorkItem>();
     exactPreviewGenerationRef.current += 1;
+
+    if (countCancelled && hadPendingWork) {
+      incrementPlannerPerformanceCounter("drag.preview.exact.cancelled");
+    }
   };
 
   const applyHoveredTarget = (bucket: CalendarBucket | null) => {
@@ -697,11 +839,12 @@ export function ScheduleWorkbench({
           }
         );
 
-        return buildPlannerDragPreviewData(
-          previewCandidate.signature,
+        return buildPlannerDragPreviewData({
+          signature: previewCandidate.signature,
+          currentProjects: stateRef.current.projects,
           delta,
-          stateRef.current.closures
-        );
+          closures: stateRef.current.closures,
+        });
       },
       {
         hoveredBucketId: bucket.bucketId,
@@ -718,58 +861,23 @@ export function ScheduleWorkbench({
     });
     publishPlannerExactPreviewPending(dragSession.dragId, previewCandidate.signature);
 
-    resetExactPreviewWorker(exactPreviewTimerRef.current !== null);
-    exactPreviewSignatureRef.current = previewCandidate.signature;
-    const generation = exactPreviewGenerationRef.current;
-
-    if (typeof window === "undefined" || typeof window.setTimeout !== "function") {
-      return;
+    const queuedExactPreviewWork: ExactPreviewWorkItem = {
+      ...previewCandidate,
+      dragId: dragSession.dragId,
+      dueAt: getPlannerNow() + EXACT_PREVIEW_DEBOUNCE_MS,
+    };
+    const nextTransition = queuePlannerExactPreviewRunnerWork(
+      exactPreviewRunnerStateRef.current,
+      queuedExactPreviewWork,
+      getPlannerNow()
+    );
+    exactPreviewRunnerStateRef.current = nextTransition.nextState;
+    if (nextTransition.counter) {
+      incrementPlannerPerformanceCounter(nextTransition.counter);
     }
-
-    exactPreviewTimerRef.current = window.setTimeout(() => {
-      exactPreviewTimerRef.current = null;
-
-      const exactResult = previewProjectPlacements(
-        stateRef.current,
-        previewCandidate.requests,
-        {
-          dependencyResolution: "preserve-dependencies",
-        }
-      );
-      const exactPreview = measurePlannerPerformance(
-        "drag.preview.exact.delta",
-        () =>
-          buildExactPlannerDragPreview({
-            signature: previewCandidate.signature,
-            currentProjects: stateRef.current.projects,
-            previewProjects: exactResult.nextState.projects,
-            changedProjectIds: exactResult.changedProjectIds,
-            closures: stateRef.current.closures,
-            primaryProjectId: previewCandidate.primaryProjectId,
-          }),
-        {
-          hoveredBucketId: bucket.bucketId,
-          selectionSize: previewCandidate.requests.length,
-        }
-      );
-
-      if (
-        exactPreviewGenerationRef.current !== generation ||
-        exactPreviewSignatureRef.current !== previewCandidate.signature ||
-        dragSessionRef.current?.dragId !== dragSession.dragId ||
-        activeDragRef.current === null ||
-        lastPreviewSignatureRef.current?.signature !== previewCandidate.signature
-      ) {
-        incrementPlannerPerformanceCounter("drag.preview.exact.stale-drop");
-        return;
-      }
-
-      publishPlannerExactDragPreview({
-        activeDragId: dragSession.dragId,
-        signature: previewCandidate.signature,
-        preview: exactPreview,
-      });
-    }, EXACT_PREVIEW_DEBOUNCE_MS);
+    if (nextTransition.nextState.phase === "scheduled") {
+      armScheduledExactPreviewTimer(nextTransition.delayMs);
+    }
   };
 
   const queueHoveredTargetUpdate = (bucket: CalendarBucket | null) => {

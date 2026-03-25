@@ -16,6 +16,11 @@ export type YearSectionRenderData = {
   dayStates: Record<string, CalendarDayState>;
 };
 
+export type YearSectionRenderCache = {
+  key: string;
+  dataBySectionId: Map<string, YearSectionRenderData>;
+};
+
 export function buildSectionDays(section: YearMonthSection) {
   return eachDayOfInterval({
     start: parseISO(section.startDate),
@@ -40,6 +45,56 @@ export function buildYearSectionRenderData(
       dayStates: buildSectionDayStates(days, closures),
     };
   });
+}
+
+export function buildYearSectionRenderCacheKey(
+  sections: YearMonthSection[],
+  closures: ClosurePeriod[]
+) {
+  const sectionKey = sections
+    .map(
+      (section) =>
+        `${section.id}:${section.startDate}:${section.endDate}:${section.dayCount}`
+    )
+    .join("|");
+  const closureKey = closures
+    .map((closure) =>
+      JSON.stringify({
+        id: closure.id,
+        title: closure.title,
+        type: closure.type,
+        startDate: closure.startDate,
+        endDate: closure.endDate,
+        impact: closure.impact,
+        details: closure.details ?? null,
+        source: closure.source,
+        editable: closure.editable,
+      })
+    )
+    .join("|");
+
+  return `${sectionKey}__${closureKey}`;
+}
+
+export function resolveYearSectionRenderCache(
+  previousCache: YearSectionRenderCache | null,
+  sections: YearMonthSection[],
+  closures: ClosurePeriod[]
+) {
+  const key = buildYearSectionRenderCacheKey(sections, closures);
+  if (previousCache?.key === key) {
+    return previousCache;
+  }
+
+  return {
+    key,
+    dataBySectionId: new Map(
+      buildYearSectionRenderData(sections, closures).map((entry) => [
+        entry.section.id,
+        entry,
+      ] as const)
+    ),
+  } satisfies YearSectionRenderCache;
 }
 
 export function getVirtualizedMonthTranslateY(itemStart: number, scrollMargin: number) {

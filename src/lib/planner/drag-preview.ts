@@ -1,5 +1,6 @@
 import { buildSectionTeamProjectMap, type SectionTeamProjectMap } from "@/lib/planner/timeline-render";
 import {
+  getTimelineSectionIdsForScheduledProject,
   buildTimelinePreviewDeltaFromChangedProjectIds,
   buildTimelinePreviewDeltaFromPlacementRequests,
 } from "@/lib/planner/timeline-preview";
@@ -11,6 +12,7 @@ import type {
   TeamId,
   TimelinePreviewDelta,
 } from "@/lib/planner/types";
+import { isScheduledProject } from "@/lib/planner/types";
 
 export type PlannerDragPreviewMode = "idle" | "fast" | "exact-pending" | "exact-ready";
 
@@ -21,6 +23,7 @@ export type PlannerDragPreviewData = {
   changedProjectIdSet: ReadonlySet<string>;
   touchedSectionIdSet: ReadonlySet<string>;
   touchedTeamIdSet: ReadonlySet<TeamId>;
+  touchedRowKeySet: ReadonlySet<string>;
 };
 
 export type PlannerDragPreviewSnapshot = {
@@ -41,18 +44,77 @@ export const EMPTY_PLANNER_DRAG_PREVIEW_SNAPSHOT: PlannerDragPreviewSnapshot = {
   exactPreview: null,
 };
 
-export function buildPlannerDragPreviewData(
-  signature: string,
-  delta: TimelinePreviewDelta,
-  closures: ClosurePeriod[]
-): PlannerDragPreviewData {
+export function makePlannerDragPreviewRowKey(sectionId: string, teamId: TeamId) {
+  return `${sectionId}::${teamId}`;
+}
+
+function buildTouchedRowKeySet(args: {
+  currentProjects: Project[];
+  delta: TimelinePreviewDelta;
+  closures: ClosurePeriod[];
+}) {
+  const currentById = new Map(
+    args.currentProjects
+      .filter(isScheduledProject)
+      .map((project) => [project.id, project] as const)
+  );
+  const previewById = new Map(args.delta.projects.map((project) => [project.id, project] as const));
+  const rowKeys = new Set<string>();
+
+  for (const projectId of args.delta.changedProjectIds) {
+    const currentProject = currentById.get(projectId);
+    if (currentProject) {
+      for (const sectionId of getTimelineSectionIdsForScheduledProject(
+        currentProject,
+        args.closures
+      )) {
+        rowKeys.add(makePlannerDragPreviewRowKey(sectionId, currentProject.scheduledTeam));
+      }
+    }
+
+    const previewProject = previewById.get(projectId);
+    if (previewProject) {
+      for (const sectionId of getTimelineSectionIdsForScheduledProject(
+        previewProject,
+        args.closures
+      )) {
+        rowKeys.add(makePlannerDragPreviewRowKey(sectionId, previewProject.scheduledTeam));
+      }
+    }
+  }
+
+  return rowKeys;
+}
+
+export function buildPlannerHoveredRowKey(hoveredBucket: CalendarBucket | null) {
+  if (!hoveredBucket) {
+    return null;
+  }
+
+  return makePlannerDragPreviewRowKey(
+    hoveredBucket.startSlot.slice(0, 7),
+    hoveredBucket.teamId
+  );
+}
+
+export function buildPlannerDragPreviewData(args: {
+  signature: string;
+  currentProjects: Project[];
+  delta: TimelinePreviewDelta;
+  closures: ClosurePeriod[];
+}): PlannerDragPreviewData {
   return {
-    signature,
-    delta,
-    projectsBySection: buildSectionTeamProjectMap(delta.projects, closures),
-    changedProjectIdSet: new Set(delta.changedProjectIds),
-    touchedSectionIdSet: new Set(delta.touchedSectionIds),
-    touchedTeamIdSet: new Set(delta.touchedTeamIds),
+    signature: args.signature,
+    delta: args.delta,
+    projectsBySection: buildSectionTeamProjectMap(args.delta.projects, args.closures),
+    changedProjectIdSet: new Set(args.delta.changedProjectIds),
+    touchedSectionIdSet: new Set(args.delta.touchedSectionIds),
+    touchedTeamIdSet: new Set(args.delta.touchedTeamIds),
+    touchedRowKeySet: buildTouchedRowKeySet({
+      currentProjects: args.currentProjects,
+      delta: args.delta,
+      closures: args.closures,
+    }),
   };
 }
 
@@ -70,7 +132,12 @@ export function buildFastPlannerDragPreview(args: {
     primaryProjectId: args.primaryProjectId,
   });
 
-  return buildPlannerDragPreviewData(args.signature, delta, args.closures);
+  return buildPlannerDragPreviewData({
+    signature: args.signature,
+    currentProjects: args.currentProjects,
+    delta,
+    closures: args.closures,
+  });
 }
 
 export function buildExactPlannerDragPreview(args: {
@@ -89,7 +156,12 @@ export function buildExactPlannerDragPreview(args: {
     primaryProjectId: args.primaryProjectId,
   });
 
-  return buildPlannerDragPreviewData(args.signature, delta, args.closures);
+  return buildPlannerDragPreviewData({
+    signature: args.signature,
+    currentProjects: args.currentProjects,
+    delta,
+    closures: args.closures,
+  });
 }
 
 export function getActivePlannerDragPreview(

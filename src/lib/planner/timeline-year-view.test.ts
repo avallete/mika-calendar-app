@@ -1,9 +1,11 @@
 import { describe, expect, test } from "bun:test";
 
 import {
+  buildYearSectionRenderCacheKey,
   buildYearSectionRenderData,
   getDayHeaderTooltipState,
   getVirtualizedMonthTranslateY,
+  resolveYearSectionRenderCache,
 } from "@/lib/planner/timeline-year-view";
 import type { ClosurePeriod, YearMonthSection } from "@/lib/planner/types";
 
@@ -95,5 +97,50 @@ describe("timeline year view helpers", () => {
     );
 
     expect(getDayHeaderTooltipState(renderData[0]!.dayStates["2026-01-12"], true)).toBeNull();
+  });
+
+  test("reuses cached section render data when sections and closures are unchanged", () => {
+    const sections = [makeSection()];
+    const closures = [makeClosure({ startDate: "2026-01-12", endDate: "2026-01-12" })];
+    const initialCache = resolveYearSectionRenderCache(null, sections, closures);
+    const reusedCache = resolveYearSectionRenderCache(
+      initialCache,
+      [...sections],
+      [...closures]
+    );
+
+    expect(reusedCache).toBe(initialCache);
+    expect(
+      buildYearSectionRenderCacheKey(sections, closures)
+    ).toBe(buildYearSectionRenderCacheKey([...sections], [...closures]));
+  });
+
+  test("rebuilds cached section render data when the range or closures change", () => {
+    const sections = [makeSection()];
+    const initialCache = resolveYearSectionRenderCache(null, sections, []);
+    const closureChangedCache = resolveYearSectionRenderCache(
+      initialCache,
+      sections,
+      [makeClosure({ startDate: "2026-01-12", endDate: "2026-01-12" })]
+    );
+    const rangeChangedCache = resolveYearSectionRenderCache(
+      initialCache,
+      [
+        ...sections,
+        makeSection({
+          id: "2026-02",
+          label: "fevrier 2026",
+          startDate: "2026-02-01",
+          endDate: "2026-02-28",
+          dayCount: 28,
+        }),
+      ],
+      []
+    );
+
+    expect(closureChangedCache).not.toBe(initialCache);
+    expect(rangeChangedCache).not.toBe(initialCache);
+    expect(closureChangedCache.key).not.toBe(initialCache.key);
+    expect(rangeChangedCache.key).not.toBe(initialCache.key);
   });
 });

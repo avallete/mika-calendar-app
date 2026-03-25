@@ -47,8 +47,7 @@ import {
   getClosureImpactLabelFr,
   getClosureTypeLabelFr,
 } from "@/lib/planner/day-markers";
-import { getActivePlannerDragPreview } from "@/lib/planner/drag-preview";
-import { usePlannerDragPreviewSnapshot } from "@/lib/planner/drag-preview-store";
+import { usePlannerRowDragPreview } from "@/lib/planner/drag-preview-store";
 import {
   measurePlannerPerformance,
   recordPlannerProfilerRender,
@@ -61,7 +60,6 @@ import {
   buildTimelineSectionRowViews,
   EMPTY_SECTION_TEAM_PROJECTS,
   EMPTY_STRING_SET,
-  slotBelongsToSection,
   type SectionTeamProjectMap,
   type TimelineTeamOverlayView,
   type TimelineTeamRowView,
@@ -82,7 +80,9 @@ import {
   getTodayDateString,
 } from "@/lib/planner/timeline-range";
 import {
-  buildYearSectionRenderData,
+  buildYearSectionRenderCacheKey,
+  resolveYearSectionRenderCache,
+  type YearSectionRenderCache,
   getDayHeaderTooltipState,
   getVirtualizedMonthTranslateY,
 } from "@/lib/planner/timeline-year-view";
@@ -952,6 +952,7 @@ function FoldedYearCard({
 
 function MonthModeView({
   summaries,
+  sectionRenderDataById,
   committedProjectsBySection,
   dependencyCountByProjectId,
   closures,
@@ -967,6 +968,7 @@ function MonthModeView({
   onProjectPointerDown,
 }: {
   summaries: ReturnType<typeof buildTimelineYearSummaries>;
+  sectionRenderDataById: YearSectionRenderCache["dataBySectionId"];
   committedProjectsBySection: SectionTeamProjectMap;
   dependencyCountByProjectId: Map<string, number>;
   closures: ClosurePeriod[];
@@ -981,23 +983,6 @@ function MonthModeView({
   onSelectProject: (projectId: string, shiftKey: boolean) => void;
   onProjectPointerDown: (projectId: string, shiftKey: boolean) => void;
 }) {
-  const sectionRenderDataById = useMemo(
-    () =>
-      measurePlannerPerformance("timeline.monthRenderData", () =>
-        new Map(
-          buildYearSectionRenderData(
-            summaries
-              .filter((yearSummary) => yearSummary.isActive)
-              .flatMap((yearSummary) =>
-                yearSummary.months.map((monthSummary) => monthSummary.section)
-              ),
-            closures
-          ).map((sectionData) => [sectionData.section.id, sectionData] as const)
-        )
-      ),
-    [closures, summaries]
-  );
-
   return (
     <Profiler id="MonthModeView" onRender={handlePlannerProfilerRender}>
       <div className="space-y-8">
@@ -1173,21 +1158,13 @@ const TimelineTeamRowOverlay = memo(function TimelineTeamRowOverlay({
   closures: ClosurePeriod[];
   pendingPlacement: QuickPlacementState | null;
 }) {
-  const snapshot = usePlannerDragPreviewSnapshot();
-  const activePreview = getActivePlannerDragPreview(snapshot);
-  const hoveredInSection =
-    snapshot.hoveredBucket &&
-    snapshot.hoveredBucket.teamId === rowView.team.id &&
-    slotBelongsToSection(snapshot.hoveredBucket.startSlot, section);
+  const rowDragPreview = usePlannerRowDragPreview(section.id, rowView.team.id);
   const pendingInSection =
     pendingPlacement &&
     pendingPlacement.placement.teamId === rowView.team.id &&
-    slotBelongsToSection(pendingPlacement.placement.startSlot, section);
-  const previewTouchesRow =
-    activePreview?.touchedSectionIdSet.has(section.id) === true &&
-    activePreview.touchedTeamIdSet.has(rowView.team.id);
+    pendingPlacement.placement.startSlot.slice(0, 7) === section.id;
   const overlayView = useMemo<TimelineTeamOverlayView | null>(() => {
-    if (!hoveredInSection && !pendingInSection && !previewTouchesRow) {
+    if (!rowDragPreview.hoveredBucket && !pendingInSection && !rowDragPreview.preview) {
       return null;
     }
 
@@ -1199,12 +1176,14 @@ const TimelineTeamRowOverlay = memo(function TimelineTeamRowOverlay({
             rowViews: [rowView],
             section,
             closures,
-            previewProjectsBySection: activePreview?.projectsBySection ?? EMPTY_SECTION_TEAM_PROJECTS,
+            previewProjectsBySection:
+              rowDragPreview.preview?.projectsBySection ?? EMPTY_SECTION_TEAM_PROJECTS,
             previewChangedProjectIdSet:
-              activePreview?.changedProjectIdSet ?? EMPTY_STRING_SET,
-            previewPrimaryProjectId: activePreview?.delta.primaryProjectId ?? null,
+              rowDragPreview.preview?.changedProjectIdSet ?? EMPTY_STRING_SET,
+            previewPrimaryProjectId:
+              rowDragPreview.preview?.delta.primaryProjectId ?? null,
             pendingPlacement,
-            hoveredBucket: snapshot.hoveredBucket,
+            hoveredBucket: rowDragPreview.hoveredBucket,
           })[0] ?? null,
         {
           sectionId: section.id,
@@ -1213,15 +1192,13 @@ const TimelineTeamRowOverlay = memo(function TimelineTeamRowOverlay({
       ) ?? null
     );
   }, [
-    activePreview,
     closures,
-    hoveredInSection,
     pendingInSection,
     pendingPlacement,
-    previewTouchesRow,
     rowView,
+    rowDragPreview.hoveredBucket,
+    rowDragPreview.preview,
     section,
-    snapshot.hoveredBucket,
   ]);
 
   if (!overlayView) {
@@ -1229,54 +1206,60 @@ const TimelineTeamRowOverlay = memo(function TimelineTeamRowOverlay({
   }
 
   return (
-    <>
-      {overlayView.hoveredBounds ? (
-        <div
-          id={overlayView.hoveredBucket?.bucketId}
-          className="pointer-events-none absolute inset-y-0 z-[5] rounded-lg bg-primary/12 ring-1 ring-inset ring-primary/35"
-          style={overlayView.hoveredBounds}
-        />
-      ) : null}
+    <Profiler
+      id={`TimelineOverlay:${section.id}:${rowView.team.id}`}
+      onRender={handlePlannerProfilerRender}
+    >
+      <>
+        {overlayView.hoveredBounds ? (
+          <div
+            id={overlayView.hoveredBucket?.bucketId}
+            className="pointer-events-none absolute inset-y-0 z-[5] rounded-lg bg-primary/12 ring-1 ring-inset ring-primary/35"
+            style={overlayView.hoveredBounds}
+          />
+        ) : null}
 
-      {overlayView.pendingBounds ? (
-        <PopoverTrigger
-          id={overlayView.pendingBucket?.bucketId ?? undefined}
-          nativeButton={false}
-          render={<div />}
-          aria-hidden="true"
-          tabIndex={-1}
-          className="pointer-events-none absolute inset-y-0 z-[6] rounded-lg bg-primary/10 ring-2 ring-inset ring-primary/55 shadow-[0_0_0_1px_rgba(37,99,235,0.16)]"
-          style={overlayView.pendingBounds}
-        />
-      ) : null}
+        {overlayView.pendingBounds ? (
+          <PopoverTrigger
+            id={overlayView.pendingBucket?.bucketId ?? undefined}
+            nativeButton={false}
+            render={<div />}
+            aria-hidden="true"
+            tabIndex={-1}
+            className="pointer-events-none absolute inset-y-0 z-[6] rounded-lg bg-primary/10 ring-2 ring-inset ring-primary/55 shadow-[0_0_0_1px_rgba(37,99,235,0.16)]"
+            style={overlayView.pendingBounds}
+          />
+        ) : null}
 
-      {overlayView.dimmedCards.map((card) => (
-        <div
-          key={`dimmed-${section.id}-${card.projectId}`}
-          className="pointer-events-none absolute top-3 z-[12] h-[92px] rounded-2xl bg-white/55 saturate-50 backdrop-blur-[1px]"
-          style={{
-            left: card.bounds.left,
-            width: card.bounds.width,
-          }}
-        />
-      ))}
+        {overlayView.dimmedCards.map((card) => (
+          <div
+            key={`dimmed-${section.id}-${card.projectId}`}
+            className="pointer-events-none absolute top-3 z-[12] h-[92px] rounded-2xl bg-white/55 saturate-50 backdrop-blur-[1px]"
+            style={{
+              left: card.bounds.left,
+              width: card.bounds.width,
+            }}
+          />
+        ))}
 
-      {overlayView.previewCards.map((card) => (
-        <PreviewProjectCard
-          key={`preview-${section.id}-${card.project.id}`}
-          project={card.project}
-          left={card.bounds.left}
-          width={card.bounds.width}
-          team={rowView.team}
-          primary={card.primary}
-        />
-      ))}
-    </>
+        {overlayView.previewCards.map((card) => (
+          <PreviewProjectCard
+            key={`preview-${section.id}-${card.project.id}`}
+            project={card.project}
+            left={card.bounds.left}
+            width={card.bounds.width}
+            team={rowView.team}
+            primary={card.primary}
+          />
+        ))}
+      </>
+    </Profiler>
   );
 });
 
 const VirtualizedYearSection = memo(function VirtualizedYearSection({
   yearSummary,
+  sectionRenderDataById,
   teams,
   closures,
   committedProjectsBySection,
@@ -1293,6 +1276,7 @@ const VirtualizedYearSection = memo(function VirtualizedYearSection({
   onProjectPointerDown,
 }: {
   yearSummary: ReturnType<typeof buildTimelineYearSummaries>[number];
+  sectionRenderDataById: YearSectionRenderCache["dataBySectionId"];
   teams: Team[];
   closures: ClosurePeriod[];
   committedProjectsBySection: SectionTeamProjectMap;
@@ -1310,16 +1294,6 @@ const VirtualizedYearSection = memo(function VirtualizedYearSection({
 }) {
   const yearRef = useRef<HTMLElement | null>(null);
   const [scrollMargin, setScrollMargin] = useState<number | null>(null);
-  const sectionRenderData = useMemo(
-    () =>
-      measurePlannerPerformance("timeline.monthRenderData", () =>
-        buildYearSectionRenderData(
-          yearSummary.months.map((month) => month.section),
-          closures
-        )
-      ),
-    [closures, yearSummary.months]
-  );
   const virtualizer = useWindowVirtualizer<HTMLDivElement>({
     count: yearSummary.months.length,
     estimateSize: () => YEAR_MONTH_ESTIMATE_BASE_PX + teams.length * YEAR_ROW_ESTIMATE_PX,
@@ -1380,7 +1354,8 @@ const VirtualizedYearSection = memo(function VirtualizedYearSection({
 
       <div className="relative" style={{ height: `${virtualizer.getTotalSize()}px` }}>
         {virtualItems.map((virtualItem) => {
-          const sectionData = sectionRenderData[virtualItem.index];
+          const sectionId = yearSummary.months[virtualItem.index]?.section.id ?? null;
+          const sectionData = sectionId ? sectionRenderDataById.get(sectionId) : null;
           if (!sectionData) {
             return null;
           }
@@ -1426,6 +1401,7 @@ const VirtualizedYearSection = memo(function VirtualizedYearSection({
 
 function YearModeView({
   summaries,
+  sectionRenderDataById,
   teams,
   closures,
   committedProjectsBySection,
@@ -1443,6 +1419,7 @@ function YearModeView({
   onProjectPointerDown,
 }: {
   summaries: ReturnType<typeof buildTimelineYearSummaries>;
+  sectionRenderDataById: YearSectionRenderCache["dataBySectionId"];
   teams: Team[];
   closures: ClosurePeriod[];
   committedProjectsBySection: SectionTeamProjectMap;
@@ -1467,6 +1444,7 @@ function YearModeView({
             <VirtualizedYearSection
               key={yearSummary.year}
               yearSummary={yearSummary}
+              sectionRenderDataById={sectionRenderDataById}
               teams={teams}
               closures={closures}
               committedProjectsBySection={committedProjectsBySection}
@@ -1572,6 +1550,20 @@ export function TimelineCanvas({
     () => buildTimelineSections(projects, customClosures, timelineNow),
     [customClosures, projects, timelineNow]
   );
+  const sectionRenderCacheKey = useMemo(
+    () => buildYearSectionRenderCacheKey(sections, closures),
+    [closures, sections]
+  );
+  /* eslint-disable react-hooks/exhaustive-deps */
+  const sectionRenderCache = useMemo(
+    () =>
+      measurePlannerPerformance("timeline.monthRenderData", () =>
+        resolveYearSectionRenderCache(null, sections, closures)
+      ),
+    [sectionRenderCacheKey]
+  );
+  /* eslint-enable react-hooks/exhaustive-deps */
+  const sectionRenderDataById = sectionRenderCache.dataBySectionId;
   const committedScheduledProjects = useMemo(
     () => projects.filter(isScheduledProject),
     [projects]
@@ -1863,6 +1855,7 @@ export function TimelineCanvas({
             {viewMode === "month" ? (
               <MonthModeView
                 summaries={summaries}
+                sectionRenderDataById={sectionRenderDataById}
                 committedProjectsBySection={committedProjectsBySection}
                 dependencyCountByProjectId={dependencyCountByProjectId}
                 closures={closures}
@@ -1899,6 +1892,7 @@ export function TimelineCanvas({
             ) : (
               <YearModeView
                 summaries={summaries}
+                sectionRenderDataById={sectionRenderDataById}
                 teams={sortedTeams}
                 closures={closures}
                 committedProjectsBySection={committedProjectsBySection}
