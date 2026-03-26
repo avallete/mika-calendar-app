@@ -59,11 +59,14 @@ import {
   buildTimelineSectionOverlayViews,
   buildTimelineSectionRowViews,
   EMPTY_SECTION_TEAM_PROJECTS,
+  EMPTY_TEAM_PROJECTS,
   EMPTY_STRING_SET,
   type SectionTeamProjectMap,
+  type SectionTeamProjects,
   type TimelineTeamOverlayView,
   type TimelineTeamRowView,
 } from "@/lib/planner/timeline-render";
+import type { ProjectScheduleSpan } from "@/lib/planner/planner-computed";
 import {
   buildTimelineYearSummaries,
   getTimelineMonthId,
@@ -667,6 +670,10 @@ function traceTimelineUi(enabled: boolean, label: string, payload: unknown) {
   console.log(`[planner ui trace] ${label} ${stringifyTracePayload(payload)}`);
 }
 
+function areArraysEqualByJson(left: unknown[], right: unknown[]) {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
 const SharedMonthHeader = memo(function SharedMonthHeader({
   section,
   days,
@@ -792,9 +799,9 @@ const SharedExpandedMonthSection = memo(function SharedExpandedMonthSection({
   days,
   dayStates,
   teams,
-  committedProjectsBySection,
+  committedSectionProjects,
+  projectSpanById,
   dependencyCountByProjectId,
-  closures,
   pendingPlacement,
   dragActive,
   todayDate,
@@ -807,9 +814,9 @@ const SharedExpandedMonthSection = memo(function SharedExpandedMonthSection({
   days: string[];
   dayStates: Record<string, CalendarDayState>;
   teams: Team[];
-  committedProjectsBySection: SectionTeamProjectMap;
+  committedSectionProjects: SectionTeamProjects;
+  projectSpanById: ReadonlyMap<string, ProjectScheduleSpan>;
   dependencyCountByProjectId: Map<string, number>;
-  closures: ClosurePeriod[];
   pendingPlacement: QuickPlacementState | null;
   dragActive: boolean;
   todayDate: string;
@@ -824,16 +831,16 @@ const SharedExpandedMonthSection = memo(function SharedExpandedMonthSection({
         buildTimelineSectionRowViews({
           teams,
           section,
-          closures,
-          committedProjectsBySection,
+          committedSectionProjects,
           dependencyCountByProjectId,
           selectedProjectIdSet,
+          projectSpanById,
         })
       ),
     [
-      closures,
-      committedProjectsBySection,
+      committedSectionProjects,
       dependencyCountByProjectId,
+      projectSpanById,
       section,
       selectedProjectIdSet,
       teams,
@@ -882,7 +889,6 @@ const SharedExpandedMonthSection = memo(function SharedExpandedMonthSection({
                 section={section}
                 days={days}
                 dayStates={dayStates}
-                closures={closures}
                 pendingPlacement={pendingPlacement}
                 focusedRange={focusedRange}
                 onSelectProject={onSelectProject}
@@ -954,8 +960,8 @@ function MonthModeView({
   summaries,
   sectionRenderDataById,
   committedProjectsBySection,
+  projectSpanById,
   dependencyCountByProjectId,
-  closures,
   pendingPlacement,
   dragActive,
   todayDate,
@@ -970,8 +976,8 @@ function MonthModeView({
   summaries: ReturnType<typeof buildTimelineYearSummaries>;
   sectionRenderDataById: YearSectionRenderCache["dataBySectionId"];
   committedProjectsBySection: SectionTeamProjectMap;
+  projectSpanById: ReadonlyMap<string, ProjectScheduleSpan>;
   dependencyCountByProjectId: Map<string, number>;
-  closures: ClosurePeriod[];
   pendingPlacement: QuickPlacementState | null;
   dragActive: boolean;
   todayDate: string;
@@ -1026,9 +1032,12 @@ function MonthModeView({
                       days={sectionData.days}
                       dayStates={sectionData.dayStates}
                       teams={teams}
-                      committedProjectsBySection={committedProjectsBySection}
+                      committedSectionProjects={
+                        committedProjectsBySection.get(monthSummary.section.id) ??
+                        EMPTY_TEAM_PROJECTS
+                      }
+                      projectSpanById={projectSpanById}
                       dependencyCountByProjectId={dependencyCountByProjectId}
-                      closures={closures}
                       pendingPlacement={pendingPlacement}
                       dragActive={dragActive}
                       todayDate={todayDate}
@@ -1059,7 +1068,6 @@ const SharedTimelineTeamRow = memo(function SharedTimelineTeamRow({
   section,
   days,
   dayStates,
-  closures,
   pendingPlacement,
   focusedRange,
   onSelectProject,
@@ -1069,7 +1077,6 @@ const SharedTimelineTeamRow = memo(function SharedTimelineTeamRow({
   section: YearMonthSection;
   days: string[];
   dayStates: Record<string, CalendarDayState>;
-  closures: ClosurePeriod[];
   pendingPlacement: QuickPlacementState | null;
   focusedRange: CalendarFocusEvent;
   onSelectProject: (projectId: string, shiftKey: boolean) => void;
@@ -1138,7 +1145,6 @@ const SharedTimelineTeamRow = memo(function SharedTimelineTeamRow({
           <TimelineTeamRowOverlay
             rowView={rowView}
             section={section}
-            closures={closures}
             pendingPlacement={pendingPlacement}
           />
         </div>
@@ -1150,12 +1156,10 @@ const SharedTimelineTeamRow = memo(function SharedTimelineTeamRow({
 const TimelineTeamRowOverlay = memo(function TimelineTeamRowOverlay({
   rowView,
   section,
-  closures,
   pendingPlacement,
 }: {
   rowView: TimelineTeamRowView;
   section: YearMonthSection;
-  closures: ClosurePeriod[];
   pendingPlacement: QuickPlacementState | null;
 }) {
   const rowDragPreview = usePlannerRowDragPreview(section.id, rowView.team.id);
@@ -1175,13 +1179,14 @@ const TimelineTeamRowOverlay = memo(function TimelineTeamRowOverlay({
           buildTimelineSectionOverlayViews({
             rowViews: [rowView],
             section,
-            closures,
             previewProjectsBySection:
               rowDragPreview.preview?.projectsBySection ?? EMPTY_SECTION_TEAM_PROJECTS,
             previewChangedProjectIdSet:
               rowDragPreview.preview?.changedProjectIdSet ?? EMPTY_STRING_SET,
             previewPrimaryProjectId:
               rowDragPreview.preview?.delta.primaryProjectId ?? null,
+            previewProjectSpanById:
+              rowDragPreview.preview?.projectSpanById ?? new Map(),
             pendingPlacement,
             hoveredBucket: rowDragPreview.hoveredBucket,
           })[0] ?? null,
@@ -1192,7 +1197,6 @@ const TimelineTeamRowOverlay = memo(function TimelineTeamRowOverlay({
       ) ?? null
     );
   }, [
-    closures,
     pendingInSection,
     pendingPlacement,
     rowView,
@@ -1261,8 +1265,8 @@ const VirtualizedYearSection = memo(function VirtualizedYearSection({
   yearSummary,
   sectionRenderDataById,
   teams,
-  closures,
   committedProjectsBySection,
+  projectSpanById,
   dependencyCountByProjectId,
   pendingPlacement,
   dragActive,
@@ -1278,8 +1282,8 @@ const VirtualizedYearSection = memo(function VirtualizedYearSection({
   yearSummary: ReturnType<typeof buildTimelineYearSummaries>[number];
   sectionRenderDataById: YearSectionRenderCache["dataBySectionId"];
   teams: Team[];
-  closures: ClosurePeriod[];
   committedProjectsBySection: SectionTeamProjectMap;
+  projectSpanById: ReadonlyMap<string, ProjectScheduleSpan>;
   dependencyCountByProjectId: Map<string, number>;
   pendingPlacement: QuickPlacementState | null;
   dragActive: boolean;
@@ -1380,9 +1384,11 @@ const VirtualizedYearSection = memo(function VirtualizedYearSection({
                 days={days}
                 dayStates={dayStates}
                 teams={teams}
-                committedProjectsBySection={committedProjectsBySection}
+                committedSectionProjects={
+                  committedProjectsBySection.get(section.id) ?? EMPTY_TEAM_PROJECTS
+                }
+                projectSpanById={projectSpanById}
                 dependencyCountByProjectId={dependencyCountByProjectId}
-                closures={closures}
                 pendingPlacement={pendingPlacement}
                 dragActive={dragActive}
                 todayDate={todayDate}
@@ -1403,8 +1409,8 @@ function YearModeView({
   summaries,
   sectionRenderDataById,
   teams,
-  closures,
   committedProjectsBySection,
+  projectSpanById,
   dependencyCountByProjectId,
   pendingPlacement,
   dragActive,
@@ -1421,8 +1427,8 @@ function YearModeView({
   summaries: ReturnType<typeof buildTimelineYearSummaries>;
   sectionRenderDataById: YearSectionRenderCache["dataBySectionId"];
   teams: Team[];
-  closures: ClosurePeriod[];
   committedProjectsBySection: SectionTeamProjectMap;
+  projectSpanById: ReadonlyMap<string, ProjectScheduleSpan>;
   dependencyCountByProjectId: Map<string, number>;
   pendingPlacement: QuickPlacementState | null;
   dragActive: boolean;
@@ -1446,8 +1452,8 @@ function YearModeView({
               yearSummary={yearSummary}
               sectionRenderDataById={sectionRenderDataById}
               teams={teams}
-              closures={closures}
               committedProjectsBySection={committedProjectsBySection}
+              projectSpanById={projectSpanById}
               dependencyCountByProjectId={dependencyCountByProjectId}
               pendingPlacement={pendingPlacement}
               dragActive={dragActive}
@@ -1478,6 +1484,7 @@ export function TimelineCanvas({
   dependencies,
   customClosures,
   closures,
+  projectSpanById,
   pendingPlacement,
   selectedProjectIds,
   traceEnabled,
@@ -1498,6 +1505,7 @@ export function TimelineCanvas({
   dependencies: ProjectDependency[];
   customClosures: CustomClosure[];
   closures: ClosurePeriod[];
+  projectSpanById: ReadonlyMap<string, ProjectScheduleSpan>;
   pendingPlacement: QuickPlacementState | null;
   selectedProjectIds: string[];
   traceEnabled: boolean;
@@ -1521,6 +1529,10 @@ export function TimelineCanvas({
   const timelineNow = useMemo(() => new Date(), []);
   const todayDate = useMemo(() => getTodayDateString(timelineNow), [timelineNow]);
   const [scrollRequest, setScrollRequest] = useState<TimelineScrollRequest | null>(null);
+  const stableTeamsRef = useRef(teams);
+  const stableDependenciesRef = useRef(dependencies);
+  const stableCustomClosuresRef = useRef(customClosures);
+  const stableClosuresRef = useRef(closures);
 
   useEffect(() => {
     if (!pendingPlacement) {
@@ -1539,26 +1551,58 @@ export function TimelineCanvas({
   const emitActiveDateChange = useEffectEvent((date: string) => {
     onActiveDateChange(date);
   });
+  const stableTeams = useMemo(() => {
+    if (areArraysEqualByJson(stableTeamsRef.current, teams)) {
+      return stableTeamsRef.current;
+    }
+
+    stableTeamsRef.current = teams;
+    return teams;
+  }, [teams]);
+  const stableDependencies = useMemo(() => {
+    if (areArraysEqualByJson(stableDependenciesRef.current, dependencies)) {
+      return stableDependenciesRef.current;
+    }
+
+    stableDependenciesRef.current = dependencies;
+    return dependencies;
+  }, [dependencies]);
+  const stableCustomClosures = useMemo(() => {
+    if (areArraysEqualByJson(stableCustomClosuresRef.current, customClosures)) {
+      return stableCustomClosuresRef.current;
+    }
+
+    stableCustomClosuresRef.current = customClosures;
+    return customClosures;
+  }, [customClosures]);
+  const stableClosures = useMemo(() => {
+    if (areArraysEqualByJson(stableClosuresRef.current, closures)) {
+      return stableClosuresRef.current;
+    }
+
+    stableClosuresRef.current = closures;
+    return closures;
+  }, [closures]);
   const selectedProjectIdSet = useMemo(
     () => (selectedProjectIds.length ? new Set(selectedProjectIds) : EMPTY_STRING_SET),
     [selectedProjectIds]
   );
-  const sortedTeams = useMemo(() => getSortedTeams(teams), [teams]);
+  const sortedTeams = useMemo(() => getSortedTeams(stableTeams), [stableTeams]);
   const scrollBehavior: ScrollBehavior =
     scrollRequest?.intent === "initial" ? "auto" : "smooth";
   const sections = useMemo(
-    () => buildTimelineSections(projects, customClosures, timelineNow),
-    [customClosures, projects, timelineNow]
+    () => buildTimelineSections(projects, stableCustomClosures, timelineNow),
+    [projects, stableCustomClosures, timelineNow]
   );
   const sectionRenderCacheKey = useMemo(
-    () => buildYearSectionRenderCacheKey(sections, closures),
-    [closures, sections]
+    () => buildYearSectionRenderCacheKey(sections, stableClosures),
+    [sections, stableClosures]
   );
   /* eslint-disable react-hooks/exhaustive-deps */
   const sectionRenderCache = useMemo(
     () =>
       measurePlannerPerformance("timeline.monthRenderData", () =>
-        resolveYearSectionRenderCache(null, sections, closures)
+        resolveYearSectionRenderCache(null, sections, stableClosures)
       ),
     [sectionRenderCacheKey]
   );
@@ -1568,30 +1612,42 @@ export function TimelineCanvas({
     () => projects.filter(isScheduledProject),
     [projects]
   );
+  const committedProjectsBySectionRef = useRef<SectionTeamProjectMap>(
+    EMPTY_SECTION_TEAM_PROJECTS
+  );
   const committedProjectsBySection = useMemo(
-    () => buildSectionTeamProjectMap(committedScheduledProjects, closures),
-    [closures, committedScheduledProjects]
+    () => {
+      const nextProjectsBySection = buildSectionTeamProjectMap(
+        committedScheduledProjects,
+        projectSpanById,
+        committedProjectsBySectionRef.current
+      );
+      committedProjectsBySectionRef.current = nextProjectsBySection;
+      return nextProjectsBySection;
+    },
+    [committedScheduledProjects, projectSpanById]
   );
   const dependencyCountByProjectId = useMemo(
-    () => buildDependencyCountByProjectId(dependencies),
-    [dependencies]
+    () => buildDependencyCountByProjectId(stableDependencies),
+    [stableDependencies]
   );
   const { years } = useMemo(
-    () => buildTimelineYearRange(projects, customClosures, timelineNow),
-    [customClosures, projects, timelineNow]
+    () => buildTimelineYearRange(projects, stableCustomClosures, timelineNow),
+    [projects, stableCustomClosures, timelineNow]
   );
   const summaries = useMemo(
     () =>
       buildTimelineYearSummaries({
         sections,
         projects,
-        closures,
+        closures: stableClosures,
+        projectSpanById,
         activeDate,
         todayDate,
         focusDate: focusEvent?.startDate ?? null,
         viewMode,
       }),
-    [activeDate, closures, focusEvent, projects, sections, todayDate, viewMode]
+    [activeDate, focusEvent, projectSpanById, projects, sections, stableClosures, todayDate, viewMode]
   );
   const activeYear = parseISO(activeDate).getFullYear();
 
@@ -1857,8 +1913,8 @@ export function TimelineCanvas({
                 summaries={summaries}
                 sectionRenderDataById={sectionRenderDataById}
                 committedProjectsBySection={committedProjectsBySection}
+                projectSpanById={projectSpanById}
                 dependencyCountByProjectId={dependencyCountByProjectId}
-                closures={closures}
                 pendingPlacement={pendingPlacement}
                 dragActive={dragActive}
                 todayDate={todayDate}
@@ -1894,8 +1950,8 @@ export function TimelineCanvas({
                 summaries={summaries}
                 sectionRenderDataById={sectionRenderDataById}
                 teams={sortedTeams}
-                closures={closures}
                 committedProjectsBySection={committedProjectsBySection}
+                projectSpanById={projectSpanById}
                 dependencyCountByProjectId={dependencyCountByProjectId}
                 pendingPlacement={pendingPlacement}
                 dragActive={dragActive}

@@ -1,12 +1,12 @@
 import { addDays, format, parseISO } from "date-fns";
 
-import { advanceWorkingDuration, compareSlotKeys, parseSlotKey } from "@/lib/planner/calendar";
+import { compareSlotKeys, parseSlotKey } from "@/lib/planner/calendar";
+import { recordPlannerPerfProbeCount } from "@/lib/planner/planner-perf";
+import { type ProjectScheduleSpan } from "@/lib/planner/planner-computed";
 import { makeCalendarRowSurfaceId } from "@/lib/planner/timeline-hover";
-import { getTimelineSectionIdsForScheduledProject } from "@/lib/planner/timeline-preview";
 import type {
   CalendarBucket,
   CalendarRowSurface,
-  ClosurePeriod,
   ProjectDependency,
   QuickPlacementState,
   ScheduledTimelineProject,
@@ -16,7 +16,8 @@ import type {
   YearMonthSection,
 } from "@/lib/planner/types";
 
-export type SectionTeamProjectMap = Map<string, Map<TeamId, ScheduledTimelineProject[]>>;
+export type SectionTeamProjects = Map<TeamId, ScheduledTimelineProject[]>;
+export type SectionTeamProjectMap = Map<string, SectionTeamProjects>;
 
 export type TimelineBounds = {
   left: string;
@@ -61,16 +62,38 @@ export type TimelineTeamOverlayView = {
 
 export const EMPTY_SCHEDULED_PROJECTS: ScheduledTimelineProject[] = [];
 export const EMPTY_SECTION_TEAM_PROJECTS: SectionTeamProjectMap = new Map();
+export const EMPTY_TEAM_PROJECTS: SectionTeamProjects = new Map();
 export const EMPTY_STRING_SET: ReadonlySet<string> = new Set<string>();
+
+function haveSameScheduledProjectSequence(
+  previousProjects: ScheduledTimelineProject[] | undefined,
+  nextProjects: ScheduledTimelineProject[]
+) {
+  if (!previousProjects || previousProjects.length !== nextProjects.length) {
+    return false;
+  }
+
+  return previousProjects.every((project, index) => {
+    const nextProject = nextProjects[index];
+    return (
+      project.id === nextProject.id &&
+      project.scheduledTeam === nextProject.scheduledTeam &&
+      project.scheduledStartSlot === nextProject.scheduledStartSlot &&
+      project.scheduledDurationHalfDays === nextProject.scheduledDurationHalfDays &&
+      project.sequenceOrder === nextProject.sequenceOrder
+    );
+  });
+}
 
 export function buildSectionTeamProjectMap(
   projects: ScheduledTimelineProject[],
-  closures: ClosurePeriod[]
+  projectSpanById: ReadonlyMap<string, ProjectScheduleSpan>,
+  previousProjectsBySection?: SectionTeamProjectMap | null
 ): SectionTeamProjectMap {
   const projectsBySection = new Map<string, Map<TeamId, ScheduledTimelineProject[]>>();
 
   for (const project of projects) {
-    for (const sectionId of getTimelineSectionIdsForScheduledProject(project, closures)) {
+    for (const sectionId of projectSpanById.get(project.id)?.sectionIds ?? []) {
       const sectionProjects =
         projectsBySection.get(sectionId) ?? new Map<TeamId, ScheduledTimelineProject[]>();
       const teamProjects = sectionProjects.get(project.scheduledTeam) ?? [];
@@ -101,7 +124,48 @@ export function buildSectionTeamProjectMap(
     }
   }
 
-  return projectsBySection;
+  if (!previousProjectsBySection) {
+    recordPlannerPerfProbeCount("timelineProjectionRebuildSectionCount", projectsBySection.size);
+    return projectsBySection;
+  }
+
+  const nextProjectsBySection: SectionTeamProjectMap = new Map();
+  let rebuiltSectionCount = 0;
+
+  for (const [sectionId, sectionProjects] of projectsBySection) {
+    const previousSectionProjects = previousProjectsBySection.get(sectionId);
+    let reusedAllTeamProjects = Boolean(previousSectionProjects);
+    const nextSectionProjects: SectionTeamProjects = new Map();
+
+    for (const [teamId, teamProjects] of sectionProjects) {
+      const previousTeamProjects = previousSectionProjects?.get(teamId);
+      const nextTeamProjects = haveSameScheduledProjectSequence(
+        previousTeamProjects,
+        teamProjects
+      )
+        ? previousTeamProjects!
+        : teamProjects;
+      if (nextTeamProjects !== previousTeamProjects) {
+        reusedAllTeamProjects = false;
+      }
+      nextSectionProjects.set(teamId, nextTeamProjects);
+    }
+
+    if (
+      reusedAllTeamProjects &&
+      previousSectionProjects &&
+      previousSectionProjects.size === nextSectionProjects.size
+    ) {
+      nextProjectsBySection.set(sectionId, previousSectionProjects);
+      continue;
+    }
+
+    rebuiltSectionCount += 1;
+    nextProjectsBySection.set(sectionId, nextSectionProjects);
+  }
+
+  recordPlannerPerfProbeCount("timelineProjectionRebuildSectionCount", rebuiltSectionCount);
+  return nextProjectsBySection;
 }
 
 export function buildDependencyCountByProjectId(dependencies: ProjectDependency[]) {
@@ -117,12 +181,22 @@ export function buildDependencyCountByProjectId(dependencies: ProjectDependency[
   return counts;
 }
 
+export function getTeamProjectsForSection(
+  sectionProjects: SectionTeamProjects,
+  teamId: TeamId
+) {
+  return sectionProjects.get(teamId) ?? EMPTY_SCHEDULED_PROJECTS;
+}
+
 export function getSectionTeamProjects(
   projectsBySection: SectionTeamProjectMap,
   sectionId: string,
   teamId: TeamId
 ) {
-  return projectsBySection.get(sectionId)?.get(teamId) ?? EMPTY_SCHEDULED_PROJECTS;
+  return getTeamProjectsForSection(
+    projectsBySection.get(sectionId) ?? EMPTY_TEAM_PROJECTS,
+    teamId
+  );
 }
 
 export function slotBelongsToSection(slotKey: SlotKey, section: YearMonthSection) {
@@ -223,18 +297,18 @@ export function scopeSectionPreviewState(args: {
 export function buildTimelineSectionRowViews(args: {
   teams: Team[];
   section: YearMonthSection;
-  closures: ClosurePeriod[];
-  committedProjectsBySection: SectionTeamProjectMap;
+  committedSectionProjects: SectionTeamProjects;
   dependencyCountByProjectId: Map<string, number>;
   selectedProjectIdSet: ReadonlySet<string>;
+  projectSpanById: ReadonlyMap<string, ProjectScheduleSpan>;
 }) {
   const {
     teams,
     section,
-    closures,
-    committedProjectsBySection,
+    committedSectionProjects,
     dependencyCountByProjectId,
     selectedProjectIdSet,
+    projectSpanById,
   } = args;
 
   return teams.map((team) => {
@@ -247,22 +321,18 @@ export function buildTimelineSectionRowViews(args: {
       granularity: "row-surface",
     };
 
-    const committedProjects = getSectionTeamProjects(
-      committedProjectsBySection,
-      section.id,
-      team.id
-    );
+    const committedProjects = getTeamProjectsForSection(committedSectionProjects, team.id);
     const scheduledCards: TimelineScheduledCardView[] = [];
 
     for (const project of committedProjects) {
-      const computed = advanceWorkingDuration(
-        project.scheduledStartSlot,
-        project.scheduledDurationHalfDays,
-        closures
-      );
+      const projectSpan = projectSpanById.get(project.id);
+      if (!projectSpan) {
+        continue;
+      }
+
       const bounds = getMonthSegmentBounds(
         project.scheduledStartSlot,
-        computed.calendarEndSlot,
+        projectSpan.calendarEndSlot,
         section
       );
 
@@ -272,7 +342,7 @@ export function buildTimelineSectionRowViews(args: {
 
       scheduledCards.push({
         project,
-        calendarEndSlot: computed.calendarEndSlot,
+        calendarEndSlot: projectSpan.calendarEndSlot,
         bounds: {
           left: `${(bounds.startOffset / section.dayCount) * 100}%`,
           width: `${(Math.max(bounds.endOffset - bounds.startOffset, 0.48) / section.dayCount) * 100}%`,
@@ -294,20 +364,20 @@ export function buildTimelineSectionRowViews(args: {
 export function buildTimelineSectionOverlayViews(args: {
   rowViews: TimelineTeamRowView[];
   section: YearMonthSection;
-  closures: ClosurePeriod[];
   previewProjectsBySection: SectionTeamProjectMap;
   previewChangedProjectIdSet: ReadonlySet<string>;
   previewPrimaryProjectId: string | null;
+  previewProjectSpanById: ReadonlyMap<string, ProjectScheduleSpan>;
   pendingPlacement: QuickPlacementState | null;
   hoveredBucket: CalendarBucket | null;
 }) {
   const {
     rowViews,
     section,
-    closures,
     previewProjectsBySection,
     previewChangedProjectIdSet,
     previewPrimaryProjectId,
+    previewProjectSpanById,
     pendingPlacement,
     hoveredBucket,
   } = args;
@@ -352,14 +422,14 @@ export function buildTimelineSectionOverlayViews(args: {
         continue;
       }
 
-      const computed = advanceWorkingDuration(
-        project.scheduledStartSlot,
-        project.scheduledDurationHalfDays,
-        closures
-      );
+      const projectSpan = previewProjectSpanById.get(project.id);
+      if (!projectSpan) {
+        continue;
+      }
+
       const bounds = getMonthSegmentBounds(
         project.scheduledStartSlot,
-        computed.calendarEndSlot,
+        projectSpan.calendarEndSlot,
         section
       );
 

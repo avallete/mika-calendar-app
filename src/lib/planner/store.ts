@@ -15,17 +15,16 @@ import {
   teams,
 } from "@/db/schema";
 import {
+  canWritePersistentStateDelta,
   type DbExecutor,
   type PersistentPlannerState,
   ensureClosureMarkerSchema,
   getBasePersistentState,
   plannerStateToPersistentState,
   replacePersistentState,
+  writePersistentStateDelta,
 } from "@/lib/planner/persistence";
-import {
-  buildEffectiveClosures,
-  materializePlannerState,
-} from "@/lib/planner/closure-materialization";
+import { materializePlannerState } from "@/lib/planner/closure-materialization";
 import {
   addPlannerTraceContextFields,
   approximateJsonByteSize,
@@ -37,9 +36,12 @@ import {
   measurePlannerTraceStepAsync,
   startPlannerTrace,
   summarizePlannerSnapshot,
+  tracePlannerTraceStep,
   type PlannerTraceContext,
   type PlannerTraceLike,
 } from "@/lib/planner/planner-trace";
+import { primePlannerComputedSnapshot } from "@/lib/planner/planner-computed";
+import { recordPlannerPerfProbeCount } from "@/lib/planner/planner-perf";
 import { initialPlannerState } from "@/lib/planner/sample-data";
 import {
   addClosureInState,
@@ -76,6 +78,9 @@ function toDateString(value: Date | string | null | undefined) {
 
   return format(new Date(value), "yyyy-MM-dd");
 }
+
+let plannerBootstrapPromise: Promise<void> | null = null;
+let plannerBootstrapOwner: DbExecutor | null = null;
 
 function actionLabel(actionType: string) {
   switch (actionType) {
@@ -192,21 +197,25 @@ function toPlannerSnapshot(
     projects: persistentState.projects,
     dependencies: persistentState.dependencies,
     customClosures: persistentState.customClosures,
-    closures: buildEffectiveClosures({
-      projects: persistentState.projects,
-      holidaySources: persistentState.holidaySources,
-      customClosures: persistentState.customClosures,
-    }),
+    closures: [],
     history,
   };
 }
 
-function normalizePlannerSnapshot(
+function hydratePlannerSnapshot(
   persistentState: PersistentPlannerState,
   history: PlannerHistoryState,
   traceContext?: PlannerTraceLike,
-  label = "planner.store.normalizeSnapshot"
+  label = "planner.store.hydrateSnapshot",
+  options?: {
+    countAsLoadHydrate?: boolean;
+    previousSnapshot?: PlannerState | null;
+  }
 ) {
+  if (options?.countAsLoadHydrate) {
+    recordPlannerPerfProbeCount("loadHydrateCallCount");
+  }
+
   const snapshot = measurePlannerTraceStep(
     traceContext,
     `${label}.toPlannerSnapshot`,
@@ -223,6 +232,25 @@ function normalizePlannerSnapshot(
       snapshotSummary: summarizePlannerSnapshot(snapshot),
     })
   );
+  primePlannerComputedSnapshot(
+    materializedSnapshot,
+    options?.previousSnapshot ?? undefined
+  );
+  return materializedSnapshot;
+}
+
+function normalizePlannerSnapshotCanonical(
+  persistentState: PersistentPlannerState,
+  history: PlannerHistoryState,
+  traceContext?: PlannerTraceLike,
+  label = "planner.store.normalizeSnapshot"
+) {
+  const hydratedSnapshot = hydratePlannerSnapshot(
+    persistentState,
+    history,
+    traceContext,
+    `${label}.hydrate`
+  );
   const normalized = measurePlannerTraceStep(
     traceContext,
     `${label}.reschedule`,
@@ -232,7 +260,7 @@ function normalizePlannerSnapshot(
         typeof traceFields.traceSource === "string"
           ? traceFields.traceSource
           : "load";
-      return rescheduleProjects(materializedSnapshot, {
+      return rescheduleProjects(hydratedSnapshot, {
         action: label,
         metadata: {
           source: traceSource,
@@ -241,7 +269,7 @@ function normalizePlannerSnapshot(
       });
     },
     addPlannerTraceContextFields(traceContext, {
-      snapshotSummary: summarizePlannerSnapshot(materializedSnapshot),
+      snapshotSummary: summarizePlannerSnapshot(hydratedSnapshot),
     })
   );
 
@@ -249,6 +277,38 @@ function normalizePlannerSnapshot(
     ...normalized,
     history,
   };
+}
+
+function shouldValidatePlannerSnapshotCanonical() {
+  return (
+    typeof process !== "undefined" &&
+    process.env.PLANNER_VALIDATE_CANONICAL === "1"
+  );
+}
+
+function validatePlannerSnapshotCanonical(
+  snapshot: PlannerState,
+  traceContext?: PlannerTraceLike,
+  label = "planner.store.validateCanonical"
+) {
+  if (!shouldValidatePlannerSnapshotCanonical()) {
+    return;
+  }
+
+  const canonical = normalizePlannerSnapshotCanonical(
+    plannerStateToPersistentState(snapshot),
+    snapshot.history,
+    traceContext,
+    label
+  );
+  if (JSON.stringify(snapshot) === JSON.stringify(canonical)) {
+    return;
+  }
+
+  tracePlannerTraceStep(traceContext, `${label}.mismatch`, {
+    hydratedSnapshotSummary: summarizePlannerSnapshot(snapshot),
+    canonicalSnapshotSummary: summarizePlannerSnapshot(canonical),
+  });
 }
 
 async function readHistoryState(
@@ -296,62 +356,77 @@ async function ensurePlannerBootstrapped(
   executor: DbExecutor,
   traceContext?: PlannerTraceLike
 ) {
-  await measurePlannerTraceStepAsync(
-    traceContext,
-    "planner.store.bootstrap.ensureSchema",
-    () => ensureClosureMarkerSchema(executor),
-    addPlannerTraceContextFields(traceContext)
-  );
-
-  const existingTeamCount = await measurePlannerTraceStepAsync(
-    traceContext,
-    "planner.store.bootstrap.teamCount",
-    () =>
-      executor.select({ count: sql<number>`count(*)` }).from(teams),
-    addPlannerTraceContextFields(traceContext)
-  );
-
-  if (Number(existingTeamCount[0]?.count ?? 0) === 0) {
-    const baseState = getBasePersistentState();
-    await measurePlannerTraceStepAsync(
-      traceContext,
-      "planner.store.bootstrap.seedBaseState",
-      () =>
-        replacePersistentState(executor, baseState, traceContext, {
-          after: summarizePlannerSnapshot(baseState),
-        }),
-      addPlannerTraceContextFields(traceContext, {
-        snapshotSummary: summarizePlannerSnapshot(baseState),
-      })
-    );
-    return;
+  const currentDb = getDb();
+  if (plannerBootstrapOwner !== currentDb) {
+    plannerBootstrapOwner = currentDb;
+    plannerBootstrapPromise = null;
   }
 
-  const existingHolidaySources = await measurePlannerTraceStepAsync(
-    traceContext,
-    "planner.store.bootstrap.holidaySourceCount",
-    () =>
-      executor.select({ count: sql<number>`count(*)` }).from(holidaySources),
-    addPlannerTraceContextFields(traceContext)
-  );
-  if (Number(existingHolidaySources[0]?.count ?? 0) === 0) {
-    await measurePlannerTraceStepAsync(
-      traceContext,
-      "planner.store.bootstrap.backfillHolidaySources",
-      () =>
-        executor.insert(holidaySources).values(
-          initialPlannerState.holidaySources.map((source) => ({
-            id: source.id,
-            code: source.code,
-            labelFr: source.labelFr,
-            enabled: source.enabled,
-          }))
-        ),
-      addPlannerTraceContextFields(traceContext, {
-        rowCount: initialPlannerState.holidaySources.length,
-      })
-    );
+  if (!plannerBootstrapPromise) {
+    plannerBootstrapPromise = (async () => {
+      await measurePlannerTraceStepAsync(
+        traceContext,
+        "planner.store.bootstrap.ensureSchema",
+        () => ensureClosureMarkerSchema(executor),
+        addPlannerTraceContextFields(traceContext)
+      );
+
+      const existingTeamCount = await measurePlannerTraceStepAsync(
+        traceContext,
+        "planner.store.bootstrap.teamCount",
+        () =>
+          executor.select({ count: sql<number>`count(*)` }).from(teams),
+        addPlannerTraceContextFields(traceContext)
+      );
+
+      if (Number(existingTeamCount[0]?.count ?? 0) === 0) {
+        const baseState = getBasePersistentState();
+        await measurePlannerTraceStepAsync(
+          traceContext,
+          "planner.store.bootstrap.seedBaseState",
+          () =>
+            replacePersistentState(executor, baseState, traceContext, {
+              after: summarizePlannerSnapshot(baseState),
+            }),
+          addPlannerTraceContextFields(traceContext, {
+            snapshotSummary: summarizePlannerSnapshot(baseState),
+          })
+        );
+        return;
+      }
+
+      const existingHolidaySources = await measurePlannerTraceStepAsync(
+        traceContext,
+        "planner.store.bootstrap.holidaySourceCount",
+        () =>
+          executor.select({ count: sql<number>`count(*)` }).from(holidaySources),
+        addPlannerTraceContextFields(traceContext)
+      );
+      if (Number(existingHolidaySources[0]?.count ?? 0) === 0) {
+        await measurePlannerTraceStepAsync(
+          traceContext,
+          "planner.store.bootstrap.backfillHolidaySources",
+          () =>
+            executor.insert(holidaySources).values(
+              initialPlannerState.holidaySources.map((source) => ({
+                id: source.id,
+                code: source.code,
+                labelFr: source.labelFr,
+                enabled: source.enabled,
+              }))
+            ),
+          addPlannerTraceContextFields(traceContext, {
+            rowCount: initialPlannerState.holidaySources.length,
+          })
+        );
+      }
+    })().catch((error) => {
+      plannerBootstrapPromise = null;
+      throw error;
+    });
   }
+
+  await plannerBootstrapPromise;
 }
 
 function getPlannerServerCaptureEnvironment() {
@@ -457,12 +532,16 @@ export async function loadPlannerSnapshot(
       source: storeTraceContext?.source ?? null,
       snapshotSummary: summarizePlannerSnapshot(persistentState),
     });
-    const snapshot = normalizePlannerSnapshot(
+    const snapshot = hydratePlannerSnapshot(
       persistentState,
       history,
       trace,
-      "planner.store.load.normalizeSnapshot"
+      "planner.store.load.hydrateSnapshot",
+      {
+        countAsLoadHydrate: true,
+      }
     );
+    validatePlannerSnapshotCanonical(snapshot, trace, "planner.store.load.validateCanonical");
     const serverSummary = buildPlannerCaptureServerSummary(trace);
     logPlannerServerCaptureCompletion(
       storeTraceContext,
@@ -569,11 +648,11 @@ async function commitLoggedMutation(
               sessionId,
             })
           );
-          const beforeSnapshot = normalizePlannerSnapshot(
+          const beforeSnapshot = hydratePlannerSnapshot(
             persistentBefore,
             historyBefore,
             trace,
-            "planner.store.commit.normalizeBefore"
+            "planner.store.commit.hydrateBefore"
           );
           logPlannerServerCaptureStart(storeTraceContext, {
             sessionId,
@@ -589,32 +668,48 @@ async function commitLoggedMutation(
               beforeSnapshotSummary: summarizePlannerSnapshot(beforeSnapshot),
             })
           );
-          const normalizedAfter = normalizePlannerSnapshot(
-            plannerStateToPersistentState(nextSnapshot),
-            buildHistoryState({
+          const afterSnapshotBase = {
+            ...nextSnapshot,
+            history: buildHistoryState({
               undoActionType: actionType,
             }),
-            trace,
-            "planner.store.commit.normalizeAfter"
-          );
-          const persistentAfter = plannerStateToPersistentState(normalizedAfter);
+          } satisfies PlannerState;
+          const persistentAfter = plannerStateToPersistentState(afterSnapshotBase);
 
-          await measurePlannerTraceStepAsync(
-            trace,
-            "planner.store.commit.replacePersistentState",
-            () =>
-              replacePersistentState(tx, persistentAfter, persistenceTraceContext, {
-                before: summarizePlannerSnapshot(persistentBefore),
-                after: summarizePlannerSnapshot(persistentAfter),
-              }),
-            addPlannerTraceContextFields(storeTraceContext, {
-              beforeSummary: summarizePlannerSnapshot(persistentBefore),
-              afterSummary: summarizePlannerSnapshot(persistentAfter),
-            })
-          );
+          if (canWritePersistentStateDelta(persistentBefore, persistentAfter)) {
+            await measurePlannerTraceStepAsync(
+              trace,
+              "planner.store.commit.writePersistentDelta",
+              () =>
+                writePersistentStateDelta(
+                  tx,
+                  persistentBefore,
+                  persistentAfter,
+                  persistenceTraceContext
+                ),
+              addPlannerTraceContextFields(storeTraceContext, {
+                beforeSummary: summarizePlannerSnapshot(persistentBefore),
+                afterSummary: summarizePlannerSnapshot(persistentAfter),
+              })
+            );
+          } else {
+            await measurePlannerTraceStepAsync(
+              trace,
+              "planner.store.commit.replacePersistentState",
+              () =>
+                replacePersistentState(tx, persistentAfter, persistenceTraceContext, {
+                  before: summarizePlannerSnapshot(persistentBefore),
+                  after: summarizePlannerSnapshot(persistentAfter),
+                }),
+              addPlannerTraceContextFields(storeTraceContext, {
+                beforeSummary: summarizePlannerSnapshot(persistentBefore),
+                afterSummary: summarizePlannerSnapshot(persistentAfter),
+              })
+            );
+          }
 
           const logId = crypto.randomUUID();
-          const afterSnapshotForLog = normalizedAfter;
+          const afterSnapshotForLog = afterSnapshotBase;
 
           await measurePlannerTraceStepAsync(
             trace,
@@ -644,7 +739,7 @@ async function commitLoggedMutation(
             })
           );
           return {
-            ...normalizedAfter,
+            ...afterSnapshotBase,
             history: historyAfter,
           };
         }),

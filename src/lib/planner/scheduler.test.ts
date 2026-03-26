@@ -114,6 +114,47 @@ function baseState(): PlannerState {
 }
 
 describe("scheduler", () => {
+  test("previewProjectPlacements matches full reschedule for cross-team moves", () => {
+    const state = baseState();
+    const placement = {
+      teamId: "team-b" as const,
+      startSlot: makeSlotKey("2026-03-25", "PM"),
+      durationHalfDays: 2,
+    };
+    const fullReschedule = rescheduleProjects({
+      ...state,
+      projects: state.projects.map((project) =>
+        project.id === "a-2"
+          ? {
+              ...project,
+              status: "scheduled" as const,
+              scheduledTeam: placement.teamId,
+              scheduledStartSlot: placement.startSlot,
+              scheduledDurationHalfDays: placement.durationHalfDays,
+              sequenceOrder:
+                typeof project.sequenceOrder === "number" ? project.sequenceOrder : 0,
+            }
+          : { ...project }
+      ),
+    });
+
+    const preview = previewProjectPlacements(
+      state,
+      [
+        {
+          projectId: "a-2",
+          placement,
+        },
+      ],
+      {
+        dependencyResolution: "preserve-dependencies",
+      }
+    );
+
+    expect(preview.nextState).toEqual(fullReschedule);
+    expect(preview.changedSectionIds).toEqual(["2026-03"]);
+  });
+
   test("pushes later same-team work forward when an earlier item is extended", () => {
     const nextState = updateProjectPlacement(baseState(), "a-1", {
       teamId: "team-a",

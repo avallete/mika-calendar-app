@@ -9,6 +9,7 @@
     "start": "bun --bun next start",
     "lint": "eslint .",
     "test": "bun test",
+    "test:planner-perf": "bun scripts/planner-perf.ts",
     "typecheck": "tsc --noEmit",
     "db:generate": "bunx drizzle-kit generate",
     "db:migrate": "bunx drizzle-kit migrate",

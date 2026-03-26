@@ -4,6 +4,7 @@ import {
   addWorkingLag,
   advanceWorkingDuration,
   compareSlotKeys,
+  getWorkingCalendarIndex,
   makeSlotKey,
   maxSlotKey,
   normalizeToWorkingSlot,
@@ -33,6 +34,12 @@ import {
   getTodayDateString,
 } from "@/lib/planner/timeline-range";
 import { measurePlannerPerformance } from "@/lib/planner/drag-performance";
+import {
+  getPlannerComputedSnapshot,
+  registerPlannerComputedSnapshot,
+  type ProjectScheduleSpan,
+} from "@/lib/planner/planner-computed";
+import { recordPlannerPerfProbeCount } from "@/lib/planner/planner-perf";
 import {
   addPlannerTraceContextFields,
   normalizePlannerTraceSource,
@@ -66,6 +73,8 @@ type ScheduledProjectLike = Project & {
 type PlacementUpdateResult = {
   nextState: PlannerState;
   changedProjectIds: string[];
+  changedSectionIds: string[];
+  projectSpanById: Map<string, ProjectScheduleSpan>;
 };
 
 const MAX_ITERATIONS = 12;
@@ -295,6 +304,37 @@ function buildPlacementTraceLabel(
   return normalizedRequestsLabel(requestCount);
 }
 
+function buildDependencyAdjacency(dependencies: ProjectDependency[]) {
+  const incomingBySuccessorId = new Map<string, ProjectDependency[]>();
+  const successorIdsByProjectId = new Map<string, string[]>();
+
+  for (const dependency of dependencies) {
+    const incoming = incomingBySuccessorId.get(dependency.successorProjectId) ?? [];
+    incoming.push(dependency);
+    incomingBySuccessorId.set(dependency.successorProjectId, incoming);
+
+    const successors = successorIdsByProjectId.get(dependency.predecessorProjectId) ?? [];
+    successors.push(dependency.successorProjectId);
+    successorIdsByProjectId.set(dependency.predecessorProjectId, successors);
+  }
+
+  return {
+    incomingBySuccessorId,
+    successorIdsByProjectId,
+  };
+}
+
+function seedMinSequenceOrder(
+  seeds: Map<TeamId, number>,
+  teamId: TeamId,
+  sequenceOrder: number
+) {
+  const previous = seeds.get(teamId);
+  if (previous === undefined || sequenceOrder < previous) {
+    seeds.set(teamId, sequenceOrder);
+  }
+}
+
 function compareScheduledProjectsByPlacement(
   left: ScheduledProjectLike,
   right: ScheduledProjectLike
@@ -394,11 +434,11 @@ function buildDependencySafeTeamOrder(
 
 function getPredecessorReadySlot(
   projectId: string,
-  dependencies: ProjectDependency[],
+  incomingBySuccessorId: Map<string, ProjectDependency[]>,
   computations: Map<string, ScheduledComputation>,
   closures: ClosurePeriod[]
 ) {
-  const incoming = dependencies.filter((dependency) => dependency.successorProjectId === projectId);
+  const incoming = incomingBySuccessorId.get(projectId) ?? [];
 
   if (!incoming.length) {
     return null;
@@ -420,6 +460,32 @@ function getPredecessorReadySlot(
   }
 
   return maxSlotKey(...slots);
+}
+
+function listChangedSectionIds(
+  previousProjectSpanById: ReadonlyMap<string, ProjectScheduleSpan>,
+  nextProjectSpanById: ReadonlyMap<string, ProjectScheduleSpan>,
+  changedProjectIds: string[],
+) {
+  const sectionIds = new Set<string>();
+
+  for (const projectId of changedProjectIds) {
+    const previous = previousProjectSpanById.get(projectId);
+    if (previous) {
+      for (const sectionId of previous.sectionIds) {
+        sectionIds.add(sectionId);
+      }
+    }
+
+    const next = nextProjectSpanById.get(projectId);
+    if (next) {
+      for (const sectionId of next.sectionIds) {
+        sectionIds.add(sectionId);
+      }
+    }
+  }
+
+  return [...sectionIds].sort();
 }
 
 function overlapExists(
@@ -545,6 +611,393 @@ function collectTransitiveSuccessors(
   }
 
   return affected;
+}
+
+function buildPlacementIncrementalScope(args: {
+  previousState: PlannerState;
+  nextProjects: Project[];
+  dependencies: ProjectDependency[];
+  movedProjectIds: string[];
+}) {
+  const previousProjectsById = new Map(
+    args.previousState.projects.map((project) => [project.id, project] as const)
+  );
+  const nextProjectsById = new Map(
+    args.nextProjects.map((project) => [project.id, project] as const)
+  );
+  const nextScheduledProjectsByTeam = new Map<TeamId, ScheduledProjectLike[]>();
+  const teamSequenceSeeds = new Map<TeamId, number>();
+  const affectedProjectIds = new Set<string>(args.movedProjectIds);
+  const { successorIdsByProjectId } = buildDependencyAdjacency(args.dependencies);
+
+  for (const teamProject of args.nextProjects.filter(isScheduledProject)) {
+    const teamProjects = nextScheduledProjectsByTeam.get(teamProject.scheduledTeam) ?? [];
+    teamProjects.push(teamProject);
+    nextScheduledProjectsByTeam.set(teamProject.scheduledTeam, teamProjects);
+  }
+
+  for (const teamProjects of nextScheduledProjectsByTeam.values()) {
+    teamProjects.sort(compareScheduledProjectsByPlacement);
+  }
+
+  for (const movedProjectId of args.movedProjectIds) {
+    const previousProject = previousProjectsById.get(movedProjectId);
+    if (previousProject && isScheduledProject(previousProject)) {
+      seedMinSequenceOrder(
+        teamSequenceSeeds,
+        previousProject.scheduledTeam,
+        previousProject.sequenceOrder
+      );
+    }
+
+    const nextProject = nextProjectsById.get(movedProjectId);
+    if (nextProject && isScheduledProject(nextProject)) {
+      seedMinSequenceOrder(
+        teamSequenceSeeds,
+        nextProject.scheduledTeam,
+        nextProject.sequenceOrder
+      );
+    }
+  }
+
+  let expanded = true;
+  while (expanded) {
+    expanded = false;
+
+    for (const [teamId, minSequenceOrder] of teamSequenceSeeds) {
+      for (const project of nextScheduledProjectsByTeam.get(teamId) ?? []) {
+        if (project.sequenceOrder < minSequenceOrder || affectedProjectIds.has(project.id)) {
+          continue;
+        }
+
+        affectedProjectIds.add(project.id);
+        expanded = true;
+      }
+    }
+
+    for (const projectId of [...affectedProjectIds]) {
+      for (const successorProjectId of successorIdsByProjectId.get(projectId) ?? []) {
+        const successorProject = nextProjectsById.get(successorProjectId);
+        if (!successorProject || !isScheduledProject(successorProject)) {
+          continue;
+        }
+
+        if (!affectedProjectIds.has(successorProjectId)) {
+          affectedProjectIds.add(successorProjectId);
+          expanded = true;
+        }
+
+        const previousSeed = teamSequenceSeeds.get(successorProject.scheduledTeam);
+        if (
+          previousSeed === undefined ||
+          successorProject.sequenceOrder < previousSeed
+        ) {
+          teamSequenceSeeds.set(
+            successorProject.scheduledTeam,
+            successorProject.sequenceOrder
+          );
+          expanded = true;
+        }
+      }
+    }
+  }
+
+  return {
+    affectedProjectIds,
+    teamSequenceSeeds,
+  };
+}
+
+function seedUnaffectedProjectComputations(args: {
+  projects: Project[];
+  affectedProjectIds: ReadonlySet<string>;
+  previousProjectSpanById: ReadonlyMap<string, ProjectScheduleSpan>;
+}) {
+  const computations = new Map<string, ScheduledComputation>();
+
+  for (const project of args.projects) {
+    if (!isScheduledProject(project) || args.affectedProjectIds.has(project.id)) {
+      continue;
+    }
+
+    const previousSpan = args.previousProjectSpanById.get(project.id);
+    if (!previousSpan) {
+      recordPlannerPerfProbeCount("seededUnaffectedProjectCount");
+      continue;
+    }
+
+    computations.set(project.id, previousSpan);
+    recordPlannerPerfProbeCount("reusedSpanCount");
+  }
+
+  return computations;
+}
+
+function buildProjectSpanByIdFromComputations(
+  projects: Project[],
+  computations: ReadonlyMap<string, ScheduledComputation>
+) {
+  const projectSpanById = new Map<string, ProjectScheduleSpan>();
+
+  for (const project of projects) {
+    if (!isScheduledProject(project)) {
+      continue;
+    }
+
+    const computation = computations.get(project.id);
+    if (!computation) {
+      continue;
+    }
+
+    projectSpanById.set(project.id, computation);
+  }
+
+  return projectSpanById;
+}
+
+function reschedulePlacementProjectsIncremental(args: {
+  previousState: PlannerState;
+  nextState: PlannerState;
+  trace: SchedulerTrace | null;
+  summaryOnly: boolean;
+  movedProjectIds: string[];
+}): PlacementUpdateResult {
+  const verboseTrace = shouldLogVerboseSchedulerTrace(args.summaryOnly);
+  const previousComputed = getPlannerComputedSnapshot(args.previousState);
+  const previousProjects = args.previousState.projects.map((project) => ({ ...project }));
+  const nextProjects = measureSchedulerStage(
+    args.trace,
+    "reschedule.normalizeSequenceOrders",
+    () =>
+      normalizeSequenceOrders(
+        args.nextState.projects.map((project) => ({ ...project })),
+        args.nextState.dependencies,
+        args.nextState.teams,
+        verboseTrace ? args.trace : null
+      ),
+    {
+      teamCount: args.nextState.teams.length,
+      projectCount: args.nextState.projects.length,
+    }
+  );
+  const { incomingBySuccessorId } = buildDependencyAdjacency(args.nextState.dependencies);
+  const { affectedProjectIds, teamSequenceSeeds } = measureSchedulerStage(
+    args.trace,
+    "reschedule.incremental.scope",
+    () =>
+      buildPlacementIncrementalScope({
+        previousState: args.previousState,
+        nextProjects,
+        dependencies: args.nextState.dependencies,
+        movedProjectIds: args.movedProjectIds,
+      }),
+    {
+      movedProjectCount: args.movedProjectIds.length,
+      scheduledProjectCount: nextProjects.filter(isScheduledProject).length,
+    }
+  );
+  const computations = measureSchedulerStage(
+    args.trace,
+    "reschedule.incremental.seedComputations",
+    () =>
+      seedUnaffectedProjectComputations({
+        projects: nextProjects,
+        affectedProjectIds,
+        previousProjectSpanById: previousComputed.projectSpanById,
+      }),
+    {
+      unaffectedScheduledProjectCount: nextProjects.filter(
+        (project) => isScheduledProject(project) && !affectedProjectIds.has(project.id)
+      ).length,
+      affectedScheduledProjectCount: nextProjects.filter(
+        (project) => isScheduledProject(project) && affectedProjectIds.has(project.id)
+      ).length,
+    }
+  );
+  let iterationCount = 0;
+
+  if (verboseTrace) {
+    traceLog(args.trace, "queues.before", summarizeTeamQueues(previousProjects, args.nextState.teams));
+  }
+
+  const { stabilized } = measureSchedulerStage(
+    args.trace,
+    "reschedule.mainLoop",
+    () => {
+      let stabilized = false;
+
+      for (let iteration = 0; iteration < MAX_ITERATIONS; iteration += 1) {
+        iterationCount = iteration + 1;
+        let changed = false;
+
+        for (const team of getSortedTeams(args.nextState.teams)) {
+          if (!teamSequenceSeeds.has(team.id)) {
+            continue;
+          }
+
+          const teamProjects = sortScheduledProjects(nextProjects, team.id);
+          let previousReadySlot: SlotKey | null = null;
+
+          for (const project of teamProjects) {
+            const previousComputation = computations.get(project.id);
+
+            if (!affectedProjectIds.has(project.id)) {
+              previousReadySlot = previousComputation?.readySlot ?? previousReadySlot;
+              continue;
+            }
+
+            const dependencyReady = getPredecessorReadySlot(
+              project.id,
+              incomingBySuccessorId,
+              computations,
+              args.nextState.closures
+            );
+            const requestedStart = [
+              project.scheduledStartSlot,
+              previousReadySlot,
+              dependencyReady,
+            ]
+              .filter(Boolean)
+              .reduce((latest, current) => {
+                if (!latest) {
+                  return current as SlotKey;
+                }
+
+                return compareSlotKeys(latest, current as SlotKey) > 0
+                  ? latest
+                  : (current as SlotKey);
+              }, project.scheduledStartSlot) as SlotKey;
+            const computed = advanceWorkingDuration(
+              requestedStart,
+              project.scheduledDurationHalfDays,
+              args.nextState.closures
+            );
+
+            computations.set(project.id, computed);
+            if (verboseTrace) {
+              traceLog(args.trace, `iteration.${iteration + 1}.${project.id}`, {
+                teamId: team.id,
+                previousReadySlot,
+                dependencyReady,
+                requestedStart,
+                computedStartSlot: computed.startSlot,
+                calendarEndSlot: computed.calendarEndSlot,
+                readySlot: computed.readySlot,
+                skippedDates: computed.skippedDates,
+              });
+            }
+
+            if (
+              !previousComputation ||
+              previousComputation.startSlot !== computed.startSlot ||
+              previousComputation.calendarEndSlot !== computed.calendarEndSlot ||
+              previousComputation.readySlot !== computed.readySlot ||
+              project.scheduledStartSlot !== computed.startSlot
+            ) {
+              changed = true;
+              project.scheduledStartSlot = computed.startSlot;
+            }
+
+            previousReadySlot = computed.readySlot;
+          }
+        }
+
+        if (!changed) {
+          stabilized = true;
+          break;
+        }
+      }
+
+      return { stabilized };
+    },
+    {
+      teamCount: args.nextState.teams.length,
+      scheduledProjectCount: args.nextState.projects.filter(isScheduledProject).length,
+      dependencyCount: args.nextState.dependencies.length,
+      closureCount: args.nextState.closures.length,
+      affectedProjectCount: affectedProjectIds.size,
+      touchedTeamCount: teamSequenceSeeds.size,
+    }
+  );
+
+  if (!stabilized && verboseTrace) {
+    traceLog(args.trace, "reschedule.unstable", {
+      maxIterations: MAX_ITERATIONS,
+      queues: summarizeTeamQueues(nextProjects, args.nextState.teams),
+    });
+  }
+
+  const materializedNextState = measureSchedulerStage(
+    args.trace,
+    "reschedule.materialize.output",
+    () =>
+      materializePlannerState({
+        ...args.nextState,
+        projects: nextProjects,
+      }),
+    {
+      projectCount: nextProjects.length,
+      closureCount: args.nextState.closures.length,
+    }
+  );
+  const nextProjectSpanById = buildProjectSpanByIdFromComputations(
+    nextProjects,
+    computations
+  );
+  const changes = measureSchedulerStage(
+    args.trace,
+    "reschedule.changedProjectDiff",
+    () => listScheduledChanges(previousProjects, nextProjects),
+    {
+      previousProjectCount: previousProjects.length,
+      nextProjectCount: nextProjects.length,
+    }
+  );
+  const changedProjectIds = changes.map((change) => change.id);
+  recordPlannerPerfProbeCount("changedProjectCount", changedProjectIds.length);
+  const changedSectionIds = measureSchedulerStage(
+    args.trace,
+    "placement.changedSectionIds",
+    () =>
+      listChangedSectionIds(
+        previousComputed.projectSpanById,
+        nextProjectSpanById,
+        changedProjectIds
+      ),
+    {
+      changedProjectCount: changedProjectIds.length,
+    }
+  );
+  recordPlannerPerfProbeCount("changedSectionCount", changedSectionIds.length);
+
+  registerPlannerComputedSnapshot(materializedNextState, {
+    snapshot: materializedNextState,
+    calendarIndex: getWorkingCalendarIndex(materializedNextState.closures),
+    projectSpanById: nextProjectSpanById,
+  });
+
+  traceLog(args.trace, "summary", {
+    iterationCount,
+    changedProjectCount: changes.length,
+    teamCount: args.nextState.teams.length,
+    scheduledProjectCount: args.nextState.projects.filter(isScheduledProject).length,
+    dependencyCount: args.nextState.dependencies.length,
+    closureCount: args.nextState.closures.length,
+    affectedProjectCount: affectedProjectIds.size,
+    touchedTeamCount: teamSequenceSeeds.size,
+  });
+
+  if (verboseTrace) {
+    traceLog(args.trace, "queues.after", summarizeTeamQueues(nextProjects, args.nextState.teams));
+    traceLog(args.trace, "changes", changes);
+  }
+
+  return {
+    nextState: materializedNextState,
+    changedProjectIds,
+    changedSectionIds,
+    projectSpanById: nextProjectSpanById,
+  };
 }
 
 export function getTouchingProjectChain(state: PlannerState, projectId: string) {
@@ -715,6 +1168,7 @@ export function rescheduleProjects(
   state: PlannerState,
   options?: RescheduleOptions
 ): PlannerState {
+  recordPlannerPerfProbeCount("fullRescheduleCallCount");
   const summaryOnly = options?.summaryOnly ?? false;
   const verboseTrace = shouldLogVerboseSchedulerTrace(summaryOnly);
   const trace =
@@ -755,6 +1209,7 @@ export function rescheduleProjects(
       projectCount: preparedState.projects.length,
     }
   );
+  const { incomingBySuccessorId } = buildDependencyAdjacency(preparedState.dependencies);
   const computations = new Map<string, ScheduledComputation>();
   let iterationCount = 0;
 
@@ -778,7 +1233,7 @@ export function rescheduleProjects(
           for (const project of teamProjects) {
             const dependencyReady = getPredecessorReadySlot(
               project.id,
-              preparedState.dependencies,
+              incomingBySuccessorId,
               computations,
               preparedState.closures
             );
@@ -897,6 +1352,12 @@ export function rescheduleProjects(
   if (ownsTrace) {
     finishSchedulerTrace(trace);
   }
+
+  registerPlannerComputedSnapshot(nextState, {
+    snapshot: nextState,
+    calendarIndex: getWorkingCalendarIndex(nextState.closures),
+    projectSpanById: buildProjectSpanByIdFromComputations(nextProjects, computations),
+  });
 
   return nextState;
 }
@@ -1118,22 +1579,22 @@ function updateProjectPlacementsWithResult(
     traceLog(trace, "dependencies.broken", options.removeDependencyIds);
   }
 
-  const nextState = summaryOnly
+  const placementState = {
+    ...anticipatedState,
+    dependencies: nextDependencies,
+    projects: nextProjects,
+  };
+  const result = summaryOnly
     ? measurePlannerPerformance(
         "drag.preview.exact.scheduler",
         () =>
-          rescheduleProjects(
-            {
-              ...anticipatedState,
-              dependencies: nextDependencies,
-              projects: nextProjects,
-            },
-            {
-              trace,
-              summaryOnly,
-              traceContext,
-            }
-          ),
+          reschedulePlacementProjectsIncremental({
+            previousState: state,
+            nextState: placementState,
+            trace,
+            summaryOnly,
+            movedProjectIds: normalizedRequests.map((request) => request.projectId),
+          }),
         {
           source: normalizedSource,
           strategy,
@@ -1141,34 +1602,19 @@ function updateProjectPlacementsWithResult(
           selectionSize: normalizedRequests.length,
         }
       )
-    : rescheduleProjects(
-        {
-          ...anticipatedState,
-          dependencies: nextDependencies,
-          projects: nextProjects,
-        },
-        {
-          trace,
-          summaryOnly,
-          traceContext,
-        }
-      );
-
-  const changedProjectIds = measureSchedulerStage(
-    trace,
-    "placement.changedProjectIds",
-    () =>
-      listScheduledChanges(state.projects, nextState.projects).map(
-        (change) => change.id
-      ),
-    {
-      projectCount: nextState.projects.length,
-    }
-  );
+    : reschedulePlacementProjectsIncremental({
+        previousState: state,
+        nextState: placementState,
+        trace,
+        summaryOnly,
+        movedProjectIds: normalizedRequests.map((request) => request.projectId),
+      });
   finishSchedulerTrace(trace);
   return {
-    nextState,
-    changedProjectIds,
+    nextState: result.nextState,
+    changedProjectIds: result.changedProjectIds,
+    changedSectionIds: result.changedSectionIds,
+    projectSpanById: result.projectSpanById,
   };
 }
 

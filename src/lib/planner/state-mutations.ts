@@ -125,7 +125,7 @@ export function placeProjectInState(
   traceContext?: PlannerTraceContext | null
 ) {
   return updateProjectPlacement(
-    cloneState(state),
+    state,
     projectId,
     placement,
     options,
@@ -140,7 +140,7 @@ export function placeProjectsInState(
   traceContext?: PlannerTraceContext | null
 ) {
   return updateProjectPlacements(
-    cloneState(state),
+    state,
     placements,
     options,
     traceContext

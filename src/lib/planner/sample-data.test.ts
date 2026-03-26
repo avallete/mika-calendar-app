@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
 
-import { buildPlannerDemoState } from "@/lib/planner/sample-data";
+import {
+  buildPlannerDemoState,
+  buildPlannerFixtureState,
+  buildPlannerStressState,
+} from "@/lib/planner/sample-data";
 import { buildTimelineYearRange } from "@/lib/planner/timeline-range";
 import { isScheduledProject } from "@/lib/planner/types";
 
@@ -101,5 +105,29 @@ describe("planner sample data", () => {
     expect(yearRange.years.length).toBeGreaterThanOrEqual(4);
     expect(yearRange.startYear).toBeLessThanOrEqual(2025);
     expect(yearRange.endYear).toBeGreaterThanOrEqual(2028);
+  });
+
+  test("builds the stress fixture with denser scheduled work and more dependencies", () => {
+    const fixedNow = new Date(2026, 2, 25, 12);
+    const demoSnapshot = buildPlannerDemoState(fixedNow);
+    const stressSnapshot = buildPlannerStressState(fixedNow);
+    const fixtureSnapshot = buildPlannerFixtureState({
+      preset: "stress",
+      now: fixedNow,
+    });
+
+    expect(fixtureSnapshot).toEqual(stressSnapshot);
+    expect(stressSnapshot.projects.length).toBeGreaterThan(demoSnapshot.projects.length);
+    expect(
+      stressSnapshot.projects.filter((project) => project.status === "scheduled").length
+    ).toBeGreaterThan(
+      demoSnapshot.projects.filter((project) => project.status === "scheduled").length
+    );
+    expect(stressSnapshot.dependencies.length).toBeGreaterThan(
+      demoSnapshot.dependencies.length
+    );
+    expect(stressSnapshot.customClosures.length).toBeGreaterThan(
+      demoSnapshot.customClosures.length
+    );
   });
 });

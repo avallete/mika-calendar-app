@@ -1,11 +1,13 @@
 import { describe, expect, test } from "bun:test";
 
 import { makeSlotKey } from "@/lib/planner/calendar";
+import { buildProjectSpanByIdFromProjects } from "@/lib/planner/planner-computed";
 import {
   buildSectionTeamProjectMap,
   buildTimelineSectionOverlayViews,
   buildTimelineSectionRowViews,
   EMPTY_SECTION_TEAM_PROJECTS,
+  EMPTY_TEAM_PROJECTS,
   scopeSectionPreviewState,
 } from "@/lib/planner/timeline-render";
 import type {
@@ -72,17 +74,36 @@ function makeBucket(startSlot: CalendarBucket["startSlot"]): CalendarBucket {
   };
 }
 
+function buildProjectSpanById(projects: ScheduledTimelineProject[]) {
+  return buildProjectSpanByIdFromProjects({
+    snapshot: {
+      teams,
+      holidaySources: [],
+      projects,
+      dependencies: [],
+      customClosures: [],
+      closures: [],
+      history: {
+        canUndo: false,
+        canRedo: false,
+      },
+    },
+    projects,
+  });
+}
+
 describe("timeline render helpers", () => {
   test("scopes preview data to touched sections but keeps hovered bucket highlights", () => {
     const hoveredBucket = makeBucket(makeSlotKey("2026-03-12", "AM"));
+    const previewProjects = [
+      makeScheduledProject({
+        id: "project-1",
+        scheduledStartSlot: makeSlotKey("2026-03-12", "AM"),
+      }),
+    ];
     const previewProjectsBySection = buildSectionTeamProjectMap(
-      [
-        makeScheduledProject({
-          id: "project-1",
-          scheduledStartSlot: makeSlotKey("2026-03-12", "AM"),
-        }),
-      ],
-      []
+      previewProjects,
+      buildProjectSpanById(previewProjects)
     );
     const previewChangedProjectIdSet = new Set(["project-1"]);
 
@@ -116,23 +137,25 @@ describe("timeline render helpers", () => {
   });
 
   test("builds static row views once from committed scheduled cards", () => {
+    const committedProjects = [
+      makeScheduledProject({
+        id: "project-1",
+        scheduledTeam: "team-a",
+        scheduledStartSlot: makeSlotKey("2026-03-10", "AM"),
+      }),
+    ];
     const committedProjectsBySection = buildSectionTeamProjectMap(
-      [
-        makeScheduledProject({
-          id: "project-1",
-          scheduledTeam: "team-a",
-          scheduledStartSlot: makeSlotKey("2026-03-10", "AM"),
-        }),
-      ],
-      []
+      committedProjects,
+      buildProjectSpanById(committedProjects)
     );
     const rowViews = buildTimelineSectionRowViews({
       teams,
       section: marchSection,
-      closures: [],
-      committedProjectsBySection,
+      committedSectionProjects:
+        committedProjectsBySection.get(marchSection.id) ?? EMPTY_TEAM_PROJECTS,
       dependencyCountByProjectId: new Map([["project-1", 2]]),
       selectedProjectIdSet: new Set(["project-1"]),
+      projectSpanById: buildProjectSpanById(committedProjects),
     });
 
     expect(rowViews).toHaveLength(2);
@@ -150,47 +173,50 @@ describe("timeline render helpers", () => {
   });
 
   test("builds overlay views from preview, hover, and pending state without mutating static rows", () => {
+    const committedProjects = [
+      makeScheduledProject({
+        id: "project-1",
+        scheduledTeam: "team-a",
+        scheduledStartSlot: makeSlotKey("2026-03-10", "AM"),
+      }),
+    ];
     const committedProjectsBySection = buildSectionTeamProjectMap(
-      [
-        makeScheduledProject({
-          id: "project-1",
-          scheduledTeam: "team-a",
-          scheduledStartSlot: makeSlotKey("2026-03-10", "AM"),
-        }),
-      ],
-      []
+      committedProjects,
+      buildProjectSpanById(committedProjects)
     );
+    const previewProjects = [
+      makeScheduledProject({
+        id: "project-1",
+        scheduledTeam: "team-a",
+        scheduledStartSlot: makeSlotKey("2026-03-11", "AM"),
+      }),
+      makeScheduledProject({
+        id: "project-2",
+        scheduledTeam: "team-a",
+        scheduledStartSlot: makeSlotKey("2026-03-20", "AM"),
+      }),
+    ];
     const previewProjectsBySection = buildSectionTeamProjectMap(
-      [
-        makeScheduledProject({
-          id: "project-1",
-          scheduledTeam: "team-a",
-          scheduledStartSlot: makeSlotKey("2026-03-11", "AM"),
-        }),
-        makeScheduledProject({
-          id: "project-2",
-          scheduledTeam: "team-a",
-          scheduledStartSlot: makeSlotKey("2026-03-20", "AM"),
-        }),
-      ],
-      []
+      previewProjects,
+      buildProjectSpanById(previewProjects)
     );
     const rowViews = buildTimelineSectionRowViews({
       teams,
       section: marchSection,
-      closures: [],
-      committedProjectsBySection,
+      committedSectionProjects:
+        committedProjectsBySection.get(marchSection.id) ?? EMPTY_TEAM_PROJECTS,
       dependencyCountByProjectId: new Map([["project-1", 2]]),
       selectedProjectIdSet: new Set(["project-1"]),
+      projectSpanById: buildProjectSpanById(committedProjects),
     });
 
     const overlayViews = buildTimelineSectionOverlayViews({
       rowViews,
       section: marchSection,
-      closures: [],
       previewProjectsBySection,
       previewChangedProjectIdSet: new Set(["project-1", "project-2"]),
       previewPrimaryProjectId: "project-1",
+      previewProjectSpanById: buildProjectSpanById(previewProjects),
       pendingPlacement: {
         projectId: "draft-1",
         title: "Brouillon",
@@ -221,5 +247,47 @@ describe("timeline render helpers", () => {
     expect(teamBOverlay.team.id).toBe("team-b");
     expect(teamBOverlay.previewCards).toHaveLength(0);
     expect(teamBOverlay.dimmedCards).toHaveLength(0);
+  });
+
+  test("reuses unchanged section project maps when previous projections are provided", () => {
+    const previousProjects = [
+      makeScheduledProject({
+        id: "project-march",
+        scheduledTeam: "team-a",
+        scheduledStartSlot: makeSlotKey("2026-03-10", "AM"),
+      }),
+      makeScheduledProject({
+        id: "project-april",
+        scheduledTeam: "team-b",
+        scheduledStartSlot: makeSlotKey("2026-04-14", "AM"),
+      }),
+    ];
+    const previousProjectsBySection = buildSectionTeamProjectMap(
+      previousProjects,
+      buildProjectSpanById(previousProjects)
+    );
+
+    const nextProjects = [
+      makeScheduledProject({
+        id: "project-march",
+        scheduledTeam: "team-a",
+        scheduledStartSlot: makeSlotKey("2026-03-12", "AM"),
+      }),
+      makeScheduledProject({
+        id: "project-april",
+        scheduledTeam: "team-b",
+        scheduledStartSlot: makeSlotKey("2026-04-14", "AM"),
+      }),
+    ];
+    const nextProjectsBySection = buildSectionTeamProjectMap(
+      nextProjects,
+      buildProjectSpanById(nextProjects),
+      previousProjectsBySection
+    );
+
+    expect(nextProjectsBySection.get("2026-04")).toBe(previousProjectsBySection.get("2026-04"));
+    expect(nextProjectsBySection.get("2026-03")).not.toBe(
+      previousProjectsBySection.get("2026-03")
+    );
   });
 });

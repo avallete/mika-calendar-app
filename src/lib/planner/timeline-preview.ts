@@ -1,5 +1,5 @@
-import { advanceWorkingDuration, parseSlotKey, previousCalendarSlot } from "@/lib/planner/calendar";
-import { getTimelineMonthId } from "@/lib/planner/timeline-folding";
+import { advanceWorkingDuration } from "@/lib/planner/calendar";
+import { buildProjectSpanByIdFromProjects, type ProjectScheduleSpan } from "@/lib/planner/planner-computed";
 import type {
   ClosurePeriod,
   Project,
@@ -9,35 +9,31 @@ import type {
 } from "@/lib/planner/types";
 import { isScheduledProject } from "@/lib/planner/types";
 
-function listMonthSectionIdsBetween(startDate: string, endDate: string) {
-  const sectionIds: string[] = [];
-  let cursor = startDate.slice(0, 7);
-  const endSectionId = endDate.slice(0, 7);
-
-  while (cursor <= endSectionId) {
-    sectionIds.push(cursor);
-    const [year, month] = cursor.split("-").map(Number);
-    const nextMonth = month === 12 ? 1 : month + 1;
-    const nextYear = month === 12 ? year + 1 : year;
-    cursor = `${nextYear}-${String(nextMonth).padStart(2, "0")}`;
-  }
-
-  return sectionIds;
+function getSectionIdsForProject(args: {
+  project: ScheduledTimelineProject;
+  closures: ClosurePeriod[];
+  projectSpanById?: ReadonlyMap<string, ProjectScheduleSpan> | null;
+}) {
+  return (
+    args.projectSpanById?.get(args.project.id)?.sectionIds ??
+    advanceWorkingDuration(
+      args.project.scheduledStartSlot,
+      args.project.scheduledDurationHalfDays,
+      args.closures
+    ).sectionIds
+  );
 }
 
 export function getTimelineSectionIdsForScheduledProject(
   project: ScheduledTimelineProject,
-  closures: ClosurePeriod[]
+  closures: ClosurePeriod[],
+  projectSpanById?: ReadonlyMap<string, ProjectScheduleSpan> | null
 ) {
-  const computed = advanceWorkingDuration(
-    project.scheduledStartSlot,
-    project.scheduledDurationHalfDays,
-    closures
-  );
-  const startDate = parseSlotKey(project.scheduledStartSlot).date;
-  const endDate = parseSlotKey(previousCalendarSlot(computed.calendarEndSlot)).date;
-
-  return listMonthSectionIdsBetween(getTimelineMonthId(startDate), getTimelineMonthId(endDate));
+  return getSectionIdsForProject({
+    project,
+    closures,
+    projectSpanById,
+  });
 }
 
 function didScheduledProjectChange(
@@ -62,6 +58,9 @@ function buildTimelinePreviewDeltaFromScheduledProjects(args: {
   changedProjectIds?: string[] | null;
   closures: ClosurePeriod[];
   primaryProjectId: string | null;
+  currentProjectSpanById?: ReadonlyMap<string, ProjectScheduleSpan> | null;
+  previewProjectSpanById?: ReadonlyMap<string, ProjectScheduleSpan> | null;
+  changedSectionIds?: string[] | null;
 }): TimelinePreviewDelta {
   const {
     currentProjects,
@@ -69,6 +68,9 @@ function buildTimelinePreviewDeltaFromScheduledProjects(args: {
     changedProjectIds,
     closures,
     primaryProjectId,
+    currentProjectSpanById,
+    previewProjectSpanById,
+    changedSectionIds,
   } = args;
   const currentById = new Map(
     currentProjects.filter(isScheduledProject).map((project) => [project.id, project] as const)
@@ -83,20 +85,24 @@ function buildTimelinePreviewDeltaFromScheduledProjects(args: {
           didScheduledProjectChange(currentById.get(project.id), project)
         );
   const touchedTeamIds = new Set<string>();
-  const touchedSectionIds = new Set<string>();
+  const touchedSectionIds = new Set<string>(changedSectionIds ?? []);
 
   for (const project of changedProjects) {
     touchedTeamIds.add(project.scheduledTeam);
-    getTimelineSectionIdsForScheduledProject(project, closures).forEach((sectionId) =>
-      touchedSectionIds.add(sectionId)
-    );
+    getSectionIdsForProject({
+      project,
+      closures,
+      projectSpanById: previewProjectSpanById,
+    }).forEach((sectionId) => touchedSectionIds.add(sectionId));
 
     const currentProject = currentById.get(project.id);
     if (currentProject) {
       touchedTeamIds.add(currentProject.scheduledTeam);
-      getTimelineSectionIdsForScheduledProject(currentProject, closures).forEach((sectionId) =>
-        touchedSectionIds.add(sectionId)
-      );
+      getSectionIdsForProject({
+        project: currentProject,
+        closures,
+        projectSpanById: currentProjectSpanById,
+      }).forEach((sectionId) => touchedSectionIds.add(sectionId));
     }
   }
 
@@ -114,7 +120,10 @@ export function buildTimelinePreviewDelta(args: {
   previewProjects: Project[];
   closures: ClosurePeriod[];
   primaryProjectId: string | null;
-}): TimelinePreviewDelta {
+  currentProjectSpanById?: ReadonlyMap<string, ProjectScheduleSpan> | null;
+  previewProjectSpanById?: ReadonlyMap<string, ProjectScheduleSpan> | null;
+  changedSectionIds?: string[] | null;
+}) {
   return buildTimelinePreviewDeltaFromScheduledProjects({
     ...args,
     previewProjects: args.previewProjects.filter(isScheduledProject),
@@ -127,6 +136,9 @@ export function buildTimelinePreviewDeltaFromChangedProjectIds(args: {
   changedProjectIds: string[];
   closures: ClosurePeriod[];
   primaryProjectId: string | null;
+  currentProjectSpanById?: ReadonlyMap<string, ProjectScheduleSpan> | null;
+  previewProjectSpanById?: ReadonlyMap<string, ProjectScheduleSpan> | null;
+  changedSectionIds?: string[] | null;
 }) {
   return buildTimelinePreviewDeltaFromScheduledProjects({
     currentProjects: args.currentProjects,
@@ -134,6 +146,9 @@ export function buildTimelinePreviewDeltaFromChangedProjectIds(args: {
     changedProjectIds: args.changedProjectIds,
     closures: args.closures,
     primaryProjectId: args.primaryProjectId,
+    currentProjectSpanById: args.currentProjectSpanById,
+    previewProjectSpanById: args.previewProjectSpanById,
+    changedSectionIds: args.changedSectionIds,
   });
 }
 
@@ -142,8 +157,16 @@ export function buildTimelinePreviewDeltaFromPlacementRequests(args: {
   placementRequests: ProjectPlacementRequest[];
   closures: ClosurePeriod[];
   primaryProjectId: string | null;
+  currentProjectSpanById?: ReadonlyMap<string, ProjectScheduleSpan> | null;
+  previewProjectSpanById?: ReadonlyMap<string, ProjectScheduleSpan> | null;
 }) {
-  const { currentProjects, placementRequests, closures, primaryProjectId } = args;
+  const {
+    currentProjects,
+    placementRequests,
+    closures,
+    primaryProjectId,
+    currentProjectSpanById,
+  } = args;
   const currentById = new Map(currentProjects.map((project) => [project.id, project] as const));
   const previewProjects: ScheduledTimelineProject[] = [];
   const changedProjectIds: string[] = [];
@@ -173,11 +196,31 @@ export function buildTimelinePreviewDeltaFromPlacementRequests(args: {
     }
   }
 
+  const previewProjectSpanById =
+    args.previewProjectSpanById ??
+    buildProjectSpanByIdFromProjects({
+      snapshot: {
+        teams: [],
+        holidaySources: [],
+        projects: currentProjects,
+        dependencies: [],
+        customClosures: [],
+        closures,
+        history: {
+          canUndo: false,
+          canRedo: false,
+        },
+      },
+      projects: previewProjects,
+    });
+
   return buildTimelinePreviewDeltaFromScheduledProjects({
     currentProjects,
     previewProjects,
     changedProjectIds,
     closures,
     primaryProjectId,
+    currentProjectSpanById,
+    previewProjectSpanById,
   });
 }

@@ -6,7 +6,7 @@ import path from "node:path";
 import { closeDb } from "@/db/client";
 import { saveProjectAction } from "@/lib/planner/actions";
 import { createPlannerTraceContext } from "@/lib/planner/planner-trace";
-import { loadPlannerSnapshot, saveProject } from "@/lib/planner/store";
+import { loadPlannerSnapshot, placeProject, saveProject } from "@/lib/planner/store";
 import type { PlannerState } from "@/lib/planner/types";
 
 const tempDirs: string[] = [];
@@ -222,5 +222,146 @@ describe("planner store tracing", () => {
       phase: "store",
     });
     expect(captureSummaryPayload?.summary).toBeDefined();
+  });
+
+  test("traced loadPlannerSnapshot skips canonical reschedule on the hot path", async () => {
+    createTempPlannerDbDir();
+    await closeDb();
+    process.env.PLANNER_TRACE_SERVER = "1";
+
+    const consoleCalls: unknown[][] = [];
+    const originalConsoleLog = console.log;
+    const originalConsoleGroupCollapsed = console.groupCollapsed;
+    const originalConsoleGroupEnd = console.groupEnd;
+
+    console.log = ((...args: unknown[]) => {
+      consoleCalls.push(args);
+    }) as typeof console.log;
+    console.groupCollapsed = ((...args: unknown[]) => {
+      consoleCalls.push(args);
+    }) as typeof console.groupCollapsed;
+    console.groupEnd = (() => {}) as typeof console.groupEnd;
+
+    try {
+      await loadPlannerSnapshot(
+        "store-trace-load-hot-path",
+        createPlannerTraceContext({
+          source: "load",
+          enabled: true,
+          traceId: "trace-load-hot-path",
+          captureId: "capture-load-hot-path",
+          runtime: "server",
+          phase: "store",
+        })
+      );
+    } finally {
+      console.log = originalConsoleLog;
+      console.groupCollapsed = originalConsoleGroupCollapsed;
+      console.groupEnd = originalConsoleGroupEnd;
+    }
+
+    expect(
+      consoleCalls.some(
+        (args) =>
+          typeof args[0] === "string" &&
+          String(args[0]).startsWith("planner.store.load.hydrateSnapshot.materialize")
+      )
+    ).toBe(true);
+    expect(
+      consoleCalls.some(
+        (args) =>
+          typeof args[0] === "string" &&
+          String(args[0]).includes("planner.store.load.normalizeSnapshot.reschedule")
+      )
+    ).toBe(false);
+  });
+
+  test("project placement commits use delta persistence instead of full replace", async () => {
+    createTempPlannerDbDir();
+    await closeDb();
+    process.env.PLANNER_TRACE_SERVER = "1";
+
+    const initialSnapshot = await loadPlannerSnapshot("store-trace-place-delta");
+    const plannedTeam = initialSnapshot.teams[0];
+
+    expect(plannedTeam).toBeDefined();
+    if (!plannedTeam) {
+      throw new Error("Expected at least one team in the planner state.");
+    }
+
+    const savedSnapshot = await saveProject(
+      "store-trace-place-delta",
+      {
+        title: "Projet delta placement",
+        plannedTeam: plannedTeam.id,
+        estimatedDurationHalfDays: 4,
+        targetDateHint: "2026-10-08",
+        notes: "Preparation delta placement",
+        dependencyIds: [],
+      }
+    );
+    const projectToPlace = savedSnapshot.projects.find(
+      (project) => project.title === "Projet delta placement"
+    );
+
+    expect(projectToPlace).toBeDefined();
+    if (!projectToPlace) {
+      throw new Error("Expected the saved project to be available for placement.");
+    }
+
+    const consoleCalls: unknown[][] = [];
+    const originalConsoleLog = console.log;
+    const originalConsoleGroupCollapsed = console.groupCollapsed;
+    const originalConsoleGroupEnd = console.groupEnd;
+
+    console.log = ((...args: unknown[]) => {
+      consoleCalls.push(args);
+    }) as typeof console.log;
+    console.groupCollapsed = ((...args: unknown[]) => {
+      consoleCalls.push(args);
+    }) as typeof console.groupCollapsed;
+    console.groupEnd = (() => {}) as typeof console.groupEnd;
+
+    try {
+      await placeProject(
+        "store-trace-place-delta",
+        projectToPlace.id,
+        {
+          teamId: plannedTeam.id,
+          startSlot: "2026-10-08-AM",
+          durationHalfDays: projectToPlace.estimatedDurationHalfDays,
+        },
+        {
+          source: "drag-move",
+        },
+        createPlannerTraceContext({
+          source: "drag-move",
+          enabled: true,
+          traceId: "trace-place-delta",
+          captureId: "capture-place-delta",
+          runtime: "server",
+          phase: "store",
+        })
+      );
+    } finally {
+      console.log = originalConsoleLog;
+      console.groupCollapsed = originalConsoleGroupCollapsed;
+      console.groupEnd = originalConsoleGroupEnd;
+    }
+
+    expect(
+      consoleCalls.some(
+        (args) =>
+          typeof args[0] === "string" &&
+          String(args[0]).startsWith("planner.store.commit.writePersistentDelta")
+      )
+    ).toBe(true);
+    expect(
+      consoleCalls.some(
+        (args) =>
+          typeof args[0] === "string" &&
+          String(args[0]).startsWith("planner.store.commit.replacePersistentState")
+      )
+    ).toBe(false);
   });
 });

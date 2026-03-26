@@ -39,6 +39,13 @@ type GeneratedProject = {
   project: Project;
 };
 
+export type PlannerFixturePreset = "demo" | "stress";
+
+type PlannerFixtureOptions = {
+  preset?: PlannerFixturePreset;
+  now?: Date;
+};
+
 const BUNDLE_COUNT = 100;
 const DURATION_PATTERN = [1, 2, 3, 4, 6, 3, 2, 8, 4, 10, 6, 14, 2, 20, 4] as const;
 const GAP_PATTERN = [0, 1, 0, 2, 1, 0, 1] as const;
@@ -239,16 +246,27 @@ const TEAM_SEED_DEFINITIONS: TeamSeedDefinition[] = [
   },
 ];
 
-export const seedTeams: Team[] = TEAM_SEED_DEFINITIONS.map(
-  ({
-    scheduledCount: _scheduledCount,
-    draftCount: _draftCount,
-    startOffsetBusinessDays: _startOffsetBusinessDays,
-    workTypes: _workTypes,
-    noteFocus: _noteFocus,
-    ...team
-  }) => ({ ...team })
-);
+function toSeedTeam({
+  id,
+  slug,
+  nameFr,
+  displayOrder,
+  accentColor,
+  softColor,
+  isActive,
+}: TeamSeedDefinition): Team {
+  return {
+    id,
+    slug,
+    nameFr,
+    displayOrder,
+    accentColor,
+    softColor,
+    isActive,
+  };
+}
+
+export const seedTeams: Team[] = TEAM_SEED_DEFINITIONS.map(toSeedTeam);
 
 export const seedHolidaySources: HolidaySource[] = [
   {
@@ -770,6 +788,221 @@ export function buildPlannerDemoState(now: Date = new Date()): PlannerState {
       canRedo: false,
     },
   };
+}
+
+function buildPlannerStressClosures(now: Date) {
+  const extraClosures = [
+    {
+      title: "Rotation atelier soudure",
+      type: "company_closure",
+      impact: "blocking",
+      startOffsetDays: 54,
+      durationDays: 1,
+      repeatsAnnually: false,
+      details: "Atelier chaud mobilise pour maintenance et controles ventilation.",
+    },
+    {
+      title: "Blocage grue mobile mutualisee",
+      type: "custom_time_off",
+      impact: "blocking",
+      startOffsetDays: 164,
+      durationDays: 2,
+      repeatsAnnually: false,
+      details: "Indisponibilite grue mobile pour controle periodique.",
+    },
+    {
+      title: "Vent violent plateau sud",
+      type: "weather",
+      impact: "advisory",
+      startOffsetDays: 228,
+      durationDays: 2,
+      repeatsAnnually: true,
+      details: "Limiter les levages longs et securiser les approvisionnements.",
+    },
+    {
+      title: "Audit prevention inter-equipes",
+      type: "custom_time_off",
+      impact: "blocking",
+      startOffsetDays: 286,
+      durationDays: 1,
+      repeatsAnnually: true,
+      details: "Journee reservee aux audits terrain et reprises de consignes.",
+    },
+    {
+      title: "Gel durable atelier nord",
+      type: "weather",
+      impact: "advisory",
+      startOffsetDays: 336,
+      durationDays: 4,
+      repeatsAnnually: true,
+      details: "Cadences reduites et repli partiel des interventions exterieures.",
+    },
+    {
+      title: "Maintenance stock et EPI",
+      type: "company_closure",
+      impact: "blocking",
+      startOffsetDays: 402,
+      durationDays: 1,
+      repeatsAnnually: false,
+      details: "Fermeture complementaire du parc pour inspection EPI.",
+    },
+  ] as const;
+
+  return extraClosures.map((closure, index) => {
+    const startDate = addDays(now, closure.startOffsetDays);
+    const endDate = addDays(startDate, closure.durationDays - 1);
+
+    return {
+      id: makeDeterministicUuid(0x58000000, index + 1),
+      title: closure.title,
+      type: closure.type,
+      startDate: toDateString(startDate),
+      endDate: toDateString(endDate),
+      impact: closure.impact,
+      details: closure.details,
+      repeatsAnnually: closure.repeatsAnnually,
+    } satisfies CustomClosure;
+  });
+}
+
+export function buildPlannerStressState(now: Date = new Date()): PlannerState {
+  const baseState = buildPlannerDemoState(now);
+  const today = startOfDay(now);
+  const existingScheduledCountsByTeam = new Map<string, number>();
+  const extraScheduledCountsByTeam = new Map<string, number>();
+  const extraDraftCountsByTeam = new Map<string, number>();
+  const scheduledProjects = baseState.projects.filter((project) => project.status === "scheduled");
+  const draftProjects = baseState.projects.filter((project) => project.status === "draft");
+
+  for (const project of scheduledProjects) {
+    existingScheduledCountsByTeam.set(
+      project.plannedTeam,
+      (existingScheduledCountsByTeam.get(project.plannedTeam) ?? 0) + 1
+    );
+  }
+
+  const extraScheduledProjects = draftProjects.slice(0, 20).map((project, index) => {
+    const teamOffset = extraScheduledCountsByTeam.get(project.plannedTeam) ?? 0;
+    extraScheduledCountsByTeam.set(project.plannedTeam, teamOffset + 1);
+    const startDate = addBusinessDays(today, 90 + index + teamOffset);
+
+    return {
+      ...project,
+      id: makeDeterministicUuid(0x55000000, index + 1),
+      status: "scheduled" as const,
+      scheduledTeam: project.plannedTeam,
+      scheduledStartSlot: makeSlotKey(
+        toDateString(startDate),
+        SLOT_PATTERN[(index + teamOffset) % SLOT_PATTERN.length]
+      ),
+      scheduledDurationHalfDays: project.estimatedDurationHalfDays,
+      sequenceOrder: (existingScheduledCountsByTeam.get(project.plannedTeam) ?? 0) + teamOffset,
+    } satisfies Project;
+  });
+
+  const extraDraftProjects = draftProjects.slice(20, 60).map((project, index) => {
+    const teamOffset = extraDraftCountsByTeam.get(project.plannedTeam) ?? 0;
+    extraDraftCountsByTeam.set(project.plannedTeam, teamOffset + 1);
+
+    return {
+      ...project,
+      id: makeDeterministicUuid(0x56000000, index + 1),
+      targetDateHint: toDateString(addDays(today, 140 + index + teamOffset)),
+    } satisfies Project;
+  });
+
+  const latestScheduledByTeam = new Map<string, string>();
+  for (const project of [...scheduledProjects, ...extraScheduledProjects]) {
+    latestScheduledByTeam.set(project.plannedTeam, project.id);
+  }
+
+  const extraDependencies = extraScheduledProjects.map((project, index) => {
+    const predecessorProjectId =
+      index === 0
+        ? scheduledProjects.find(
+            (candidate) => candidate.plannedTeam === project.plannedTeam
+          )?.id ?? project.id
+        : extraScheduledProjects[index - 1]?.id ?? project.id;
+
+    return {
+      id: makeDeterministicUuid(0x57000000, index + 1),
+      predecessorProjectId,
+      successorProjectId: project.id,
+      lagHalfDays: index % 4,
+    } satisfies ProjectDependency;
+  }).filter(
+    (dependency) => dependency.predecessorProjectId !== dependency.successorProjectId
+  );
+
+  const crossTeamDependencies = extraScheduledProjects
+    .filter((_, index) => index % 5 === 0)
+    .map((project, index) => {
+      const predecessorTeam = seedTeams[(index + 1) % seedTeams.length]?.id ?? project.plannedTeam;
+      const predecessorProjectId =
+        latestScheduledByTeam.get(predecessorTeam) ??
+        extraScheduledProjects[index]?.id ??
+        project.id;
+
+      return {
+        id: makeDeterministicUuid(0x57100000, index + 1),
+        predecessorProjectId,
+        successorProjectId: project.id,
+        lagHalfDays: (index % 3) + 1,
+      } satisfies ProjectDependency;
+    })
+    .filter(
+      (dependency) => dependency.predecessorProjectId !== dependency.successorProjectId
+    );
+
+  const customClosures = [
+    ...baseState.customClosures.map((closure) => ({ ...closure })),
+    ...buildPlannerStressClosures(today),
+  ];
+  const projects = [
+    ...baseState.projects.map((project) => ({ ...project })),
+    ...extraScheduledProjects,
+    ...extraDraftProjects,
+  ];
+  const dependencies = [
+    ...baseState.dependencies.map((dependency) => ({ ...dependency })),
+    ...extraDependencies,
+    ...crossTeamDependencies,
+  ];
+  const rawState: PlannerState = {
+    teams: baseState.teams.map((team) => ({ ...team })),
+    holidaySources: baseState.holidaySources.map((source) => ({ ...source })),
+    projects,
+    dependencies,
+    customClosures,
+    closures: buildEffectiveClosures({
+      projects,
+      holidaySources: baseState.holidaySources,
+      customClosures,
+      now: today,
+    }),
+    history: {
+      canUndo: false,
+      canRedo: false,
+    },
+  };
+  const normalizedState = rescheduleProjects(rawState);
+
+  return {
+    ...normalizedState,
+    history: {
+      canUndo: false,
+      canRedo: false,
+    },
+  };
+}
+
+export function buildPlannerFixtureState(options: PlannerFixtureOptions = {}): PlannerState {
+  const preset = options.preset ?? "demo";
+  const now = options.now ?? new Date();
+
+  return preset === "stress"
+    ? buildPlannerStressState(now)
+    : buildPlannerDemoState(now);
 }
 
 export const initialPlannerState: PlannerState = buildPlannerDemoState();

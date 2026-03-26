@@ -38,6 +38,7 @@ function makePreviewData(overrides: Partial<PlannerDragPreviewData> = {}): Plann
     signature: overrides.signature ?? "sig-1",
     delta: overrides.delta ?? delta,
     projectsBySection: overrides.projectsBySection ?? new Map(),
+    projectSpanById: overrides.projectSpanById ?? new Map(),
     changedProjectIdSet: overrides.changedProjectIdSet ?? new Set(delta.changedProjectIds),
     touchedSectionIdSet:
       overrides.touchedSectionIdSet ?? new Set(delta.touchedSectionIds),

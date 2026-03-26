@@ -4,6 +4,7 @@ import {
   createContext,
   useContext,
   useEffect,
+  useRef,
   useState,
   useTransition,
 } from "react";
@@ -36,6 +37,7 @@ import {
   placeProjectInState,
   placeProjectsInState,
 } from "@/lib/planner/state-mutations";
+import { primePlannerComputedSnapshot } from "@/lib/planner/planner-computed";
 import {
   createPlannerTraceContext,
   extendPlannerTraceContext,
@@ -46,6 +48,7 @@ import {
   summarizePlannerSnapshot,
   type PlannerTraceContext,
 } from "@/lib/planner/planner-trace";
+import { resolveClientPlannerSessionId } from "@/lib/planner/session";
 import type {
   ClosureFormState,
   PlannerState,
@@ -60,23 +63,6 @@ import {
   getDefaultPlannerViewportPreferences,
   readPlannerViewportPreferencesFromLocalStorage,
 } from "@/lib/planner/viewport-preferences";
-
-const SESSION_STORAGE_KEY = "planner-session-id";
-
-function getOrCreateSessionId() {
-  if (typeof window === "undefined") {
-    return null;
-  }
-
-  const existing = window.localStorage.getItem(SESSION_STORAGE_KEY);
-  if (existing) {
-    return existing;
-  }
-
-  const nextSessionId = window.crypto.randomUUID();
-  window.localStorage.setItem(SESSION_STORAGE_KEY, nextSessionId);
-  return nextSessionId;
-}
 
 function isEditableTarget(target: EventTarget | null) {
   if (!(target instanceof HTMLElement)) {
@@ -173,16 +159,29 @@ function resolveClientTraceContext(args: {
 export function PlannerProvider({
   children,
   initialState,
+  initialSessionId,
 }: {
   children: React.ReactNode;
   initialState: PlannerState;
+  initialSessionId?: string | null;
 }) {
-  const [state, setState] = useState(initialState);
-  const [sessionId] = useState<string | null>(() => getOrCreateSessionId());
+  const [state, setState] = useState(() => {
+    primePlannerComputedSnapshot(initialState);
+    return initialState;
+  });
+  const [{ sessionId, reloadRequired }] = useState(() =>
+    resolveClientPlannerSessionId(initialSessionId)
+  );
   const [isPending, startTransition] = useTransition();
+  const stateRef = useRef(state);
+  const placementMutationInFlightRef = useRef(false);
 
   useEffect(() => {
-    if (!sessionId) {
+    stateRef.current = state;
+  }, [state]);
+
+  useEffect(() => {
+    if (!sessionId || !reloadRequired) {
       return;
     }
 
@@ -209,6 +208,8 @@ export function PlannerProvider({
         )
           .then((snapshot: PlannerState) => {
             measurePlannerTraceStep(trace, "planner.client.serverAction.reconcile", () => {
+              primePlannerComputedSnapshot(snapshot, stateRef.current);
+              stateRef.current = snapshot;
               setState(snapshot);
             }, {
               snapshotSummary: summarizePlannerSnapshot(snapshot),
@@ -227,7 +228,7 @@ export function PlannerProvider({
           });
       });
     });
-  }, [sessionId]);
+  }, [reloadRequired, sessionId]);
 
   useEffect(() => {
     if (!sessionId) {
@@ -268,15 +269,17 @@ export function PlannerProvider({
                 sessionId,
                 trigger: "keyboard",
               }
-            )
-              .then((snapshot: PlannerState) => {
-                measurePlannerTraceStep(
-                  trace,
-                  "planner.client.serverAction.reconcile",
-                  () => {
-                    setState(snapshot);
-                  },
-                  {
+        )
+          .then((snapshot: PlannerState) => {
+            measurePlannerTraceStep(
+              trace,
+              "planner.client.serverAction.reconcile",
+              () => {
+                primePlannerComputedSnapshot(snapshot, stateRef.current);
+                stateRef.current = snapshot;
+                setState(snapshot);
+              },
+              {
                     snapshotSummary: summarizePlannerSnapshot(snapshot),
                   }
                 );
@@ -320,15 +323,17 @@ export function PlannerProvider({
               sessionId,
               trigger: "keyboard",
             }
-          )
-            .then((snapshot: PlannerState) => {
-              measurePlannerTraceStep(
-                trace,
-                "planner.client.serverAction.reconcile",
-                () => {
-                  setState(snapshot);
-                },
-                {
+        )
+          .then((snapshot: PlannerState) => {
+            measurePlannerTraceStep(
+              trace,
+              "planner.client.serverAction.reconcile",
+              () => {
+                primePlannerComputedSnapshot(snapshot, stateRef.current);
+                stateRef.current = snapshot;
+                setState(snapshot);
+              },
+              {
                   snapshotSummary: summarizePlannerSnapshot(snapshot),
                 }
               );
@@ -365,6 +370,9 @@ export function PlannerProvider({
     if (!sessionId) {
       return;
     }
+    if (placementMutationInFlightRef.current) {
+      return;
+    }
 
     const traceContext = resolveClientTraceContext({
       source,
@@ -395,6 +403,8 @@ export function PlannerProvider({
         )
           .then((snapshot: PlannerState) => {
             measurePlannerTraceStep(trace, "planner.client.serverAction.reconcile", () => {
+              primePlannerComputedSnapshot(snapshot, stateRef.current);
+              stateRef.current = snapshot;
               setState(snapshot);
             }, {
               snapshotSummary: summarizePlannerSnapshot(snapshot),
@@ -447,32 +457,31 @@ export function PlannerProvider({
     const trace = startPlannerTrace(`planner.client.${source}`, optimisticTraceContext, {
       sessionId,
     });
-    let previousState: PlannerState | null = null;
+    const previousState = stateRef.current;
+    incrementPlannerPerformanceCounter("planner.client.optimistic.compute.invocations");
+    const optimisticNextState = measurePlannerPerformance(
+      "planner.client.optimistic.compute",
+      () =>
+        measurePlannerTraceStep(
+          trace,
+          "planner.client.optimistic.compute",
+          () => optimisticMutator(previousState, optimisticTraceContext),
+          {
+            currentSnapshotSummary: summarizePlannerSnapshot(previousState),
+          }
+        ),
+      {
+        currentSnapshotSummary: summarizePlannerSnapshot(previousState),
+      }
+    );
+    primePlannerComputedSnapshot(optimisticNextState, previousState);
     measurePlannerTraceStep(trace, "planner.client.optimistic.setState", () => {
       measurePlannerPerformance("planner.client.optimistic.setState", () => {
-        setState((current) => {
-          previousState = current;
-          incrementPlannerPerformanceCounter(
-            "planner.client.optimistic.compute.invocations"
-          );
-          return measurePlannerPerformance(
-            "planner.client.optimistic.compute",
-            () =>
-              measurePlannerTraceStep(
-                trace,
-                "planner.client.optimistic.compute",
-                () => optimisticMutator(current, optimisticTraceContext),
-                {
-                  currentSnapshotSummary: summarizePlannerSnapshot(current),
-                }
-              ),
-            {
-              currentSnapshotSummary: summarizePlannerSnapshot(current),
-            }
-          );
-        });
+        stateRef.current = optimisticNextState;
+        setState(optimisticNextState);
       });
     });
+    placementMutationInFlightRef.current = true;
 
     measurePlannerTraceStep(trace, "planner.client.transition.dispatch", () => {
       measurePlannerPerformance("planner.client.transition.dispatch", () => {
@@ -500,6 +509,8 @@ export function PlannerProvider({
                   trace,
                   "planner.client.serverAction.reconcile",
                   () => {
+                    primePlannerComputedSnapshot(snapshot, stateRef.current);
+                    stateRef.current = snapshot;
                     setState(snapshot);
                   },
                   {
@@ -521,6 +532,7 @@ export function PlannerProvider({
                 outcome: "committed",
               });
             }
+            placementMutationInFlightRef.current = false;
           })
           .catch((error: unknown) => {
             measurePlannerPerformance(
@@ -530,20 +542,15 @@ export function PlannerProvider({
                   trace,
                   "planner.client.serverAction.rollback",
                   () => {
-                    if (previousState) {
-                      setState(previousState);
-                    }
+                    stateRef.current = previousState;
+                    setState(previousState);
                   },
                   {
-                    previousSnapshotSummary: previousState
-                      ? summarizePlannerSnapshot(previousState)
-                      : null,
+                    previousSnapshotSummary: summarizePlannerSnapshot(previousState),
                   }
                 ),
               {
-                previousSnapshotSummary: previousState
-                  ? summarizePlannerSnapshot(previousState)
-                  : null,
+                previousSnapshotSummary: summarizePlannerSnapshot(previousState),
               }
             );
             finishPlannerTrace(trace, {
@@ -555,11 +562,10 @@ export function PlannerProvider({
                 sessionId,
                 error: getErrorMessage(error),
                 outcome: "rolled-back",
-                snapshotSummary: previousState
-                  ? summarizePlannerSnapshot(previousState)
-                  : null,
+                snapshotSummary: summarizePlannerSnapshot(previousState),
               });
             }
+            placementMutationInFlightRef.current = false;
             window.alert(getErrorMessage(error));
           });
         });

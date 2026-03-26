@@ -1,6 +1,7 @@
 import { addMonths, addYears, format, parseISO } from "date-fns";
 
 import { advanceWorkingDuration, parseSlotKey, previousCalendarSlot } from "@/lib/planner/calendar";
+import type { ProjectScheduleSpan } from "@/lib/planner/planner-computed";
 import type {
   ClosurePeriod,
   Project,
@@ -37,13 +38,19 @@ function overlapsRange(
   return rangeStart <= sectionEnd && rangeEnd >= sectionStart;
 }
 
-function getScheduledProjectRanges(projects: Project[], closures: ClosurePeriod[]) {
+function getScheduledProjectRanges(
+  projects: Project[],
+  closures: ClosurePeriod[],
+  projectSpanById?: ReadonlyMap<string, ProjectScheduleSpan> | null
+) {
   return projects.filter(isScheduledProject).map((project) => {
-    const computed = advanceWorkingDuration(
-      project.scheduledStartSlot,
-      project.scheduledDurationHalfDays,
-      closures
-    );
+    const computed =
+      projectSpanById?.get(project.id) ??
+      advanceWorkingDuration(
+        project.scheduledStartSlot,
+        project.scheduledDurationHalfDays,
+        closures
+      );
 
     return {
       id: project.id,
@@ -73,15 +80,25 @@ export function buildTimelineYearSummaries(params: {
   sections: YearMonthSection[];
   projects: Project[];
   closures: ClosurePeriod[];
+  projectSpanById?: ReadonlyMap<string, ProjectScheduleSpan> | null;
   activeDate: string;
   todayDate: string;
   focusDate?: string | null;
   viewMode: TimelineViewMode;
 }) {
-  const { sections, projects, closures, activeDate, todayDate, focusDate, viewMode } = params;
+  const {
+    sections,
+    projects,
+    closures,
+    projectSpanById,
+    activeDate,
+    todayDate,
+    focusDate,
+    viewMode,
+  } = params;
   const activeMonthId = getTimelineMonthId(activeDate);
   const activeYear = parseISO(activeDate).getFullYear();
-  const projectRanges = getScheduledProjectRanges(projects, closures);
+  const projectRanges = getScheduledProjectRanges(projects, closures, projectSpanById);
   const groupedSections = new Map<number, YearMonthSection[]>();
 
   for (const section of sections) {

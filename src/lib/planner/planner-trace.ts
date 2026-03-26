@@ -84,11 +84,13 @@ export type PlannerCaptureServerSummary = {
   };
   store: {
     transactionMs: number;
+    writePersistentDeltaMs: number;
     replacePersistentStateMs: number;
     actionLogInsertMs: number;
   };
   persistence: {
     deleteRowsByTable: Record<string, number | null>;
+    updateRowsByTable: Record<string, number | null>;
     insertRowsByTable: Record<string, number | null>;
   };
 };
@@ -546,6 +548,10 @@ export function buildPlannerCaptureServerSummaryFromMetrics(args: {
         args.stageMetrics,
         "planner.store.commit.transaction"
       ),
+      writePersistentDeltaMs: getStageTotalMs(
+        args.stageMetrics,
+        "planner.store.commit.writePersistentDelta"
+      ),
       replacePersistentStateMs: getStageTotalMs(
         args.stageMetrics,
         "planner.store.commit.replacePersistentState"
@@ -559,6 +565,10 @@ export function buildPlannerCaptureServerSummaryFromMetrics(args: {
       deleteRowsByTable: buildRowCountSummary(
         args.stageMetrics,
         "planner.persistence.delete."
+      ),
+      updateRowsByTable: buildRowCountSummary(
+        args.stageMetrics,
+        "planner.persistence.update."
       ),
       insertRowsByTable: buildRowCountSummary(
         args.stageMetrics,

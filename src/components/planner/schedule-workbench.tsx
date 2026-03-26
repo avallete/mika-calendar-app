@@ -62,7 +62,7 @@ import {
 } from "@/lib/planner/drag-placements";
 import {
   buildExactPlannerDragPreview,
-  buildPlannerDragPreviewData,
+  buildFastPlannerDragPreview,
 } from "@/lib/planner/drag-preview";
 import {
   createPlannerExactPreviewRunnerState,
@@ -98,7 +98,7 @@ import {
   type PlannerPointerCoordinates,
 } from "@/lib/planner/drag-session";
 import { buildCalendarBucketFromRowSurfacePointer } from "@/lib/planner/timeline-hover";
-import { buildTimelinePreviewDeltaFromPlacementRequests } from "@/lib/planner/timeline-preview";
+import { getPlannerComputedSnapshot } from "@/lib/planner/planner-computed";
 import {
   buildFranceHolidayStripSummary,
   getNextCustomClosureOccurrence,
@@ -732,15 +732,22 @@ export function ScheduleWorkbench({
       );
       const exactPreview = measurePlannerPerformance(
         "drag.preview.exact.delta",
-        () =>
+        () => {
+          const currentComputed = getPlannerComputedSnapshot(stateRef.current);
+          return (
           buildExactPlannerDragPreview({
             signature: work.signature,
             currentProjects: stateRef.current.projects,
+            currentProjectSpanById: currentComputed.projectSpanById,
             previewProjects: exactResult.nextState.projects,
+            previewProjectSpanById: exactResult.projectSpanById,
             changedProjectIds: exactResult.changedProjectIds,
+            changedSectionIds: exactResult.changedSectionIds,
             closures: stateRef.current.closures,
             primaryProjectId: work.primaryProjectId,
-          }),
+          })
+          );
+        },
         {
           hoveredBucketId: work.traceSummary.hoveredBucketId,
           selectionSize: work.requests.length,
@@ -885,29 +892,16 @@ export function ScheduleWorkbench({
 
     const fastPreview = measurePlannerPerformance(
       "drag.preview.fast",
-      () => {
-        const delta = measurePlannerPerformance(
-          "drag.preview.fast.delta",
-          () =>
-            buildTimelinePreviewDeltaFromPlacementRequests({
-              currentProjects: stateRef.current.projects,
-              placementRequests: previewCandidate.requests,
-              closures: stateRef.current.closures,
-              primaryProjectId: previewCandidate.primaryProjectId,
-            }),
-          {
-            hoveredBucketId: bucket.bucketId,
-            selectionSize: previewCandidate.requests.length,
-          }
-        );
-
-        return buildPlannerDragPreviewData({
+      () =>
+        buildFastPlannerDragPreview({
           signature: previewCandidate.signature,
           currentProjects: stateRef.current.projects,
-          delta,
+          currentProjectSpanById:
+            getPlannerComputedSnapshot(stateRef.current).projectSpanById,
+          placementRequests: previewCandidate.requests,
           closures: stateRef.current.closures,
-        });
-      },
+          primaryProjectId: previewCandidate.primaryProjectId,
+        }),
       {
         hoveredBucketId: bucket.bucketId,
         selectionSize: previewCandidate.requests.length,
@@ -1901,6 +1895,7 @@ export function ScheduleWorkbench({
               dependencies={state.dependencies}
               customClosures={state.customClosures}
               closures={state.closures}
+              projectSpanById={getPlannerComputedSnapshot(state).projectSpanById}
               pendingPlacement={pendingPlacement}
               selectedProjectIds={selectedProjectIds}
               traceEnabled={traceEnabled}

@@ -168,6 +168,7 @@ describe("planner trace helpers", () => {
       },
       store: {
         transactionMs: 80,
+        writePersistentDeltaMs: 0,
         replacePersistentStateMs: 20,
         actionLogInsertMs: 5,
       },
@@ -175,6 +176,7 @@ describe("planner trace helpers", () => {
         deleteRowsByTable: {
           projects: 200,
         },
+        updateRowsByTable: {},
         insertRowsByTable: {
           projects: 200,
         },
