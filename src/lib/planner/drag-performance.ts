@@ -18,6 +18,32 @@ export type PlannerPerformanceSession = {
   counters: Map<string, number>;
   metrics: Map<string, PlannerPerformanceMetric>;
   flushed: boolean;
+  captureId: string | null;
+  deferSummaryUntilExplicitEnd: boolean;
+  result: Record<string, unknown>;
+};
+
+export type PlannerPerformanceStageSnapshot = PlannerPerformanceMetric & {
+  stage: string;
+  avgMs: number;
+};
+
+export type PlannerCaptureBrowserSummary = {
+  preview: {
+    fastMs: number;
+    exactMs: number;
+  };
+  optimistic: {
+    computeMs: number;
+    computeInvocationCount: number;
+  };
+  render: {
+    commitMs: number;
+  };
+  server: {
+    awaitMs: number;
+    reconcileMs: number;
+  };
 };
 
 const WARN_THRESHOLD_MS = 8;
@@ -75,6 +101,86 @@ function getMetric(
   };
   session.metrics.set(stage, nextMetric);
   return nextMetric;
+}
+
+function snapshotPlannerPerformanceMetrics(
+  session: PlannerPerformanceSession
+): PlannerPerformanceStageSnapshot[] {
+  return [...session.metrics.entries()].map(([stage, metric]) => ({
+    stage,
+    count: metric.count,
+    totalMs: roundDuration(metric.totalMs),
+    avgMs: roundDuration(metric.totalMs / metric.count),
+    maxMs: roundDuration(metric.maxMs),
+    lastMs: roundDuration(metric.lastMs),
+    slowCount: metric.slowCount,
+    verySlowCount: metric.verySlowCount,
+    lastPayload: metric.lastPayload,
+  }));
+}
+
+function getMetricTotalByPredicate(
+  stageMetrics: Array<Pick<PlannerPerformanceStageSnapshot, "stage" | "totalMs">>,
+  predicate: (stage: string) => boolean
+) {
+  return roundDuration(
+    stageMetrics
+      .filter((metric) => predicate(metric.stage))
+      .reduce((total, metric) => total + metric.totalMs, 0)
+  );
+}
+
+export function buildPlannerCaptureBrowserSummaryFromMetrics(args: {
+  stageMetrics: Array<Pick<PlannerPerformanceStageSnapshot, "stage" | "totalMs">>;
+  counters: Record<string, number>;
+}): PlannerCaptureBrowserSummary {
+  return {
+    preview: {
+      fastMs: getMetricTotalByPredicate(
+        args.stageMetrics,
+        (stage) => stage === "drag.preview.fast"
+      ),
+      exactMs: getMetricTotalByPredicate(
+        args.stageMetrics,
+        (stage) =>
+          stage === "drag.preview.exact.scheduler" ||
+          stage === "drag.preview.exact.delta"
+      ),
+    },
+    optimistic: {
+      computeMs: getMetricTotalByPredicate(
+        args.stageMetrics,
+        (stage) => stage === "planner.client.optimistic.compute"
+      ),
+      computeInvocationCount:
+        args.counters["planner.client.optimistic.compute.invocations"] ?? 0,
+    },
+    render: {
+      commitMs: getMetricTotalByPredicate(
+        args.stageMetrics,
+        (stage) => stage.startsWith("timeline.")
+      ),
+    },
+    server: {
+      awaitMs: getMetricTotalByPredicate(
+        args.stageMetrics,
+        (stage) => stage === "planner.client.serverAction.await"
+      ),
+      reconcileMs: getMetricTotalByPredicate(
+        args.stageMetrics,
+        (stage) => stage === "planner.client.serverAction.reconcile"
+      ),
+    },
+  };
+}
+
+export function buildPlannerCaptureBrowserSummary(
+  session: PlannerPerformanceSession
+): PlannerCaptureBrowserSummary {
+  return buildPlannerCaptureBrowserSummaryFromMetrics({
+    stageMetrics: snapshotPlannerPerformanceMetrics(session),
+    counters: Object.fromEntries(session.counters.entries()),
+  });
 }
 
 function logSlowStage(
@@ -149,6 +255,9 @@ export function startPlannerPerformanceSession(
     counters: new Map<string, number>(),
     metrics: new Map<string, PlannerPerformanceMetric>(),
     flushed: false,
+    captureId: typeof metadata.captureId === "string" ? metadata.captureId : null,
+    deferSummaryUntilExplicitEnd: false,
+    result: {},
   };
 }
 
@@ -197,6 +306,25 @@ export function measurePlannerPerformance<T>(
   }
 }
 
+export async function measurePlannerPerformanceAsync<T>(
+  stage: string,
+  fn: () => Promise<T>,
+  payload?: Record<string, unknown>
+) {
+  const session = activePlannerPerformanceSession;
+  if (!session) {
+    return fn();
+  }
+
+  const startedAt = getNow();
+
+  try {
+    return await fn();
+  } finally {
+    recordPlannerPerformanceMetric(stage, getNow() - startedAt, payload);
+  }
+}
+
 export function recordPlannerProfilerRender(
   componentId: string,
   phase: "mount" | "update" | "nested-update",
@@ -213,36 +341,24 @@ export function recordPlannerProfilerRender(
   );
 }
 
-export function schedulePlannerPerformanceSummary(
-  session: PlannerPerformanceSession | null,
-  payload: Record<string, unknown> = {}
-) {
-  if (!session) {
-    return;
-  }
-
+function schedulePlannerPerformanceFlush(session: PlannerPerformanceSession) {
   const flush = () => {
     if (session.flushed) {
       clearActivePlannerPerformanceSession(session);
       return;
     }
 
+    if (session.deferSummaryUntilExplicitEnd) {
+      return;
+    }
+
     session.flushed = true;
     const totalDurationMs = getNow() - session.startedAt;
     const counterRows = Object.fromEntries(session.counters.entries());
-    const metricRows = [...session.metrics.entries()]
-      .map(([stage, metric]) => ({
-        stage,
-        count: metric.count,
-        totalMs: roundDuration(metric.totalMs),
-        avgMs: roundDuration(metric.totalMs / metric.count),
-        maxMs: roundDuration(metric.maxMs),
-        slowCount: metric.slowCount,
-        verySlowCount: metric.verySlowCount,
-        lastMs: roundDuration(metric.lastMs),
-        lastPayload: metric.lastPayload,
-      }))
-      .sort((left, right) => right.totalMs - left.totalMs);
+    const metricRows = snapshotPlannerPerformanceMetrics(session).sort(
+      (left, right) => right.totalMs - left.totalMs
+    );
+    const browserSummary = buildPlannerCaptureBrowserSummary(session);
 
     if (typeof console !== "undefined") {
       console.groupCollapsed(
@@ -265,11 +381,24 @@ export function schedulePlannerPerformanceSummary(
         }
       }
 
-      if (Object.keys(payload).length) {
-        console.log("result", payload);
+      if (Object.keys(session.result).length) {
+        console.log("result", session.result);
       }
 
       console.groupEnd();
+
+      if (session.captureId) {
+        console.log("[planner capture] planner.capture.browser.summary", {
+          ...session.metadata,
+          ...session.result,
+          browserSummary,
+        });
+        console.log("[planner capture] planner.capture.end", {
+          ...session.metadata,
+          ...session.result,
+          browserSummary,
+        });
+      }
     }
 
     clearActivePlannerPerformanceSession(session);
@@ -281,4 +410,44 @@ export function schedulePlannerPerformanceSummary(
   }
 
   flush();
+}
+
+export function schedulePlannerPerformanceSummary(
+  session: PlannerPerformanceSession | null,
+  payload: Record<string, unknown> = {},
+  options?: {
+    deferFlush?: boolean;
+  }
+) {
+  if (!session) {
+    return;
+  }
+
+  session.result = {
+    ...session.result,
+    ...payload,
+  };
+  session.deferSummaryUntilExplicitEnd = options?.deferFlush ?? false;
+  if (session.deferSummaryUntilExplicitEnd) {
+    return;
+  }
+
+  schedulePlannerPerformanceFlush(session);
+}
+
+export function completePlannerPerformanceCapture(
+  captureId: string,
+  payload: Record<string, unknown> = {}
+) {
+  const session = activePlannerPerformanceSession;
+  if (!session || session.captureId !== captureId) {
+    return;
+  }
+
+  session.deferSummaryUntilExplicitEnd = false;
+  session.result = {
+    ...session.result,
+    ...payload,
+  };
+  schedulePlannerPerformanceFlush(session);
 }

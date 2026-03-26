@@ -26,6 +26,20 @@ import {
   buildEffectiveClosures,
   materializePlannerState,
 } from "@/lib/planner/closure-materialization";
+import {
+  addPlannerTraceContextFields,
+  approximateJsonByteSize,
+  buildPlannerCaptureServerSummary,
+  extendPlannerTraceContext,
+  finishPlannerTrace,
+  logPlannerCaptureEvent,
+  measurePlannerTraceStep,
+  measurePlannerTraceStepAsync,
+  startPlannerTrace,
+  summarizePlannerSnapshot,
+  type PlannerTraceContext,
+  type PlannerTraceLike,
+} from "@/lib/planner/planner-trace";
 import { initialPlannerState } from "@/lib/planner/sample-data";
 import {
   addClosureInState,
@@ -189,10 +203,47 @@ function toPlannerSnapshot(
 
 function normalizePlannerSnapshot(
   persistentState: PersistentPlannerState,
-  history: PlannerHistoryState
+  history: PlannerHistoryState,
+  traceContext?: PlannerTraceLike,
+  label = "planner.store.normalizeSnapshot"
 ) {
-  const snapshot = toPlannerSnapshot(persistentState, history);
-  const normalized = rescheduleProjects(materializePlannerState(snapshot));
+  const snapshot = measurePlannerTraceStep(
+    traceContext,
+    `${label}.toPlannerSnapshot`,
+    () => toPlannerSnapshot(persistentState, history),
+    addPlannerTraceContextFields(traceContext, {
+      persistentSummary: summarizePlannerSnapshot(persistentState),
+    })
+  );
+  const materializedSnapshot = measurePlannerTraceStep(
+    traceContext,
+    `${label}.materialize`,
+    () => materializePlannerState(snapshot),
+    addPlannerTraceContextFields(traceContext, {
+      snapshotSummary: summarizePlannerSnapshot(snapshot),
+    })
+  );
+  const normalized = measurePlannerTraceStep(
+    traceContext,
+    `${label}.reschedule`,
+    () => {
+      const traceFields = addPlannerTraceContextFields(traceContext);
+      const traceSource =
+        typeof traceFields.traceSource === "string"
+          ? traceFields.traceSource
+          : "load";
+      return rescheduleProjects(materializedSnapshot, {
+        action: label,
+        metadata: {
+          source: traceSource,
+        },
+        traceContext,
+      });
+    },
+    addPlannerTraceContextFields(traceContext, {
+      snapshotSummary: summarizePlannerSnapshot(materializedSnapshot),
+    })
+  );
 
   return {
     ...normalized,
@@ -241,117 +292,404 @@ async function readHistoryState(
   });
 }
 
-async function ensurePlannerBootstrapped(executor: DbExecutor) {
-  await ensureClosureMarkerSchema(executor);
+async function ensurePlannerBootstrapped(
+  executor: DbExecutor,
+  traceContext?: PlannerTraceLike
+) {
+  await measurePlannerTraceStepAsync(
+    traceContext,
+    "planner.store.bootstrap.ensureSchema",
+    () => ensureClosureMarkerSchema(executor),
+    addPlannerTraceContextFields(traceContext)
+  );
 
-  const existingTeamCount = await executor
-    .select({ count: sql<number>`count(*)` })
-    .from(teams);
+  const existingTeamCount = await measurePlannerTraceStepAsync(
+    traceContext,
+    "planner.store.bootstrap.teamCount",
+    () =>
+      executor.select({ count: sql<number>`count(*)` }).from(teams),
+    addPlannerTraceContextFields(traceContext)
+  );
 
   if (Number(existingTeamCount[0]?.count ?? 0) === 0) {
-    await replacePersistentState(executor, getBasePersistentState());
+    const baseState = getBasePersistentState();
+    await measurePlannerTraceStepAsync(
+      traceContext,
+      "planner.store.bootstrap.seedBaseState",
+      () =>
+        replacePersistentState(executor, baseState, traceContext, {
+          after: summarizePlannerSnapshot(baseState),
+        }),
+      addPlannerTraceContextFields(traceContext, {
+        snapshotSummary: summarizePlannerSnapshot(baseState),
+      })
+    );
     return;
   }
 
-  const existingHolidaySources = await executor
-    .select({ count: sql<number>`count(*)` })
-    .from(holidaySources);
+  const existingHolidaySources = await measurePlannerTraceStepAsync(
+    traceContext,
+    "planner.store.bootstrap.holidaySourceCount",
+    () =>
+      executor.select({ count: sql<number>`count(*)` }).from(holidaySources),
+    addPlannerTraceContextFields(traceContext)
+  );
   if (Number(existingHolidaySources[0]?.count ?? 0) === 0) {
-    await executor.insert(holidaySources).values(
-      initialPlannerState.holidaySources.map((source) => ({
-        id: source.id,
-        code: source.code,
-        labelFr: source.labelFr,
-        enabled: source.enabled,
-      }))
+    await measurePlannerTraceStepAsync(
+      traceContext,
+      "planner.store.bootstrap.backfillHolidaySources",
+      () =>
+        executor.insert(holidaySources).values(
+          initialPlannerState.holidaySources.map((source) => ({
+            id: source.id,
+            code: source.code,
+            labelFr: source.labelFr,
+            enabled: source.enabled,
+          }))
+        ),
+      addPlannerTraceContextFields(traceContext, {
+        rowCount: initialPlannerState.holidaySources.length,
+      })
     );
   }
 }
 
-export async function loadPlannerSnapshot(sessionId?: string) {
-  const db = getDb();
-  await ensureDbReady();
-  await ensurePlannerBootstrapped(db);
-  const persistentState = await readPersistentState(db);
-  const history = await readHistoryState(db, sessionId);
-  return normalizePlannerSnapshot(persistentState, history);
+function getPlannerServerCaptureEnvironment() {
+  return {
+    nodeEnv:
+      typeof process !== "undefined"
+        ? (process.env.NODE_ENV ?? "development")
+        : "development",
+    serverTraceEnabled: true,
+  };
 }
 
-async function invalidateRedoStack(executor: DbExecutor, sessionId: string) {
-  await executor
-    .update(plannerActionLog)
-    .set({
-      invalidatedAt: new Date(),
-    })
-    .where(
-      and(
-        eq(plannerActionLog.sessionId, sessionId),
-        isNotNull(plannerActionLog.undoneAt),
-        isNull(plannerActionLog.invalidatedAt)
-      )
+function logPlannerServerCaptureStart(
+  traceContext: PlannerTraceContext | null,
+  payload: Record<string, unknown>
+) {
+  if (!traceContext) {
+    return;
+  }
+
+  logPlannerCaptureEvent(
+    "planner.capture.start",
+    {
+      ...payload,
+      environment: getPlannerServerCaptureEnvironment(),
+    },
+    traceContext
+  );
+}
+
+function logPlannerServerCaptureCompletion(
+  traceContext: PlannerTraceContext | null,
+  payload: Record<string, unknown>,
+  summary: ReturnType<typeof buildPlannerCaptureServerSummary>
+) {
+  if (!traceContext) {
+    return;
+  }
+
+  logPlannerCaptureEvent(
+    "planner.capture.server.summary",
+    {
+      ...payload,
+      summary,
+    },
+    traceContext
+  );
+  logPlannerCaptureEvent(
+    "planner.capture.end",
+    {
+      ...payload,
+      summary,
+      environment: getPlannerServerCaptureEnvironment(),
+    },
+    traceContext
+  );
+}
+
+export async function loadPlannerSnapshot(
+  sessionId?: string,
+  traceContext?: PlannerTraceContext | null
+) {
+  const storeTraceContext = extendPlannerTraceContext(traceContext, {
+    runtime: "server",
+    phase: "store",
+  });
+  const trace = startPlannerTrace("planner.store.loadSnapshot", storeTraceContext, {
+    sessionId: sessionId ?? null,
+  });
+  const db = getDb();
+  try {
+    await measurePlannerTraceStepAsync(
+      trace,
+      "planner.store.load.dbReady",
+      () => ensureDbReady(),
+      addPlannerTraceContextFields(storeTraceContext, {
+        sessionId: sessionId ?? null,
+      })
     );
+    await measurePlannerTraceStepAsync(
+      trace,
+      "planner.store.load.bootstrap",
+      () => ensurePlannerBootstrapped(db, storeTraceContext),
+      addPlannerTraceContextFields(storeTraceContext)
+    );
+    const persistentState = await measurePlannerTraceStepAsync(
+      trace,
+      "planner.store.load.readPersistentState",
+      () => readPersistentState(db),
+      addPlannerTraceContextFields(storeTraceContext)
+    );
+    const history = await measurePlannerTraceStepAsync(
+      trace,
+      "planner.store.load.readHistoryState",
+      () => readHistoryState(db, sessionId),
+      addPlannerTraceContextFields(storeTraceContext, {
+        sessionId: sessionId ?? null,
+      })
+    );
+    logPlannerServerCaptureStart(storeTraceContext, {
+      sessionId: sessionId ?? null,
+      actionType: "loadSnapshot",
+      source: storeTraceContext?.source ?? null,
+      snapshotSummary: summarizePlannerSnapshot(persistentState),
+    });
+    const snapshot = normalizePlannerSnapshot(
+      persistentState,
+      history,
+      trace,
+      "planner.store.load.normalizeSnapshot"
+    );
+    const serverSummary = buildPlannerCaptureServerSummary(trace);
+    logPlannerServerCaptureCompletion(
+      storeTraceContext,
+      {
+        sessionId: sessionId ?? null,
+        actionType: "loadSnapshot",
+        source: storeTraceContext?.source ?? null,
+        snapshotSummary: summarizePlannerSnapshot(snapshot),
+      },
+      serverSummary
+    );
+    finishPlannerTrace(trace, {
+      snapshotSummary: summarizePlannerSnapshot(snapshot),
+    });
+    return snapshot;
+  } catch (error) {
+    finishPlannerTrace(trace, {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    throw error;
+  }
+}
+
+async function invalidateRedoStack(
+  executor: DbExecutor,
+  sessionId: string,
+  traceContext?: PlannerTraceLike
+) {
+  await measurePlannerTraceStepAsync(
+    traceContext,
+    "planner.store.invalidateRedoStack",
+    async () => {
+      await executor
+        .update(plannerActionLog)
+        .set({
+          invalidatedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(plannerActionLog.sessionId, sessionId),
+            isNotNull(plannerActionLog.undoneAt),
+            isNull(plannerActionLog.invalidatedAt)
+          )
+        );
+    },
+    addPlannerTraceContextFields(traceContext, {
+      sessionId,
+    })
+  );
 }
 
 async function commitLoggedMutation(
   sessionId: string,
   actionType: string,
   payload: Record<string, unknown>,
-  mutator: (state: PlannerState) => PlannerState
+  mutator: (state: PlannerState, traceContext?: PlannerTraceContext | null) => PlannerState,
+  traceContext?: PlannerTraceContext | null
 ) {
   if (!sessionId) {
     throw new Error("Une session de planning est requise.");
   }
 
   const db = getDb();
-  await ensureDbReady();
-  return db.transaction(async (tx) => {
-    await ensurePlannerBootstrapped(tx);
-    await invalidateRedoStack(tx, sessionId);
-
-    const persistentBefore = await readPersistentState(tx);
-    const historyBefore = await readHistoryState(tx, sessionId);
-    const beforeSnapshot = normalizePlannerSnapshot(persistentBefore, historyBefore);
-    const nextSnapshot = mutator(beforeSnapshot);
-    const normalizedAfter = normalizePlannerSnapshot(
-      plannerStateToPersistentState(nextSnapshot),
-      buildHistoryState({
-        undoActionType: actionType,
+  const storeTraceContext = extendPlannerTraceContext(traceContext, {
+    runtime: "server",
+    phase: "store",
+  });
+  const persistenceTraceContext = extendPlannerTraceContext(storeTraceContext, {
+    phase: "persistence",
+  });
+  const trace = startPlannerTrace("planner.store.commitMutation", storeTraceContext, {
+    actionType,
+    sessionId,
+    payloadBytes: approximateJsonByteSize(payload),
+  });
+  try {
+    await measurePlannerTraceStepAsync(
+      trace,
+      "planner.store.commit.dbReady",
+      () => ensureDbReady(),
+      addPlannerTraceContextFields(storeTraceContext, {
+        sessionId,
       })
     );
-    const persistentAfter = plannerStateToPersistentState(normalizedAfter);
+    const nextSnapshot = await measurePlannerTraceStepAsync(
+      trace,
+      "planner.store.commit.transaction",
+      () =>
+        db.transaction(async (tx) => {
+          await ensurePlannerBootstrapped(tx, trace);
+          await invalidateRedoStack(tx, sessionId, trace);
 
-    await replacePersistentState(tx, persistentAfter);
+          const persistentBefore = await measurePlannerTraceStepAsync(
+            trace,
+            "planner.store.commit.readPersistentState.before",
+            () => readPersistentState(tx),
+            addPlannerTraceContextFields(storeTraceContext)
+          );
+          const historyBefore = await measurePlannerTraceStepAsync(
+            trace,
+            "planner.store.commit.readHistoryState.before",
+            () => readHistoryState(tx, sessionId),
+            addPlannerTraceContextFields(storeTraceContext, {
+              sessionId,
+            })
+          );
+          const beforeSnapshot = normalizePlannerSnapshot(
+            persistentBefore,
+            historyBefore,
+            trace,
+            "planner.store.commit.normalizeBefore"
+          );
+          logPlannerServerCaptureStart(storeTraceContext, {
+            sessionId,
+            actionType,
+            source: storeTraceContext?.source ?? null,
+            snapshotSummary: summarizePlannerSnapshot(beforeSnapshot),
+          });
+          const nextSnapshot = measurePlannerTraceStep(
+            trace,
+            "planner.store.commit.stateMutator",
+            () => mutator(beforeSnapshot, storeTraceContext),
+            addPlannerTraceContextFields(storeTraceContext, {
+              beforeSnapshotSummary: summarizePlannerSnapshot(beforeSnapshot),
+            })
+          );
+          const normalizedAfter = normalizePlannerSnapshot(
+            plannerStateToPersistentState(nextSnapshot),
+            buildHistoryState({
+              undoActionType: actionType,
+            }),
+            trace,
+            "planner.store.commit.normalizeAfter"
+          );
+          const persistentAfter = plannerStateToPersistentState(normalizedAfter);
 
-    const logId = crypto.randomUUID();
-    const afterSnapshotForLog = normalizedAfter;
+          await measurePlannerTraceStepAsync(
+            trace,
+            "planner.store.commit.replacePersistentState",
+            () =>
+              replacePersistentState(tx, persistentAfter, persistenceTraceContext, {
+                before: summarizePlannerSnapshot(persistentBefore),
+                after: summarizePlannerSnapshot(persistentAfter),
+              }),
+            addPlannerTraceContextFields(storeTraceContext, {
+              beforeSummary: summarizePlannerSnapshot(persistentBefore),
+              afterSummary: summarizePlannerSnapshot(persistentAfter),
+            })
+          );
 
-    await tx.insert(plannerActionLog).values({
-      id: logId,
-      sessionId,
+          const logId = crypto.randomUUID();
+          const afterSnapshotForLog = normalizedAfter;
+
+          await measurePlannerTraceStepAsync(
+            trace,
+            "planner.store.commit.insertActionLog",
+            () =>
+              tx.insert(plannerActionLog).values({
+                id: logId,
+                sessionId,
+                actionType,
+                payload,
+                beforeSnapshot,
+                afterSnapshot: afterSnapshotForLog,
+              }),
+            addPlannerTraceContextFields(storeTraceContext, {
+              payloadBytes: approximateJsonByteSize(payload),
+              beforeSnapshotBytes: approximateJsonByteSize(beforeSnapshot),
+              afterSnapshotBytes: approximateJsonByteSize(afterSnapshotForLog),
+            })
+          );
+
+          const historyAfter = await measurePlannerTraceStepAsync(
+            trace,
+            "planner.store.commit.readHistoryState.after",
+            () => readHistoryState(tx, sessionId),
+            addPlannerTraceContextFields(storeTraceContext, {
+              sessionId,
+            })
+          );
+          return {
+            ...normalizedAfter,
+            history: historyAfter,
+          };
+        }),
+      addPlannerTraceContextFields(storeTraceContext, {
+        actionType,
+      })
+    );
+    const serverSummary = buildPlannerCaptureServerSummary(trace);
+    logPlannerServerCaptureCompletion(
+      storeTraceContext,
+      {
+        sessionId,
+        actionType,
+        source: storeTraceContext?.source ?? null,
+        snapshotSummary: summarizePlannerSnapshot(nextSnapshot),
+      },
+      serverSummary
+    );
+    finishPlannerTrace(trace, {
       actionType,
-      payload,
-      beforeSnapshot,
-      afterSnapshot: afterSnapshotForLog,
+      snapshotSummary: summarizePlannerSnapshot(nextSnapshot),
     });
-
-    const historyAfter = await readHistoryState(tx, sessionId);
-    return {
-      ...normalizedAfter,
-      history: historyAfter,
-    };
-  });
+    return nextSnapshot;
+  } catch (error) {
+    finishPlannerTrace(trace, {
+      actionType,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    throw error;
+  }
 }
 
 export async function saveProject(
   sessionId: string,
   values: ProjectEditorState,
-  projectId?: string
+  projectId?: string,
+  traceContext?: PlannerTraceContext | null
 ) {
   return commitLoggedMutation(
     sessionId,
     "project.upsert",
     { projectId: projectId ?? null, values },
-    (state) => upsertProjectInState(state, values, projectId)
+    (state, actionTraceContext) =>
+      upsertProjectInState(state, values, projectId, actionTraceContext),
+    traceContext
   );
 }
 
@@ -359,193 +697,435 @@ export async function placeProject(
   sessionId: string,
   projectId: string,
   placement: ProjectPlacement,
-  options?: ProjectPlacementOptions
+  options?: ProjectPlacementOptions,
+  traceContext?: PlannerTraceContext | null
 ) {
   return commitLoggedMutation(
     sessionId,
     "project.place",
     { projectId, placement, options: options ?? null },
-    (state) => placeProjectInState(state, projectId, placement, options)
+    (state, actionTraceContext) =>
+      placeProjectInState(state, projectId, placement, options, actionTraceContext),
+    traceContext
   );
 }
 
 export async function placeProjects(
   sessionId: string,
   placements: ProjectPlacementRequest[],
-  options?: ProjectPlacementOptions
+  options?: ProjectPlacementOptions,
+  traceContext?: PlannerTraceContext | null
 ) {
   return commitLoggedMutation(
     sessionId,
     "project.placeMany",
     { placements, options: options ?? null },
-    (state) => placeProjectsInState(state, placements, options)
+    (state, actionTraceContext) =>
+      placeProjectsInState(state, placements, options, actionTraceContext),
+    traceContext
   );
 }
 
-export async function unscheduleProject(sessionId: string, projectId: string) {
+export async function unscheduleProject(
+  sessionId: string,
+  projectId: string,
+  traceContext?: PlannerTraceContext | null
+) {
   return commitLoggedMutation(
     sessionId,
     "project.unschedule",
     { projectId },
-    (state) => unscheduleProjectInState(state, projectId)
+    (state, actionTraceContext) =>
+      unscheduleProjectInState(state, projectId, actionTraceContext),
+    traceContext
   );
 }
 
 export async function deleteProject(
   sessionId: string,
   projectId: string,
-  mode?: ProjectDeleteMode
+  mode?: ProjectDeleteMode,
+  traceContext?: PlannerTraceContext | null
 ) {
   return commitLoggedMutation(
     sessionId,
     "project.delete",
     { projectId, mode: mode ?? null },
-    (state) => deleteProjectInState(state, projectId, mode)
+    (state, actionTraceContext) =>
+      deleteProjectInState(state, projectId, mode, actionTraceContext),
+    traceContext
   );
 }
 
-export async function createClosure(sessionId: string, values: ClosureFormState) {
+export async function createClosure(
+  sessionId: string,
+  values: ClosureFormState,
+  traceContext?: PlannerTraceContext | null
+) {
   return commitLoggedMutation(
     sessionId,
     "closure.add",
     { values },
-    (state) => addClosureInState(state, values)
+    (state, actionTraceContext) => addClosureInState(state, values, actionTraceContext),
+    traceContext
   );
 }
 
-export async function deleteClosure(sessionId: string, closureId: string) {
+export async function deleteClosure(
+  sessionId: string,
+  closureId: string,
+  traceContext?: PlannerTraceContext | null
+) {
   return commitLoggedMutation(
     sessionId,
     "closure.delete",
     { closureId },
-    (state) => removeClosureInState(state, closureId)
+    (state, actionTraceContext) =>
+      removeClosureInState(state, closureId, actionTraceContext),
+    traceContext
   );
 }
 
-export async function createTeam(sessionId: string, values: TeamEditorState) {
+export async function createTeam(
+  sessionId: string,
+  values: TeamEditorState,
+  traceContext?: PlannerTraceContext | null
+) {
   return commitLoggedMutation(
     sessionId,
     "team.create",
     { values },
-    (state) => createTeamInState(state, values)
+    (state) => createTeamInState(state, values),
+    traceContext
   );
 }
 
 export async function updateTeam(
   sessionId: string,
   teamId: string,
-  values: TeamEditorState
+  values: TeamEditorState,
+  traceContext?: PlannerTraceContext | null
 ) {
   return commitLoggedMutation(
     sessionId,
     "team.update",
     { teamId, values },
-    (state) => updateTeamInState(state, teamId, values)
+    (state) => updateTeamInState(state, teamId, values),
+    traceContext
   );
 }
 
-export async function deleteTeam(sessionId: string, teamId: string) {
+export async function deleteTeam(
+  sessionId: string,
+  teamId: string,
+  traceContext?: PlannerTraceContext | null
+) {
   return commitLoggedMutation(
     sessionId,
     "team.delete",
     { teamId },
-    (state) => deleteTeamInState(state, teamId)
+    (state) => deleteTeamInState(state, teamId),
+    traceContext
   );
 }
 
 export async function setHolidaySourceEnabled(
   sessionId: string,
   sourceCode: string,
-  enabled: boolean
+  enabled: boolean,
+  traceContext?: PlannerTraceContext | null
 ) {
   return commitLoggedMutation(
     sessionId,
     "holiday-source.toggle",
     { sourceCode, enabled },
-    (state) => toggleHolidaySourceInState(state, sourceCode, enabled)
+    (state, actionTraceContext) =>
+      toggleHolidaySourceInState(state, sourceCode, enabled, actionTraceContext),
+    traceContext
   );
 }
 
-export async function resetDemoData(sessionId: string) {
-  return commitLoggedMutation(sessionId, "demo.reset", {}, (state) =>
-    resetPlannerDemoDataInState(state)
+export async function resetDemoData(
+  sessionId: string,
+  traceContext?: PlannerTraceContext | null
+) {
+  return commitLoggedMutation(
+    sessionId,
+    "demo.reset",
+    {},
+    (state) => resetPlannerDemoDataInState(state),
+    traceContext
   );
 }
 
-export async function undoPlannerAction(sessionId: string) {
-  const db = getDb();
-  await ensureDbReady();
-  return db.transaction(async (tx) => {
-    const rows = await tx
-      .select()
-      .from(plannerActionLog)
-      .where(
-        and(
-          eq(plannerActionLog.sessionId, sessionId),
-          isNull(plannerActionLog.undoneAt),
-          isNull(plannerActionLog.invalidatedAt)
-        )
-      )
-      .orderBy(desc(plannerActionLog.createdAt))
-      .limit(1);
-
-    const entry = rows[0];
-    if (!entry) {
-      return loadPlannerSnapshot(sessionId);
-    }
-
-    const snapshot = entry.beforeSnapshot as PlannerState;
-    await replacePersistentState(tx, plannerStateToPersistentState(snapshot));
-    await tx
-      .update(plannerActionLog)
-      .set({
-        undoneAt: new Date(),
-      })
-      .where(eq(plannerActionLog.id, entry.id));
-
-    const history = await readHistoryState(tx, sessionId);
-    return {
-      ...snapshot,
-      history,
-    };
+export async function undoPlannerAction(
+  sessionId: string,
+  traceContext?: PlannerTraceContext | null
+) {
+  const storeTraceContext = extendPlannerTraceContext(traceContext, {
+    runtime: "server",
+    phase: "store",
   });
+  const persistenceTraceContext = extendPlannerTraceContext(storeTraceContext, {
+    phase: "persistence",
+  });
+  const trace = startPlannerTrace("planner.store.undo", storeTraceContext, {
+    sessionId,
+  });
+  const db = getDb();
+  try {
+    await measurePlannerTraceStepAsync(
+      trace,
+      "planner.store.undo.dbReady",
+      () => ensureDbReady(),
+      addPlannerTraceContextFields(storeTraceContext, {
+        sessionId,
+      })
+    );
+    const snapshot = await measurePlannerTraceStepAsync(
+      trace,
+      "planner.store.undo.transaction",
+      () =>
+        db.transaction(async (tx) => {
+          const rows = await measurePlannerTraceStepAsync(
+            trace,
+            "planner.store.undo.readActionLog",
+            () =>
+              tx
+                .select()
+                .from(plannerActionLog)
+                .where(
+                  and(
+                    eq(plannerActionLog.sessionId, sessionId),
+                    isNull(plannerActionLog.undoneAt),
+                    isNull(plannerActionLog.invalidatedAt)
+                  )
+                )
+                .orderBy(desc(plannerActionLog.createdAt))
+                .limit(1),
+            addPlannerTraceContextFields(storeTraceContext, {
+              sessionId,
+            })
+          );
+
+          const entry = rows[0];
+          if (!entry) {
+            return loadPlannerSnapshot(sessionId, storeTraceContext);
+          }
+
+          const snapshot = entry.beforeSnapshot as PlannerState;
+          logPlannerServerCaptureStart(storeTraceContext, {
+            sessionId,
+            actionType: "undo",
+            source: storeTraceContext?.source ?? null,
+            snapshotSummary: summarizePlannerSnapshot(snapshot),
+          });
+          await measurePlannerTraceStepAsync(
+            trace,
+            "planner.store.undo.replacePersistentState",
+            () =>
+              replacePersistentState(
+                tx,
+                plannerStateToPersistentState(snapshot),
+                persistenceTraceContext,
+                {
+                  after: summarizePlannerSnapshot(snapshot),
+                }
+              ),
+            addPlannerTraceContextFields(storeTraceContext, {
+              snapshotSummary: summarizePlannerSnapshot(snapshot),
+            })
+          );
+          await measurePlannerTraceStepAsync(
+            trace,
+            "planner.store.undo.markEntryUndone",
+            async () => {
+              await tx
+                .update(plannerActionLog)
+                .set({
+                  undoneAt: new Date(),
+                })
+                .where(eq(plannerActionLog.id, entry.id));
+            },
+            addPlannerTraceContextFields(storeTraceContext, {
+              actionLogId: entry.id,
+            })
+          );
+
+          const history = await measurePlannerTraceStepAsync(
+            trace,
+            "planner.store.undo.readHistoryState",
+            () => readHistoryState(tx, sessionId),
+            addPlannerTraceContextFields(storeTraceContext, {
+              sessionId,
+            })
+          );
+          return {
+            ...snapshot,
+            history,
+          };
+        }),
+      addPlannerTraceContextFields(storeTraceContext, {
+        sessionId,
+      })
+    );
+    const serverSummary = buildPlannerCaptureServerSummary(trace);
+    logPlannerServerCaptureCompletion(
+      storeTraceContext,
+      {
+        sessionId,
+        actionType: "undo",
+        source: storeTraceContext?.source ?? null,
+        snapshotSummary: summarizePlannerSnapshot(snapshot),
+      },
+      serverSummary
+    );
+    finishPlannerTrace(trace, {
+      sessionId,
+      snapshotSummary: summarizePlannerSnapshot(snapshot),
+    });
+    return snapshot;
+  } catch (error) {
+    finishPlannerTrace(trace, {
+      sessionId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    throw error;
+  }
 }
 
-export async function redoPlannerAction(sessionId: string) {
-  const db = getDb();
-  await ensureDbReady();
-  return db.transaction(async (tx) => {
-    const rows = await tx
-      .select()
-      .from(plannerActionLog)
-      .where(
-        and(
-          eq(plannerActionLog.sessionId, sessionId),
-          isNotNull(plannerActionLog.undoneAt),
-          isNull(plannerActionLog.invalidatedAt)
-        )
-      )
-      .orderBy(asc(plannerActionLog.createdAt))
-      .limit(1);
-
-    const entry = rows[0];
-    if (!entry) {
-      return loadPlannerSnapshot(sessionId);
-    }
-
-    const snapshot = entry.afterSnapshot as PlannerState;
-    await replacePersistentState(tx, plannerStateToPersistentState(snapshot));
-    await tx
-      .update(plannerActionLog)
-      .set({
-        undoneAt: null,
-      })
-      .where(eq(plannerActionLog.id, entry.id));
-
-    const history = await readHistoryState(tx, sessionId);
-    return {
-      ...snapshot,
-      history,
-    };
+export async function redoPlannerAction(
+  sessionId: string,
+  traceContext?: PlannerTraceContext | null
+) {
+  const storeTraceContext = extendPlannerTraceContext(traceContext, {
+    runtime: "server",
+    phase: "store",
   });
+  const persistenceTraceContext = extendPlannerTraceContext(storeTraceContext, {
+    phase: "persistence",
+  });
+  const trace = startPlannerTrace("planner.store.redo", storeTraceContext, {
+    sessionId,
+  });
+  const db = getDb();
+  try {
+    await measurePlannerTraceStepAsync(
+      trace,
+      "planner.store.redo.dbReady",
+      () => ensureDbReady(),
+      addPlannerTraceContextFields(storeTraceContext, {
+        sessionId,
+      })
+    );
+    const snapshot = await measurePlannerTraceStepAsync(
+      trace,
+      "planner.store.redo.transaction",
+      () =>
+        db.transaction(async (tx) => {
+          const rows = await measurePlannerTraceStepAsync(
+            trace,
+            "planner.store.redo.readActionLog",
+            () =>
+              tx
+                .select()
+                .from(plannerActionLog)
+                .where(
+                  and(
+                    eq(plannerActionLog.sessionId, sessionId),
+                    isNotNull(plannerActionLog.undoneAt),
+                    isNull(plannerActionLog.invalidatedAt)
+                  )
+                )
+                .orderBy(asc(plannerActionLog.createdAt))
+                .limit(1),
+            addPlannerTraceContextFields(storeTraceContext, {
+              sessionId,
+            })
+          );
+
+          const entry = rows[0];
+          if (!entry) {
+            return loadPlannerSnapshot(sessionId, storeTraceContext);
+          }
+
+          const snapshot = entry.afterSnapshot as PlannerState;
+          logPlannerServerCaptureStart(storeTraceContext, {
+            sessionId,
+            actionType: "redo",
+            source: storeTraceContext?.source ?? null,
+            snapshotSummary: summarizePlannerSnapshot(snapshot),
+          });
+          await measurePlannerTraceStepAsync(
+            trace,
+            "planner.store.redo.replacePersistentState",
+            () =>
+              replacePersistentState(
+                tx,
+                plannerStateToPersistentState(snapshot),
+                persistenceTraceContext,
+                {
+                  after: summarizePlannerSnapshot(snapshot),
+                }
+              ),
+            addPlannerTraceContextFields(storeTraceContext, {
+              snapshotSummary: summarizePlannerSnapshot(snapshot),
+            })
+          );
+          await measurePlannerTraceStepAsync(
+            trace,
+            "planner.store.redo.markEntryActive",
+            async () => {
+              await tx
+                .update(plannerActionLog)
+                .set({
+                  undoneAt: null,
+                })
+                .where(eq(plannerActionLog.id, entry.id));
+            },
+            addPlannerTraceContextFields(storeTraceContext, {
+              actionLogId: entry.id,
+            })
+          );
+
+          const history = await measurePlannerTraceStepAsync(
+            trace,
+            "planner.store.redo.readHistoryState",
+            () => readHistoryState(tx, sessionId),
+            addPlannerTraceContextFields(storeTraceContext, {
+              sessionId,
+            })
+          );
+          return {
+            ...snapshot,
+            history,
+          };
+        }),
+      addPlannerTraceContextFields(storeTraceContext, {
+        sessionId,
+      })
+    );
+    const serverSummary = buildPlannerCaptureServerSummary(trace);
+    logPlannerServerCaptureCompletion(
+      storeTraceContext,
+      {
+        sessionId,
+        actionType: "redo",
+        source: storeTraceContext?.source ?? null,
+        snapshotSummary: summarizePlannerSnapshot(snapshot),
+      },
+      serverSummary
+    );
+    finishPlannerTrace(trace, {
+      sessionId,
+      snapshotSummary: summarizePlannerSnapshot(snapshot),
+    });
+    return snapshot;
+  } catch (error) {
+    finishPlannerTrace(trace, {
+      sessionId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    throw error;
+  }
 }

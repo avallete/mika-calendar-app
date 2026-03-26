@@ -33,12 +33,19 @@ import {
   getTodayDateString,
 } from "@/lib/planner/timeline-range";
 import { measurePlannerPerformance } from "@/lib/planner/drag-performance";
+import {
+  addPlannerTraceContextFields,
+  normalizePlannerTraceSource,
+  type PlannerTraceContext,
+  type PlannerTraceLike,
+} from "@/lib/planner/planner-trace";
 
 type ScheduledComputation = ReturnType<typeof advanceWorkingDuration>;
 
 type SchedulerTrace = {
   id: number;
   action: string;
+  traceContext?: PlannerTraceLike;
 };
 
 type RescheduleOptions = {
@@ -46,6 +53,7 @@ type RescheduleOptions = {
   action?: string;
   metadata?: Record<string, unknown>;
   summaryOnly?: boolean;
+  traceContext?: PlannerTraceLike;
 };
 
 type ScheduledProjectLike = Project & {
@@ -77,20 +85,31 @@ function stringifyTracePayload(payload: unknown) {
 
 function startSchedulerTrace(
   action: string,
-  metadata?: Record<string, unknown>
+  metadata?: Record<string, unknown>,
+  traceContext?: PlannerTraceLike
 ): SchedulerTrace | null {
-  if (!schedulerTraceEnabled || typeof console === "undefined") {
+  if (
+    (!schedulerTraceEnabled && !traceContext) ||
+    typeof console === "undefined"
+  ) {
     return null;
   }
 
   const trace = {
     id: (schedulerTraceSequence += 1),
     action,
+    traceContext,
   };
 
-  console.groupCollapsed(`[planner trace #${trace.id}] ${action}`);
-  if (metadata) {
-    console.log(`meta ${stringifyTracePayload(metadata)}`);
+  const traceFields = addPlannerTraceContextFields(traceContext);
+  const traceIdSuffix =
+    typeof traceFields.traceId === "string"
+      ? ` traceId=${traceFields.traceId}`
+      : "";
+  console.groupCollapsed(`[planner trace #${trace.id}] ${action}${traceIdSuffix}`);
+  const traceMeta = addPlannerTraceContextFields(traceContext, metadata ?? {});
+  if (Object.keys(traceMeta).length) {
+    console.log(`meta ${stringifyTracePayload(traceMeta)}`);
   }
 
   return trace;
@@ -104,12 +123,45 @@ function traceLog(trace: SchedulerTrace | null, label: string, payload: unknown)
   console.log(`${label} ${stringifyTracePayload(payload)}`);
 }
 
+function measureSchedulerStage<T>(
+  trace: SchedulerTrace | null,
+  label: string,
+  fn: () => T,
+  payload?: Record<string, unknown>
+) {
+  if (!trace) {
+    return fn();
+  }
+
+  const startedAt =
+    typeof performance !== "undefined" && typeof performance.now === "function"
+      ? performance.now()
+      : Date.now();
+
+  try {
+    return fn();
+  } finally {
+    const finishedAt =
+      typeof performance !== "undefined" && typeof performance.now === "function"
+        ? performance.now()
+        : Date.now();
+    traceLog(trace, `${label}.duration`, {
+      ...addPlannerTraceContextFields(trace.traceContext, payload),
+      durationMs: Number((finishedAt - startedAt).toFixed(2)),
+    });
+  }
+}
+
 function finishSchedulerTrace(trace: SchedulerTrace | null) {
   if (!trace || typeof console === "undefined") {
     return;
   }
 
   console.groupEnd();
+}
+
+function shouldLogVerboseSchedulerTrace(summaryOnly: boolean) {
+  return schedulerTraceEnabled && !summaryOnly;
 }
 
 function summarizeTeamQueues(projects: Project[], teams: Team[]) {
@@ -209,6 +261,38 @@ function sortScheduledProjects(projects: Project[], teamId: TeamId) {
 
       return left.sequenceOrder - right.sequenceOrder;
     });
+}
+
+function normalizedRequestsLabel(requestCount: number) {
+  return requestCount === 1
+    ? "updateProjectPlacement"
+    : "updateProjectPlacements";
+}
+
+function buildPlacementTraceLabel(
+  requestCount: number,
+  normalizedSource: string,
+  traceContext?: PlannerTraceLike
+) {
+  const traceFields = addPlannerTraceContextFields(traceContext);
+  if (normalizedSource === "preview" || traceFields.phase === "preview") {
+    return "updateProjectPlacement.preview";
+  }
+
+  if (traceFields.runtime === "browser" && traceFields.phase === "optimistic") {
+    return `${normalizedRequestsLabel(requestCount)}.optimistic-client`;
+  }
+
+  if (
+    traceFields.runtime === "server" &&
+    (traceFields.phase === "server-action" ||
+      traceFields.phase === "store" ||
+      traceFields.phase === "persistence")
+  ) {
+    return `${normalizedRequestsLabel(requestCount)}.server-commit`;
+  }
+
+  return normalizedRequestsLabel(requestCount);
 }
 
 function compareScheduledProjectsByPlacement(
@@ -631,118 +715,181 @@ export function rescheduleProjects(
   state: PlannerState,
   options?: RescheduleOptions
 ): PlannerState {
-  const preparedState = materializePlannerState(state);
   const summaryOnly = options?.summaryOnly ?? false;
+  const verboseTrace = shouldLogVerboseSchedulerTrace(summaryOnly);
   const trace =
     options?.trace ??
-    startSchedulerTrace(options?.action ?? "rescheduleProjects", options?.metadata);
+    startSchedulerTrace(
+      options?.action ?? "rescheduleProjects",
+      options?.metadata,
+      options?.traceContext
+    );
   const ownsTrace = !options?.trace;
+  const preparedState = measureSchedulerStage(
+    trace,
+    "reschedule.materialize.input",
+    () => materializePlannerState(state),
+    addPlannerTraceContextFields(options?.traceContext, {
+      source:
+        typeof addPlannerTraceContextFields(options?.traceContext).traceSource ===
+        "string"
+          ? addPlannerTraceContextFields(options?.traceContext).traceSource
+          : null,
+    })
+  );
   const previousProjects = preparedState.projects.map((project) => ({ ...project }));
-  const nextProjects = normalizeSequenceOrders(
-    preparedState.projects.map((project) => ({
-      ...project,
-    })),
-    preparedState.dependencies,
-    preparedState.teams,
-    summaryOnly ? null : trace
+  const nextProjects = measureSchedulerStage(
+    trace,
+    "reschedule.normalizeSequenceOrders",
+    () =>
+      normalizeSequenceOrders(
+        preparedState.projects.map((project) => ({
+          ...project,
+        })),
+        preparedState.dependencies,
+        preparedState.teams,
+        verboseTrace ? trace : null
+      ),
+    {
+      teamCount: preparedState.teams.length,
+      projectCount: preparedState.projects.length,
+    }
   );
   const computations = new Map<string, ScheduledComputation>();
   let iterationCount = 0;
 
-  if (!summaryOnly) {
+  if (verboseTrace) {
     traceLog(trace, "queues.before", summarizeTeamQueues(previousProjects, preparedState.teams));
   }
 
-  let stabilized = false;
-  for (let iteration = 0; iteration < MAX_ITERATIONS; iteration += 1) {
-    iterationCount = iteration + 1;
-    let changed = false;
+  const { stabilized } = measureSchedulerStage(
+    trace,
+    "reschedule.mainLoop",
+    () => {
+      let stabilized = false;
+      for (let iteration = 0; iteration < MAX_ITERATIONS; iteration += 1) {
+        iterationCount = iteration + 1;
+        let changed = false;
 
-    for (const team of getSortedTeams(preparedState.teams)) {
-      const teamProjects = sortScheduledProjects(nextProjects, team.id);
-      let previousReadySlot: SlotKey | null = null;
+        for (const team of getSortedTeams(preparedState.teams)) {
+          const teamProjects = sortScheduledProjects(nextProjects, team.id);
+          let previousReadySlot: SlotKey | null = null;
 
-      for (const project of teamProjects) {
-        const dependencyReady = getPredecessorReadySlot(
-          project.id,
-          preparedState.dependencies,
-          computations,
-          preparedState.closures
-        );
+          for (const project of teamProjects) {
+            const dependencyReady = getPredecessorReadySlot(
+              project.id,
+              preparedState.dependencies,
+              computations,
+              preparedState.closures
+            );
 
-        const requestedStart = [project.scheduledStartSlot, previousReadySlot, dependencyReady]
-          .filter(Boolean)
-          .reduce((latest, current) => {
-            if (!latest) {
-              return current as SlotKey;
+            const requestedStart = [
+              project.scheduledStartSlot,
+              previousReadySlot,
+              dependencyReady,
+            ]
+              .filter(Boolean)
+              .reduce((latest, current) => {
+                if (!latest) {
+                  return current as SlotKey;
+                }
+                return compareSlotKeys(latest, current as SlotKey) > 0
+                  ? latest
+                  : (current as SlotKey);
+              }, project.scheduledStartSlot) as SlotKey;
+
+            const computed = advanceWorkingDuration(
+              requestedStart,
+              project.scheduledDurationHalfDays,
+              preparedState.closures
+            );
+            const previous = computations.get(project.id);
+
+            computations.set(project.id, computed);
+            if (verboseTrace) {
+              traceLog(trace, `iteration.${iteration + 1}.${project.id}`, {
+                teamId: team.id,
+                previousReadySlot,
+                dependencyReady,
+                requestedStart,
+                computedStartSlot: computed.startSlot,
+                calendarEndSlot: computed.calendarEndSlot,
+                readySlot: computed.readySlot,
+                skippedDates: computed.skippedDates,
+              });
             }
-            return compareSlotKeys(latest, current as SlotKey) > 0
-              ? latest
-              : (current as SlotKey);
-          }, project.scheduledStartSlot) as SlotKey;
 
-        const computed = advanceWorkingDuration(
-          requestedStart,
-          project.scheduledDurationHalfDays,
-          preparedState.closures
-        );
-        const previous = computations.get(project.id);
+            if (
+              !previous ||
+              previous.startSlot !== computed.startSlot ||
+              previous.calendarEndSlot !== computed.calendarEndSlot ||
+              previous.readySlot !== computed.readySlot ||
+              project.scheduledStartSlot !== computed.startSlot
+            ) {
+              changed = true;
+              project.scheduledStartSlot = computed.startSlot;
+            }
 
-        computations.set(project.id, computed);
-        if (!summaryOnly) {
-          traceLog(trace, `iteration.${iteration + 1}.${project.id}`, {
-            teamId: team.id,
-            previousReadySlot,
-            dependencyReady,
-            requestedStart,
-            computedStartSlot: computed.startSlot,
-            calendarEndSlot: computed.calendarEndSlot,
-            readySlot: computed.readySlot,
-            skippedDates: computed.skippedDates,
-          });
+            previousReadySlot = computed.readySlot;
+          }
         }
 
-        if (
-          !previous ||
-          previous.startSlot !== computed.startSlot ||
-          previous.calendarEndSlot !== computed.calendarEndSlot ||
-          previous.readySlot !== computed.readySlot ||
-          project.scheduledStartSlot !== computed.startSlot
-        ) {
-          changed = true;
-          project.scheduledStartSlot = computed.startSlot;
+        if (!changed) {
+          stabilized = true;
+          break;
         }
-
-        previousReadySlot = computed.readySlot;
       }
-    }
 
-    if (!changed) {
-      stabilized = true;
-      break;
+      return { stabilized };
+    },
+    {
+      teamCount: preparedState.teams.length,
+      scheduledProjectCount: preparedState.projects.filter(isScheduledProject).length,
+      dependencyCount: preparedState.dependencies.length,
+      closureCount: preparedState.closures.length,
     }
-  }
+  );
 
-  if (!stabilized) {
+  if (!stabilized && verboseTrace) {
     traceLog(trace, "reschedule.unstable", {
       maxIterations: MAX_ITERATIONS,
       queues: summarizeTeamQueues(nextProjects, preparedState.teams),
     });
   }
 
-  const nextState = materializePlannerState({
-    ...preparedState,
-    projects: nextProjects,
-  });
-  const changes = listScheduledChanges(previousProjects, nextProjects);
+  const nextState = measureSchedulerStage(
+    trace,
+    "reschedule.materialize.output",
+    () =>
+      materializePlannerState({
+        ...preparedState,
+        projects: nextProjects,
+      }),
+    {
+      projectCount: nextProjects.length,
+      closureCount: preparedState.closures.length,
+    }
+  );
+  const changes = measureSchedulerStage(
+    trace,
+    "reschedule.changedProjectDiff",
+    () => listScheduledChanges(previousProjects, nextProjects),
+    {
+      previousProjectCount: previousProjects.length,
+      nextProjectCount: nextProjects.length,
+    }
+  );
 
-  if (summaryOnly) {
-    traceLog(trace, "summary", {
-      iterationCount,
-      changedProjectCount: changes.length,
-      teamCount: preparedState.teams.length,
-    });
-  } else {
+  traceLog(trace, "summary", {
+    iterationCount,
+    changedProjectCount: changes.length,
+    teamCount: preparedState.teams.length,
+    scheduledProjectCount: preparedState.projects.filter(isScheduledProject).length,
+    dependencyCount: preparedState.dependencies.length,
+    closureCount: preparedState.closures.length,
+  });
+
+  if (verboseTrace) {
     traceLog(trace, "queues.after", summarizeTeamQueues(nextProjects, preparedState.teams));
     traceLog(trace, "changes", changes);
   }
@@ -827,46 +974,95 @@ export function getEarlierShiftPrompt(
 export function updateProjectPlacements(
   state: PlannerState,
   placementRequests: ProjectPlacementRequest[],
-  options?: ProjectPlacementOptions
+  options?: ProjectPlacementOptions,
+  traceContext?: PlannerTraceContext | null
 ): PlannerState {
-  return updateProjectPlacementsWithResult(state, placementRequests, options).nextState;
+  return updateProjectPlacementsWithResult(
+    state,
+    placementRequests,
+    options,
+    traceContext
+  ).nextState;
 }
 
 export function previewProjectPlacements(
   state: PlannerState,
   placementRequests: ProjectPlacementRequest[],
-  options?: Omit<ProjectPlacementOptions, "source">
+  options?: Omit<ProjectPlacementOptions, "source">,
+  traceContext?: PlannerTraceContext | null
 ) {
   return updateProjectPlacementsWithResult(state, placementRequests, {
     ...options,
     source: "preview",
-  });
+  }, traceContext);
 }
 
 function updateProjectPlacementsWithResult(
   state: PlannerState,
   placementRequests: ProjectPlacementRequest[],
-  options?: ProjectPlacementOptions
+  options?: ProjectPlacementOptions,
+  traceContext?: PlannerTraceContext | null
 ): PlacementUpdateResult {
-  const anticipatedState = materializePlannerState({
-    ...state,
-    projects: applyPlacementRequests(state.projects, placementRequests),
-  });
-  const normalizedRequests = placementRequests.map((request) =>
-    normalizePlacementRequest(request, anticipatedState.closures)
-  );
   const strategy = options?.strategy ?? "preserve";
   const dependencyResolution =
     options?.dependencyResolution ?? "preserve-dependencies";
   const summaryOnly = options?.source === "preview";
+  const normalizedSource = normalizePlannerTraceSource(options?.source ?? "unknown");
+  const trace = startSchedulerTrace(
+    buildPlacementTraceLabel(
+      placementRequests.length,
+      normalizedSource,
+      traceContext
+    ),
+    addPlannerTraceContextFields(traceContext, {
+      source: normalizedSource,
+      strategy,
+      dependencyResolution,
+      selectionSize: placementRequests.length,
+      placementCount: placementRequests.length,
+      ...(summaryOnly ? {} : options?.traceMetadata),
+    }),
+    traceContext
+  );
+  const anticipatedState = measureSchedulerStage(
+    trace,
+    "placement.materializeAnticipatedState",
+    () =>
+      materializePlannerState({
+        ...state,
+        projects: applyPlacementRequests(state.projects, placementRequests),
+      }),
+    {
+      source: normalizedSource,
+      placementCount: placementRequests.length,
+    }
+  );
+  const normalizedRequests = measureSchedulerStage(
+    trace,
+    "placement.normalizeRequests",
+    () =>
+      placementRequests.map((request) =>
+        normalizePlacementRequest(request, anticipatedState.closures)
+      ),
+    {
+      placementCount: placementRequests.length,
+    }
+  );
   const nextDependencies =
     dependencyResolution === "break-conflicting-links"
-      ? removeDependencies(state.dependencies, options?.removeDependencyIds)
+      ? measureSchedulerStage(
+          trace,
+          "placement.resolveDependencies",
+          () => removeDependencies(state.dependencies, options?.removeDependencyIds),
+          {
+            brokenDependencyCount: options?.removeDependencyIds?.length ?? 0,
+          }
+        )
       : anticipatedState.dependencies;
   const traceMetadata = summaryOnly
     ? {
         projectIds: normalizedRequests.map((request) => request.projectId),
-        source: options?.source ?? "unknown",
+        source: normalizedSource,
         strategy,
         dependencyResolution,
         selectionSize: normalizedRequests.length,
@@ -874,7 +1070,7 @@ function updateProjectPlacementsWithResult(
       }
     : {
         projectIds: normalizedRequests.map((request) => request.projectId),
-        source: options?.source ?? "unknown",
+        source: normalizedSource,
         strategy,
         dependencyResolution,
         rawPlacements: placementRequests,
@@ -882,20 +1078,34 @@ function updateProjectPlacementsWithResult(
         brokenDependencyIds: options?.removeDependencyIds ?? [],
         ...options?.traceMetadata,
       };
-  const trace = startSchedulerTrace(
-    normalizedRequests.length === 1 ? "updateProjectPlacement" : "updateProjectPlacements",
-    traceMetadata
-  );
+  traceLog(trace, "placement.summary", traceMetadata);
 
-  const insertedProjects = applyPlacementRequests(anticipatedState.projects, normalizedRequests);
-  const nextProjects =
+  const insertedProjects = measureSchedulerStage(
+    trace,
+    "placement.applyRequests",
+    () => applyPlacementRequests(anticipatedState.projects, normalizedRequests),
+    {
+      placementCount: normalizedRequests.length,
+    }
+  );
+  const nextProjects = measureSchedulerStage(
+    trace,
     strategy === "compact-same-team" && normalizedRequests.length === 1
-      ? compactLaterSameTeamProjects(
-          insertedProjects,
-          normalizedRequests[0].projectId,
-          normalizedRequests[0].placement.startSlot
-        )
-      : insertedProjects;
+      ? "placement.compaction"
+      : "placement.sequencePrepare",
+    () =>
+      strategy === "compact-same-team" && normalizedRequests.length === 1
+        ? compactLaterSameTeamProjects(
+            insertedProjects,
+            normalizedRequests[0].projectId,
+            normalizedRequests[0].placement.startSlot
+          )
+        : insertedProjects,
+    {
+      strategy,
+      projectId: normalizedRequests[0]?.projectId ?? null,
+    }
+  );
 
   if (strategy === "compact-same-team" && normalizedRequests.length === 1) {
     traceLog(trace, "compaction.anchor", {
@@ -921,9 +1131,11 @@ function updateProjectPlacementsWithResult(
             {
               trace,
               summaryOnly,
+              traceContext,
             }
           ),
         {
+          source: normalizedSource,
           strategy,
           dependencyResolution,
           selectionSize: normalizedRequests.length,
@@ -938,15 +1150,25 @@ function updateProjectPlacementsWithResult(
         {
           trace,
           summaryOnly,
+          traceContext,
         }
       );
 
+  const changedProjectIds = measureSchedulerStage(
+    trace,
+    "placement.changedProjectIds",
+    () =>
+      listScheduledChanges(state.projects, nextState.projects).map(
+        (change) => change.id
+      ),
+    {
+      projectCount: nextState.projects.length,
+    }
+  );
   finishSchedulerTrace(trace);
   return {
     nextState,
-    changedProjectIds: listScheduledChanges(state.projects, nextState.projects).map(
-      (change) => change.id
-    ),
+    changedProjectIds,
   };
 }
 
@@ -954,7 +1176,8 @@ export function updateProjectPlacement(
   state: PlannerState,
   projectId: string,
   placement: ProjectPlacement,
-  options?: ProjectPlacementOptions
+  options?: ProjectPlacementOptions,
+  traceContext?: PlannerTraceContext | null
 ) {
   return updateProjectPlacements(
     state,
@@ -964,7 +1187,8 @@ export function updateProjectPlacement(
         placement,
       },
     ],
-    options
+    options,
+    traceContext
   );
 }
 
@@ -984,12 +1208,14 @@ export function buildPlannerMetrics(state: PlannerState): ProjectMetrics {
 export function deleteProjectFromState(
   state: PlannerState,
   projectId: string,
-  mode: ProjectDeleteMode = "preserve-dates"
+  mode: ProjectDeleteMode = "preserve-dates",
+  traceContext?: PlannerTraceContext | null
 ) {
   const trace = startSchedulerTrace("deleteProjectFromState", {
     projectId,
     mode,
-  });
+    ...addPlannerTraceContextFields(traceContext),
+  }, traceContext);
   const projectToDelete = state.projects.find((project) => project.id === projectId);
   if (!projectToDelete) {
     finishSchedulerTrace(trace);
@@ -1016,7 +1242,7 @@ export function deleteProjectFromState(
   });
 
   if (!isScheduledProject(projectToDelete) || mode === "preserve-dates") {
-    const nextState = rescheduleProjects(baseState, { trace });
+    const nextState = rescheduleProjects(baseState, { trace, traceContext });
     finishSchedulerTrace(trace);
     return nextState;
   }
@@ -1057,6 +1283,7 @@ export function deleteProjectFromState(
     },
     {
       trace,
+      traceContext,
     }
   );
 

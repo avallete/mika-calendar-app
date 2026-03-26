@@ -5,6 +5,14 @@ import { AppHeader } from "@/components/planner/app-header";
 import { PlannerProvider } from "@/components/planner/planner-provider";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { fr } from "@/lib/i18n/fr";
+import {
+  createPlannerTraceContext,
+  finishPlannerTrace,
+  isPlannerServerTraceEnabled,
+  measurePlannerTraceStepAsync,
+  startPlannerTrace,
+  summarizePlannerSnapshot,
+} from "@/lib/planner/planner-trace";
 import { loadPlannerSnapshot } from "@/lib/planner/store";
 import "./globals.css";
 
@@ -31,7 +39,28 @@ export default async function RootLayout({
 }: Readonly<{
   children: React.ReactNode;
 }>) {
-  const initialState = await loadPlannerSnapshot();
+  const traceContext = createPlannerTraceContext({
+    source: "load",
+    enabled: isPlannerServerTraceEnabled(),
+    metadata: {
+      phase: "ssr",
+    },
+  });
+  const trace = startPlannerTrace("planner.load.ssr", traceContext, {
+    phase: "ssr",
+  });
+  const initialState = await measurePlannerTraceStepAsync(
+    trace,
+    "planner.load.ssr.await",
+    () => loadPlannerSnapshot(undefined, traceContext),
+    {
+      phase: "ssr",
+    }
+  );
+  finishPlannerTrace(trace, {
+    phase: "ssr",
+    snapshotSummary: summarizePlannerSnapshot(initialState),
+  });
 
   return (
     <html

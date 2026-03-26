@@ -13,6 +13,14 @@ import {
   projects,
   teams,
 } from "@/db/schema";
+import type {
+  PlannerSnapshotSummary,
+  PlannerTraceLike,
+} from "@/lib/planner/planner-trace";
+import {
+  addPlannerTraceContextFields,
+  measurePlannerTraceStepAsync,
+} from "@/lib/planner/planner-trace";
 import { initialPlannerState } from "@/lib/planner/sample-data";
 import type { PlannerState } from "@/lib/planner/types";
 
@@ -82,83 +90,171 @@ WHERE "repeats_annually" IS NULL;
 
 export async function replacePersistentState(
   executor: DbExecutor,
-  state: PersistentPlannerState
+  state: PersistentPlannerState,
+  traceContext?: PlannerTraceLike,
+  summaries?: {
+    before?: PlannerSnapshotSummary;
+    after?: PlannerSnapshotSummary;
+  }
 ) {
-  await executor.delete(plannerActionLog);
-  await executor.delete(projectDependencies);
-  await executor.delete(projects);
-  await executor.delete(closurePeriods);
-  await executor.delete(holidaySources);
-  await executor.delete(teams);
+  await measurePlannerTraceStepAsync(
+    traceContext ?? null,
+    "planner.persistence.delete.actionLog",
+    () => executor.delete(plannerActionLog),
+    addPlannerTraceContextFields(traceContext, {
+      rowCount: null,
+    })
+  );
+  await measurePlannerTraceStepAsync(
+    traceContext ?? null,
+    "planner.persistence.delete.dependencies",
+    () => executor.delete(projectDependencies),
+    addPlannerTraceContextFields(traceContext, {
+      rowCount: summaries?.before?.dependencyCount ?? null,
+    })
+  );
+  await measurePlannerTraceStepAsync(
+    traceContext ?? null,
+    "planner.persistence.delete.projects",
+    () => executor.delete(projects),
+    addPlannerTraceContextFields(traceContext, {
+      rowCount: summaries?.before?.projectCount ?? null,
+    })
+  );
+  await measurePlannerTraceStepAsync(
+    traceContext ?? null,
+    "planner.persistence.delete.closures",
+    () => executor.delete(closurePeriods),
+    addPlannerTraceContextFields(traceContext, {
+      rowCount: summaries?.before?.customClosureCount ?? null,
+    })
+  );
+  await measurePlannerTraceStepAsync(
+    traceContext ?? null,
+    "planner.persistence.delete.holidaySources",
+    () => executor.delete(holidaySources),
+    addPlannerTraceContextFields(traceContext, {
+      rowCount: summaries?.before?.holidaySourceCount ?? null,
+    })
+  );
+  await measurePlannerTraceStepAsync(
+    traceContext ?? null,
+    "planner.persistence.delete.teams",
+    () => executor.delete(teams),
+    addPlannerTraceContextFields(traceContext, {
+      rowCount: summaries?.before?.teamCount ?? null,
+    })
+  );
 
   if (state.teams.length) {
-    await executor.insert(teams).values(
-      state.teams.map((team) => ({
-        id: team.id,
-        slug: team.slug,
-        nameFr: team.nameFr,
-        displayOrder: team.displayOrder,
-        accentColor: team.accentColor,
-        softColor: team.softColor,
-        isActive: team.isActive,
-      }))
+    await measurePlannerTraceStepAsync(
+      traceContext ?? null,
+      "planner.persistence.insert.teams",
+      () =>
+        executor.insert(teams).values(
+          state.teams.map((team) => ({
+            id: team.id,
+            slug: team.slug,
+            nameFr: team.nameFr,
+            displayOrder: team.displayOrder,
+            accentColor: team.accentColor,
+            softColor: team.softColor,
+            isActive: team.isActive,
+          }))
+        ),
+      addPlannerTraceContextFields(traceContext, {
+        rowCount: summaries?.after?.teamCount ?? state.teams.length,
+      })
     );
   }
 
   if (state.holidaySources.length) {
-    await executor.insert(holidaySources).values(
-      state.holidaySources.map((source) => ({
-        id: source.id,
-        code: source.code,
-        labelFr: source.labelFr,
-        enabled: source.enabled,
-      }))
+    await measurePlannerTraceStepAsync(
+      traceContext ?? null,
+      "planner.persistence.insert.holidaySources",
+      () =>
+        executor.insert(holidaySources).values(
+          state.holidaySources.map((source) => ({
+            id: source.id,
+            code: source.code,
+            labelFr: source.labelFr,
+            enabled: source.enabled,
+          }))
+        ),
+      addPlannerTraceContextFields(traceContext, {
+        rowCount: summaries?.after?.holidaySourceCount ?? state.holidaySources.length,
+      })
     );
   }
 
   if (state.projects.length) {
-    await executor.insert(projects).values(
-      state.projects.map((project) => ({
-        id: project.id,
-        title: project.title,
-        status: project.status,
-        plannedTeamId: project.plannedTeam,
-        estimatedDurationHalfDays: project.estimatedDurationHalfDays,
-        scheduledTeamId: project.scheduledTeam ?? null,
-        scheduledStartSlot: project.scheduledStartSlot ?? null,
-        scheduledDurationHalfDays: project.scheduledDurationHalfDays ?? null,
-        sequenceOrder: project.sequenceOrder ?? null,
-        targetDateHint: project.targetDateHint
-          ? new Date(`${project.targetDateHint}T00:00:00.000Z`)
-          : null,
-        notes: project.notes ?? null,
-      }))
+    await measurePlannerTraceStepAsync(
+      traceContext ?? null,
+      "planner.persistence.insert.projects",
+      () =>
+        executor.insert(projects).values(
+          state.projects.map((project) => ({
+            id: project.id,
+            title: project.title,
+            status: project.status,
+            plannedTeamId: project.plannedTeam,
+            estimatedDurationHalfDays: project.estimatedDurationHalfDays,
+            scheduledTeamId: project.scheduledTeam ?? null,
+            scheduledStartSlot: project.scheduledStartSlot ?? null,
+            scheduledDurationHalfDays: project.scheduledDurationHalfDays ?? null,
+            sequenceOrder: project.sequenceOrder ?? null,
+            targetDateHint: project.targetDateHint
+              ? new Date(`${project.targetDateHint}T00:00:00.000Z`)
+              : null,
+            notes: project.notes ?? null,
+          }))
+        ),
+      addPlannerTraceContextFields(traceContext, {
+        rowCount: summaries?.after?.projectCount ?? state.projects.length,
+      })
     );
   }
 
   if (state.dependencies.length) {
-    await executor.insert(projectDependencies).values(
-      state.dependencies.map((dependency) => ({
-        id: dependency.id,
-        predecessorProjectId: dependency.predecessorProjectId,
-        successorProjectId: dependency.successorProjectId,
-        lagHalfDays: dependency.lagHalfDays,
-      }))
+    await measurePlannerTraceStepAsync(
+      traceContext ?? null,
+      "planner.persistence.insert.dependencies",
+      () =>
+        executor.insert(projectDependencies).values(
+          state.dependencies.map((dependency) => ({
+            id: dependency.id,
+            predecessorProjectId: dependency.predecessorProjectId,
+            successorProjectId: dependency.successorProjectId,
+            lagHalfDays: dependency.lagHalfDays,
+          }))
+        ),
+      addPlannerTraceContextFields(traceContext, {
+        rowCount: summaries?.after?.dependencyCount ?? state.dependencies.length,
+      })
     );
   }
 
   if (state.customClosures.length) {
-    await executor.insert(closurePeriods).values(
-      state.customClosures.map((closure) => ({
-        id: closure.id,
-        title: closure.title,
-        type: closure.type,
-        impact: closure.impact,
-        startDate: new Date(`${closure.startDate}T00:00:00.000Z`),
-        endDate: new Date(`${closure.endDate}T00:00:00.000Z`),
-        details: closure.details ?? null,
-        repeatsAnnually: closure.repeatsAnnually,
-      }))
+    await measurePlannerTraceStepAsync(
+      traceContext ?? null,
+      "planner.persistence.insert.closures",
+      () =>
+        executor.insert(closurePeriods).values(
+          state.customClosures.map((closure) => ({
+            id: closure.id,
+            title: closure.title,
+            type: closure.type,
+            impact: closure.impact,
+            startDate: new Date(`${closure.startDate}T00:00:00.000Z`),
+            endDate: new Date(`${closure.endDate}T00:00:00.000Z`),
+            details: closure.details ?? null,
+            repeatsAnnually: closure.repeatsAnnually,
+          }))
+        ),
+      addPlannerTraceContextFields(traceContext, {
+        rowCount:
+          summaries?.after?.customClosureCount ?? state.customClosures.length,
+      })
     );
   }
 }

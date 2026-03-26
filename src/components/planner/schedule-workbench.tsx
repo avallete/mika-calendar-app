@@ -112,6 +112,15 @@ import {
   previewProjectPlacements,
   setSchedulerTraceEnabled,
 } from "@/lib/planner/scheduler";
+import {
+  addPlannerTraceContextFields,
+  createPlannerTraceContext,
+  extendPlannerTraceContext,
+  logPlannerCaptureEvent,
+  normalizePlannerTraceSource,
+  summarizePlannerSnapshot,
+  type PlannerTraceContext,
+} from "@/lib/planner/planner-trace";
 import { getTodayDateString } from "@/lib/planner/timeline-range";
 import type {
   CalendarBucket,
@@ -148,12 +157,26 @@ function stringifyTracePayload(payload: unknown) {
   }
 }
 
-function tracePlannerUi(enabled: boolean, label: string, payload: unknown) {
+function tracePlannerUi(
+  enabled: boolean,
+  label: string,
+  payload: unknown,
+  traceContext?: PlannerTraceContext | null
+) {
   if (!enabled || typeof console === "undefined") {
     return;
   }
 
-  console.log(`[planner ui trace] ${label} ${stringifyTracePayload(payload)}`);
+  const enrichedPayload =
+    payload && typeof payload === "object"
+      ? addPlannerTraceContextFields(
+          traceContext,
+          payload as Record<string, unknown>
+        )
+      : addPlannerTraceContextFields(traceContext, {
+          payload,
+        });
+  console.log(`[planner ui trace] ${label} ${stringifyTracePayload(enrichedPayload)}`);
 }
 
 type DragPreviewCandidate = {
@@ -173,6 +196,7 @@ type DragSessionState = {
   dragId: string;
   startedAt: number;
   performanceSession: PlannerPerformanceSession | null;
+  traceContext: PlannerTraceContext | null;
 };
 
 type ExactPreviewWorkItem = DragPreviewCandidate & {
@@ -441,6 +465,7 @@ export function ScheduleWorkbench({
   const {
     state,
     metrics,
+    sessionId,
     placeProject,
     placeProjects,
     unscheduleProject,
@@ -577,32 +602,57 @@ export function ScheduleWorkbench({
     }));
   };
 
+  const createActionTraceContext = (
+    source: string,
+    metadata: Record<string, unknown> = {},
+    traceId?: string,
+    captureId?: string
+  ) =>
+    createPlannerTraceContext({
+      source: normalizePlannerTraceSource(source),
+      enabled: traceEnabled,
+      traceId,
+      captureId,
+      runtime: "browser",
+      metadata,
+    });
+
   const setTouchingSelection = (projectId: string) => {
     const chainProjectIds = getTouchingProjectChain(state, projectId);
     setSelectedProjectIds(chainProjectIds);
     setSelectedProjectId(null);
     setPendingPlacement(null);
 
-    tracePlannerUi(traceEnabled, "selection.chain", {
-      projectId,
-      selectedProjectIds: chainProjectIds,
-    });
+    tracePlannerUi(
+      traceEnabled,
+      "selection.chain",
+      {
+        projectId,
+        selectedProjectIds: chainProjectIds,
+      },
+      createActionTraceContext("sheet-edit", {
+        projectId,
+        selectionSize: chainProjectIds.length,
+      })
+    );
   };
 
   const commitPlacementRequests = (
     placementRequests: ProjectPlacementRequest[],
-    options?: Parameters<typeof placeProjects>[1]
+    options?: Parameters<typeof placeProjects>[1],
+    traceContext?: PlannerTraceContext | null
   ) => {
     if (placementRequests.length === 1) {
       placeProject(
         placementRequests[0].projectId,
         placementRequests[0].placement,
-        options
+        options,
+        traceContext
       );
       return;
     }
 
-    placeProjects(placementRequests, options);
+    placeProjects(placementRequests, options, traceContext);
   };
 
   const cancelQueuedHoverUpdate = () => {
@@ -665,9 +715,21 @@ export function ScheduleWorkbench({
       }
 
       const runGeneration = exactPreviewGenerationRef.current;
-      const exactResult = previewProjectPlacements(stateRef.current, work.requests, {
-        dependencyResolution: "preserve-dependencies",
-      });
+      const previewTraceContext = extendPlannerTraceContext(
+        dragSessionRef.current?.traceContext ?? null,
+        {
+          runtime: "browser",
+          phase: "preview",
+        }
+      );
+      const exactResult = previewProjectPlacements(
+        stateRef.current,
+        work.requests,
+        {
+          dependencyResolution: "preserve-dependencies",
+        },
+        previewTraceContext
+      );
       const exactPreview = measurePlannerPerformance(
         "drag.preview.exact.delta",
         () =>
@@ -910,6 +972,7 @@ export function ScheduleWorkbench({
 
     const data = event.active.data.current as DragProjectMeta | undefined;
     const dragId = String(event.active.id);
+    const captureId = dragId;
     const selectionSize =
       data?.type === "scheduled" &&
       data.intent === "move" &&
@@ -917,9 +980,28 @@ export function ScheduleWorkbench({
         ? selectedProjectIds.length
         : 1;
     const performanceSession = traceEnabled
-      ? startPlannerPerformanceSession(
+        ? startPlannerPerformanceSession(
           `drag:${data?.type ?? "unknown"}:${data?.type === "scheduled" ? data.intent : "draft"}`,
           {
+            captureId,
+            traceId: dragId,
+            runtime: "browser",
+            source:
+              data?.type === "scheduled"
+                ? data.intent === "move"
+                  ? "drag-move"
+                  : "drag-resize"
+                : "draft-drop",
+            sessionId,
+            viewMode: viewportPreferences.viewMode,
+            snapshotSummary: summarizePlannerSnapshot(state),
+            environment: {
+              nodeEnv:
+                typeof process !== "undefined"
+                  ? (process.env.NODE_ENV ?? "development")
+                  : "development",
+              traceEnabled,
+            },
             dragId,
             dragType: data?.type ?? null,
             intent: data?.type === "scheduled" ? data.intent : "draft",
@@ -929,6 +1011,26 @@ export function ScheduleWorkbench({
           }
         )
       : null;
+    const dragTraceContext = createActionTraceContext(
+      data?.type === "scheduled"
+        ? data.intent === "move"
+          ? "drag-move"
+          : "drag-resize"
+        : "draft-drop",
+      {
+        captureId,
+        sessionId,
+        viewMode: viewportPreferences.viewMode,
+        dragId,
+        dragType: data?.type ?? null,
+        intent: data?.type === "scheduled" ? data.intent : "draft",
+        projectId: data?.projectId ?? null,
+        selectionSize,
+        startSlot: data?.type === "scheduled" ? data.startSlot : null,
+      },
+      dragId,
+      captureId
+    );
 
     handledDragIdRef.current = null;
     hoveredBucketIdRef.current = null;
@@ -943,6 +1045,7 @@ export function ScheduleWorkbench({
       dragId,
       startedAt: typeof performance === "undefined" ? 0 : performance.now(),
       performanceSession,
+      traceContext: dragTraceContext,
     };
 
     const tracePayload = {
@@ -954,7 +1057,28 @@ export function ScheduleWorkbench({
       startSlot: data?.type === "scheduled" ? data.startSlot : null,
     };
 
-    tracePlannerUi(traceEnabled, "drag.start", tracePayload);
+    tracePlannerUi(traceEnabled, "drag.start", tracePayload, dragTraceContext);
+    if (traceEnabled) {
+      logPlannerCaptureEvent(
+        "planner.capture.start",
+        {
+          sessionId,
+          dragId,
+          source: dragTraceContext?.source ?? null,
+          viewMode: viewportPreferences.viewMode,
+          selectionSize,
+          snapshotSummary: summarizePlannerSnapshot(state),
+          environment: {
+            nodeEnv:
+              typeof process !== "undefined"
+                ? (process.env.NODE_ENV ?? "development")
+                : "development",
+            traceEnabled,
+          },
+        },
+        dragTraceContext
+      );
+    }
 
     if (
       data?.type === "scheduled" &&
@@ -1013,6 +1137,7 @@ export function ScheduleWorkbench({
         ? (resolvedDraftDrop?.bucket ?? null)
         : currentHoveredBucket ?? eventBucket;
     const dragSession = dragSessionRef.current;
+    const dragTraceContext = dragSession?.traceContext ?? null;
     const dragId = String(event.active.id);
     const dragDurationMs = dragSession
       ? typeof performance === "undefined"
@@ -1047,7 +1172,7 @@ export function ScheduleWorkbench({
         dragId,
         outcome: "ignored-duplicate",
         durationMs: dragDurationMs,
-      });
+      }, dragTraceContext);
       finalizeDragSession("ignored-duplicate");
       return;
     }
@@ -1060,7 +1185,7 @@ export function ScheduleWorkbench({
         outcome: "no-target",
         durationMs: dragDurationMs,
         targetResolution: resolvedDraftDrop?.source ?? "no-target",
-      });
+      }, dragTraceContext);
       finalizeDragSession("no-target", {
         targetResolution: resolvedDraftDrop?.source ?? "no-target",
       });
@@ -1075,7 +1200,7 @@ export function ScheduleWorkbench({
         hoveredStartSlot: bucket.startSlot,
         normalizedStartSlot: normalizeToWorkingSlot(bucket.startSlot, state.closures),
         targetResolution: resolvedDraftDrop?.source ?? "no-target",
-      });
+      }, dragTraceContext);
       setPendingPlacement({
         projectId: active.projectId,
         title: active.title,
@@ -1127,7 +1252,7 @@ export function ScheduleWorkbench({
           outcome: "no-move-plan",
           durationMs: dragDurationMs,
           hoveredStartSlot: bucket.startSlot,
-        });
+        }, dragTraceContext);
         finalizeDragSession("no-move-plan", {
           hoveredStartSlot: bucket.startSlot,
         });
@@ -1142,7 +1267,7 @@ export function ScheduleWorkbench({
           projectIds: movePlan.projectIds,
           normalizedPlacements: movePlan.normalizedRequests,
           snappedPlacements: movePlan.snappedRequests,
-        });
+        }, dragTraceContext);
         finalizeDragSession("noop", {
           projectIds: movePlan.projectIds,
         });
@@ -1166,13 +1291,18 @@ export function ScheduleWorkbench({
       };
 
       if (conflicts.length) {
-        tracePlannerUi(traceEnabled, "dependencyConflict.prompt", traceMetadata);
+        tracePlannerUi(
+          traceEnabled,
+          "dependencyConflict.prompt",
+          traceMetadata,
+          dragTraceContext
+        );
         tracePlannerUi(traceEnabled, "drag.end", {
           dragId,
           outcome: "dependency-conflict",
           durationMs: dragDurationMs,
           projectIds: movePlan.projectIds,
-        });
+        }, dragTraceContext);
         setPendingDependencyConflict({
           projectIds: movePlan.projectIds,
           placements: movePlan.snappedRequests,
@@ -1204,7 +1334,7 @@ export function ScheduleWorkbench({
           outcome: "earlier-shift-prompt",
           durationMs: dragDurationMs,
           projectIds: movePlan.projectIds,
-        });
+        }, dragTraceContext);
         setPendingEarlierShift(earliestShiftPrompt);
         finalizeDragSession("earlier-shift-prompt", {
           projectIds: movePlan.projectIds,
@@ -1218,18 +1348,27 @@ export function ScheduleWorkbench({
         durationMs: dragDurationMs,
         projectIds: movePlan.projectIds,
         normalizedPlacements: movePlan.normalizedRequests,
-      });
-      measurePlannerPerformance("drag.end.commitDispatch", () => {
+      }, dragTraceContext);
+      measurePlannerPerformance("drag.end.optimistic.call", () => {
         commitPlacementRequests(movePlan.snappedRequests, {
           source: "drag-move",
           dependencyResolution: "preserve-dependencies",
           traceMetadata,
-        });
+        }, dragTraceContext);
       });
       setPendingPlacement(null);
-      finalizeDragSession("committed", {
-        projectIds: movePlan.projectIds,
-      });
+      schedulePlannerPerformanceSummary(
+        dragSession?.performanceSession ?? null,
+        {
+          dragId,
+          durationMs: dragDurationMs,
+          outcome: "committed",
+          projectIds: movePlan.projectIds,
+        },
+        {
+          deferFlush: true,
+        }
+      );
       return;
     }
 
@@ -1247,7 +1386,7 @@ export function ScheduleWorkbench({
         outcome: "invalid-placement",
         durationMs: dragDurationMs,
         projectIds: [active.projectId],
-      });
+      }, dragTraceContext);
       finalizeDragSession("invalid-placement", {
         projectIds: [active.projectId],
       });
@@ -1269,7 +1408,7 @@ export function ScheduleWorkbench({
         durationMs: dragDurationMs,
         projectIds: [active.projectId],
         normalizedPlacements: [normalizedPlacementRequest],
-      });
+      }, dragTraceContext);
       finalizeDragSession("noop", {
         projectIds: [active.projectId],
       });
@@ -1297,13 +1436,18 @@ export function ScheduleWorkbench({
     };
 
     if (conflicts.length) {
-      tracePlannerUi(traceEnabled, "dependencyConflict.prompt", traceMetadata);
+      tracePlannerUi(
+        traceEnabled,
+        "dependencyConflict.prompt",
+        traceMetadata,
+        dragTraceContext
+      );
       tracePlannerUi(traceEnabled, "drag.end", {
         dragId,
         outcome: "dependency-conflict",
         durationMs: dragDurationMs,
         projectIds: [active.projectId],
-      });
+      }, dragTraceContext);
       setPendingDependencyConflict({
         projectIds: [active.projectId],
         placements: [normalizedPlacementRequest],
@@ -1333,7 +1477,7 @@ export function ScheduleWorkbench({
           outcome: "earlier-shift-prompt",
           durationMs: dragDurationMs,
           projectIds: [active.projectId],
-        });
+        }, dragTraceContext);
         setPendingEarlierShift(prompt);
         finalizeDragSession("earlier-shift-prompt", {
           projectIds: [active.projectId],
@@ -1348,18 +1492,27 @@ export function ScheduleWorkbench({
       durationMs: dragDurationMs,
       projectIds: [active.projectId],
       normalizedPlacements: [normalizedPlacementRequest],
-    });
-    measurePlannerPerformance("drag.end.commitDispatch", () => {
+    }, dragTraceContext);
+    measurePlannerPerformance("drag.end.optimistic.call", () => {
       placeProject(active.projectId, normalizedPlacementRequest.placement, {
         source: `drag-${active.intent}`,
         dependencyResolution: "preserve-dependencies",
         traceMetadata,
-      });
+      }, dragTraceContext);
     });
     setPendingPlacement(null);
-    finalizeDragSession("committed", {
-      projectIds: [active.projectId],
-    });
+    schedulePlannerPerformanceSummary(
+      dragSession?.performanceSession ?? null,
+      {
+        dragId,
+        durationMs: dragDurationMs,
+        outcome: "committed",
+        projectIds: [active.projectId],
+      },
+      {
+        deferFlush: true,
+      }
+    );
   };
 
   const plannerCollisionDetection = useMemo<CollisionDetection>(
@@ -1456,7 +1609,7 @@ export function ScheduleWorkbench({
           tracePlannerUi(traceEnabled, "drag.end", {
             dragId: null,
             outcome: "cancelled",
-          });
+          }, dragSession?.traceContext ?? null);
           schedulePlannerPerformanceSummary(dragSession?.performanceSession ?? null, {
             dragId: dragSession?.dragId ?? null,
             outcome: "cancelled",
@@ -1771,9 +1924,13 @@ export function ScheduleWorkbench({
               onTraceEnabledChange={updateTraceEnabled}
               onPendingPlacementChange={setPendingPlacement}
               onQuickPlacementCommit={(projectId, placement) => {
+                const traceContext = createActionTraceContext("draft-drop", {
+                  projectId,
+                  placement,
+                });
                 placeProject(projectId, placement, {
                   source: "draft-drop",
-                });
+                }, traceContext);
                 setPendingPlacement(null);
               }}
               onProjectPointerDown={(projectId, shiftKey) => {
@@ -1811,9 +1968,13 @@ export function ScheduleWorkbench({
             project={selectedProject}
             dependencies={state.dependencies}
             onSave={(projectId, placement) => {
+              const traceContext = createActionTraceContext("sheet-edit", {
+                projectId,
+                placement,
+              });
               placeProject(projectId, placement, {
                 source: "sheet-edit",
-              });
+              }, traceContext);
             }}
             onUnschedule={(projectId) => {
               const project = state.projects.find((value) => value.id === projectId);
@@ -1893,6 +2054,13 @@ export function ScheduleWorkbench({
                   return;
                 }
 
+                const traceContext = createActionTraceContext(
+                  pendingDependencyConflict.source,
+                  {
+                    projectIds: pendingDependencyConflict.projectIds,
+                    promptDecision: "preserve-dependencies",
+                  }
+                );
                 commitPlacementRequests(pendingDependencyConflict.placements, {
                   source: `${pendingDependencyConflict.source}-keep-dependencies`,
                   dependencyResolution: "preserve-dependencies",
@@ -1900,7 +2068,7 @@ export function ScheduleWorkbench({
                     ...pendingDependencyConflict.traceMetadata,
                     promptDecision: "preserve-dependencies",
                   },
-                });
+                }, traceContext);
                 setPendingDependencyConflict(null);
               }}
             >
@@ -1912,6 +2080,13 @@ export function ScheduleWorkbench({
                   return;
                 }
 
+                const traceContext = createActionTraceContext(
+                  pendingDependencyConflict.source,
+                  {
+                    projectIds: pendingDependencyConflict.projectIds,
+                    promptDecision: "break-conflicting-links",
+                  }
+                );
                 commitPlacementRequests(pendingDependencyConflict.placements, {
                   source: `${pendingDependencyConflict.source}-break-dependencies`,
                   dependencyResolution: "break-conflicting-links",
@@ -1925,7 +2100,7 @@ export function ScheduleWorkbench({
                       (conflict) => conflict.id
                     ),
                   },
-                });
+                }, traceContext);
                 setPendingDependencyConflict(null);
               }}
             >
@@ -1972,9 +2147,14 @@ export function ScheduleWorkbench({
                   return;
                 }
 
+                const traceContext = createActionTraceContext("sheet-edit", {
+                  projectId: pendingEarlierShift.projectId,
+                  interaction: pendingEarlierShift.interaction,
+                  strategy: "preserve",
+                });
                 placeProject(pendingEarlierShift.projectId, pendingEarlierShift.placement, {
                   source: `prompt-${pendingEarlierShift.interaction}`,
-                });
+                }, traceContext);
                 setPendingEarlierShift(null);
               }}
             >
@@ -1986,10 +2166,15 @@ export function ScheduleWorkbench({
                   return;
                 }
 
+                const traceContext = createActionTraceContext("sheet-edit", {
+                  projectId: pendingEarlierShift.projectId,
+                  interaction: pendingEarlierShift.interaction,
+                  strategy: "compact-same-team",
+                });
                 placeProject(pendingEarlierShift.projectId, pendingEarlierShift.placement, {
                   strategy: "compact-same-team",
                   source: `prompt-compact-${pendingEarlierShift.interaction}`,
-                });
+                }, traceContext);
                 setPendingEarlierShift(null);
               }}
             >

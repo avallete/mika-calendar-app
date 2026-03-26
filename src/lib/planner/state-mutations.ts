@@ -6,6 +6,7 @@ import {
   wouldCreateDependencyCycle,
 } from "@/lib/planner/scheduler";
 import { materializePlannerState } from "@/lib/planner/closure-materialization";
+import type { PlannerTraceContext } from "@/lib/planner/planner-trace";
 import { initialPlannerState } from "@/lib/planner/sample-data";
 import type {
   ClosureFormState,
@@ -57,7 +58,8 @@ function nextTeamPalette(index: number) {
 export function upsertProjectInState(
   state: PlannerState,
   values: ProjectEditorState,
-  projectId?: string
+  projectId?: string,
+  traceContext?: PlannerTraceContext | null
 ) {
   const nextState = cloneState(state);
   const existing = nextState.projects.find((project) => project.id === projectId);
@@ -112,27 +114,44 @@ export function upsertProjectInState(
   return rescheduleProjects({
     ...nextState,
     dependencies: nextDependencies,
-  });
+  }, { traceContext });
 }
 
 export function placeProjectInState(
   state: PlannerState,
   projectId: string,
   placement: ProjectPlacement,
-  options?: ProjectPlacementOptions
+  options?: ProjectPlacementOptions,
+  traceContext?: PlannerTraceContext | null
 ) {
-  return updateProjectPlacement(cloneState(state), projectId, placement, options);
+  return updateProjectPlacement(
+    cloneState(state),
+    projectId,
+    placement,
+    options,
+    traceContext
+  );
 }
 
 export function placeProjectsInState(
   state: PlannerState,
   placements: ProjectPlacementRequest[],
-  options?: ProjectPlacementOptions
+  options?: ProjectPlacementOptions,
+  traceContext?: PlannerTraceContext | null
 ) {
-  return updateProjectPlacements(cloneState(state), placements, options);
+  return updateProjectPlacements(
+    cloneState(state),
+    placements,
+    options,
+    traceContext
+  );
 }
 
-export function unscheduleProjectInState(state: PlannerState, projectId: string) {
+export function unscheduleProjectInState(
+  state: PlannerState,
+  projectId: string,
+  traceContext?: PlannerTraceContext | null
+) {
   return rescheduleProjects({
     ...cloneState(state),
     projects: state.projects.map((project) =>
@@ -147,18 +166,23 @@ export function unscheduleProjectInState(state: PlannerState, projectId: string)
           }
         : { ...project }
     ),
-  });
+  }, { traceContext });
 }
 
 export function deleteProjectInState(
   state: PlannerState,
   projectId: string,
-  mode?: ProjectDeleteMode
+  mode?: ProjectDeleteMode,
+  traceContext?: PlannerTraceContext | null
 ) {
-  return deleteProjectFromState(cloneState(state), projectId, mode);
+  return deleteProjectFromState(cloneState(state), projectId, mode, traceContext);
 }
 
-export function addClosureInState(state: PlannerState, values: ClosureFormState) {
+export function addClosureInState(
+  state: PlannerState,
+  values: ClosureFormState,
+  traceContext?: PlannerTraceContext | null
+) {
   return rescheduleProjects(
     materializePlannerState({
     ...cloneState(state),
@@ -175,16 +199,22 @@ export function addClosureInState(state: PlannerState, values: ClosureFormState)
         repeatsAnnually: values.repeatsAnnually,
       },
     ],
-    })
+    }),
+    { traceContext }
   );
 }
 
-export function removeClosureInState(state: PlannerState, closureId: string) {
+export function removeClosureInState(
+  state: PlannerState,
+  closureId: string,
+  traceContext?: PlannerTraceContext | null
+) {
   return rescheduleProjects(
     materializePlannerState({
     ...cloneState(state),
     customClosures: state.customClosures.filter((closure) => closure.id !== closureId),
-    })
+    }),
+    { traceContext }
   );
 }
 
@@ -255,7 +285,8 @@ export function deleteTeamInState(state: PlannerState, teamId: string) {
 export function toggleHolidaySourceInState(
   state: PlannerState,
   sourceCode: string,
-  enabled: boolean
+  enabled: boolean,
+  traceContext?: PlannerTraceContext | null
 ) {
   return rescheduleProjects({
     ...materializePlannerState({
@@ -264,7 +295,7 @@ export function toggleHolidaySourceInState(
         source.code === sourceCode ? { ...source, enabled } : { ...source }
       ),
     }),
-  });
+  }, { traceContext });
 }
 
 export function resetPlannerDemoDataInState(state: PlannerState) {

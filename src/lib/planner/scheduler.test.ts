@@ -2,6 +2,9 @@ import { describe, expect, test } from "bun:test";
 
 import { makeSlotKey } from "@/lib/planner/calendar";
 import {
+  createPlannerTraceContext,
+} from "@/lib/planner/planner-trace";
+import {
   detectDependencyConflicts,
   deleteProjectFromState,
   getEarlierShiftPrompt,
@@ -453,6 +456,56 @@ describe("scheduler", () => {
     expect(calls.some((entry) => entry.includes("summary"))).toBe(true);
     expect(calls.some((entry) => entry.includes("queues.before"))).toBe(false);
     expect(calls.some((entry) => entry.includes("changes"))).toBe(false);
+    expect(calls.some((entry) => entry === "end")).toBe(true);
+  });
+
+  test("keeps server commit scheduler traces summary-only when the verbose toggle is off", () => {
+    const originalGroupCollapsed = console.groupCollapsed;
+    const originalLog = console.log;
+    const originalGroupEnd = console.groupEnd;
+    const calls: string[] = [];
+
+    console.groupCollapsed = ((...args: unknown[]) => {
+      calls.push(`group:${String(args[0])}`);
+    }) as typeof console.groupCollapsed;
+    console.log = ((...args: unknown[]) => {
+      calls.push(`log:${String(args[0])}`);
+    }) as typeof console.log;
+    console.groupEnd = (() => {
+      calls.push("end");
+    }) as typeof console.groupEnd;
+
+    try {
+      updateProjectPlacement(
+        baseState(),
+        "a-2",
+        {
+          teamId: "team-a",
+          startSlot: makeSlotKey("2026-03-27", "AM"),
+          durationHalfDays: 2,
+        },
+        {
+          source: "sheet-edit",
+        },
+        createPlannerTraceContext({
+          source: "sheet-edit",
+          enabled: true,
+          traceId: "server-commit-trace",
+          runtime: "server",
+          phase: "store",
+        })
+      );
+    } finally {
+      console.groupCollapsed = originalGroupCollapsed;
+      console.log = originalLog;
+      console.groupEnd = originalGroupEnd;
+    }
+
+    expect(calls.some((entry) => entry.includes("updateProjectPlacement.server-commit"))).toBe(true);
+    expect(calls.some((entry) => entry.includes("summary"))).toBe(true);
+    expect(calls.some((entry) => entry.includes("queues.before"))).toBe(false);
+    expect(calls.some((entry) => entry.includes("changes"))).toBe(false);
+    expect(calls.some((entry) => entry.includes("iteration.1."))).toBe(false);
     expect(calls.some((entry) => entry === "end")).toBe(true);
   });
 

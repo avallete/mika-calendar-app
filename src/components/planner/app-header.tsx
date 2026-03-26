@@ -69,7 +69,7 @@ export function AppHeader() {
           <Button
             variant="outline"
             size="sm"
-            onClick={undo}
+            onClick={() => undo()}
             disabled={!state.history.canUndo || isPending}
             title="Ctrl+Z"
           >
@@ -79,7 +79,7 @@ export function AppHeader() {
           <Button
             variant="outline"
             size="sm"
-            onClick={redo}
+            onClick={() => redo()}
             disabled={!state.history.canRedo || isPending}
             title="Ctrl+Shift+Z"
           >
